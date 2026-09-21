@@ -39,16 +39,26 @@ func main() {
 	flag.BoolVar(&selectMode, "s", false, "pick a job in fzf and open it in the browser")
 	flag.CommandLine.Parse(args)
 
-	rows := collect(org, *days, *label)
+	rows, scanErr := collect(org, *days, *label)
 
 	if selectMode {
+		if scanErr != nil {
+			fmt.Fprintln(os.Stderr, "gh-runners: warning:", scanErr)
+		}
 		runSelect(rows)
+		if scanErr != nil {
+			os.Exit(2)
+		}
 		return
 	}
 
 	fmt.Println(header)
 	for _, r := range rows {
 		fmt.Println(strings.Join(r[:8], "\t"))
+	}
+	if scanErr != nil {
+		fmt.Fprintln(os.Stderr, "gh-runners: warning:", scanErr)
+		os.Exit(2)
 	}
 }
 
@@ -91,10 +101,10 @@ func envDays() int {
 	return 7
 }
 
-func collect(org string, days int, label string) [][9]string {
+func collect(org string, days int, label string) ([][9]string, error) {
 	var done, total atomic.Int64
 	stop := startSpinner(org, &done, &total)
-	jobs := scan.Scan(context.Background(), org, days, func(d, t int) {
+	jobs, scanErr := scan.Scan(context.Background(), org, days, func(d, t int) {
 		done.Store(int64(d))
 		total.Store(int64(t))
 	})
@@ -123,7 +133,7 @@ func collect(org string, days int, label string) [][9]string {
 	sort.Slice(rows, func(a, b int) bool {
 		return strings.Join(rows[a][:], "\t") < strings.Join(rows[b][:], "\t")
 	})
-	return rows
+	return rows, scanErr
 }
 
 func formatTime(t time.Time) string {
