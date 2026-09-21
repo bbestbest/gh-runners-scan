@@ -25,7 +25,7 @@ func main() {
 	}
 	label := flag.String("label", "", "filter jobs by runner label substring")
 	days := flag.Int("days", 7, "only scan repos pushed within N days (0 = all)")
-	interval := flag.Int("interval", 30, "rescan interval in seconds")
+	interval := flag.Int("interval", 150, "rescan interval in seconds")
 	repo := flag.String("repo", "", "highlight this repo")
 	once := flag.Bool("once", false, "print tables once and exit")
 	flag.CommandLine.Parse(args)
