@@ -74,7 +74,7 @@ func splitOrg(argv []string, fallback string) (string, []string) {
 }
 
 func printOnce(opts options) {
-	jobs := scanLabeled(context.Background(), opts, func(done, total int) {
+	jobs, scanErr := scanLabeled(context.Background(), opts, func(done, total int) {
 		if total < 0 {
 			fmt.Fprintf(os.Stderr, "\r\033[Klisting repos in %s", opts.org)
 			return
@@ -110,12 +110,16 @@ func printOnce(opts options) {
 	}
 
 	w.Flush()
+
+	if scanErr != nil {
+		fmt.Fprintln(os.Stderr, "gh-runners-tui: warning:", scanErr)
+	}
 }
 
-func scanLabeled(ctx context.Context, opts options, progress func(done, total int)) []scan.Job {
-	jobs := scan.Scan(ctx, opts.org, opts.days, progress)
+func scanLabeled(ctx context.Context, opts options, progress func(done, total int)) ([]scan.Job, error) {
+	jobs, scanErr := scan.Scan(ctx, opts.org, opts.days, progress)
 	if opts.label == "" {
-		return jobs
+		return jobs, scanErr
 	}
 	needle := strings.ToLower(opts.label)
 	var kept []scan.Job
@@ -124,5 +128,5 @@ func scanLabeled(ctx context.Context, opts options, progress func(done, total in
 			kept = append(kept, j)
 		}
 	}
-	return kept
+	return kept, scanErr
 }

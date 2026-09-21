@@ -52,6 +52,7 @@ type progressMsg struct {
 
 type scanDoneMsg struct {
 	jobs []scan.Job
+	err  error
 }
 
 type tickMsg time.Time
@@ -85,6 +86,7 @@ type model struct {
 	repoCount int
 	lastScan  string
 	nextIn    int
+	scanErr   error
 
 	width  int
 	height int
@@ -151,12 +153,12 @@ func (m *model) startScan() tea.Cmd {
 
 func scanCmd(opts options) tea.Cmd {
 	return func() tea.Msg {
-		jobs := scanLabeled(context.Background(), opts, func(done, total int) {
+		jobs, scanErr := scanLabeled(context.Background(), opts, func(done, total int) {
 			if program != nil {
 				program.Send(progressMsg{done, total})
 			}
 		})
-		return scanDoneMsg{jobs: jobs}
+		return scanDoneMsg{jobs: jobs, err: scanErr}
 	}
 }
 
@@ -178,6 +180,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case scanDoneMsg:
 		m.scanning = false
 		m.jobs = msg.jobs
+		m.scanErr = msg.err
 		m.lastScan = time.Now().UTC().Format("15:04:05")
 		m.nextIn = m.opts.interval
 		m.refresh()
@@ -601,11 +604,17 @@ func (m model) statusView() string {
 		right = fmt.Sprintf("%d running · %d queued", len(m.running), len(m.queued))
 	}
 
+	if !m.scanning && m.scanErr != nil {
+		right = redStyle.Render("rate limited · incomplete") + dimStyle.Render("   "+right)
+	} else {
+		right = dimStyle.Render(right)
+	}
+
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
 		gap = 1
 	}
-	return left + strings.Repeat(" ", gap) + dimStyle.Render(right)
+	return left + strings.Repeat(" ", gap) + right
 }
 
 func Run(opts options) error {
