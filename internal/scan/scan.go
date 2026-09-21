@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os/exec"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,11 +40,16 @@ type Job struct {
 
 type repoEntry struct {
 	Name     string `json:"name"`
-	PushedAt string `json:"pushedAt"`
+	PushedAt string `json:"pushed_at"`
+	Archived bool   `json:"archived"`
 }
 
 type runEntry struct {
-	DatabaseID int64 `json:"databaseId"`
+	DatabaseID int64 `json:"id"`
+}
+
+type runsResponse struct {
+	WorkflowRuns []runEntry `json:"workflow_runs"`
 }
 
 type jobsResponse struct {
@@ -62,14 +67,8 @@ type jobsResponse struct {
 }
 
 func isRateLimit(err error) bool {
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		return false
-	}
-	text := strings.ToLower(string(exitErr.Stderr))
-	return strings.Contains(text, "rate limit") ||
-		strings.Contains(text, "secondary rate") ||
-		strings.Contains(text, "403")
+	var rl *rateLimitError
+	return errors.As(err, &rl)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
@@ -83,22 +82,42 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func gh(ctx context.Context, limited *atomic.Bool, out any, args ...string) bool {
+func backoffFor(err error, attempt int) time.Duration {
+	var rl *rateLimitError
+	if errors.As(err, &rl) && rl.wait > 0 && rl.wait <= time.Duration(rateLimitAttempts)*rateLimitBackoff {
+		return rl.wait
+	}
+	return time.Duration(attempt+1) * rateLimitBackoff
+}
+
+func getJSON(ctx context.Context, limited *atomic.Bool, out any, path string) (string, bool) {
+	c, err := sharedClient()
+	if err != nil {
+		limited.Store(false)
+		return "", false
+	}
+	full := path
+	if !strings.HasPrefix(full, "http") {
+		full = c.base + path
+	}
 	for attempt := 0; ; attempt++ {
-		data, err := exec.CommandContext(ctx, "gh", args...).Output()
+		data, link, err := c.fetch(ctx, full)
 		if err == nil {
-			return json.Unmarshal(data, out) == nil
+			if out == nil {
+				return link, true
+			}
+			return link, json.Unmarshal(data, out) == nil
 		}
 		if !isRateLimit(err) {
-			return false
+			return "", false
 		}
 		if attempt >= rateLimitAttempts-1 {
 			limited.Store(true)
-			return false
+			return "", false
 		}
-		if !sleepCtx(ctx, time.Duration(attempt+1)*rateLimitBackoff) {
+		if !sleepCtx(ctx, backoffFor(err, attempt)) {
 			limited.Store(true)
-			return false
+			return "", false
 		}
 	}
 }
@@ -146,20 +165,28 @@ func listRepos(ctx context.Context, limited *atomic.Bool, org string, days int) 
 		return names
 	}
 
-	var entries []repoEntry
-	if !gh(ctx, limited, &entries, "repo", "list", org, "--limit", "100", "--no-archived", "--json", "name,pushedAt") {
-		return nil
-	}
 	cutoff := time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour)
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if days <= 0 {
-			names = append(names, e.Name)
-			continue
+	var names []string
+	next := "/orgs/" + url.PathEscape(org) + "/repos?per_page=100&sort=pushed&direction=desc"
+	for next != "" {
+		var entries []repoEntry
+		link, ok := getJSON(ctx, limited, &entries, next)
+		if !ok {
+			return nil
 		}
-		if ts := parseTime(e.PushedAt); !ts.IsZero() && ts.After(cutoff) {
-			names = append(names, e.Name)
+		for _, e := range entries {
+			if e.Archived {
+				continue
+			}
+			if days <= 0 {
+				names = append(names, e.Name)
+				continue
+			}
+			if ts := parseTime(e.PushedAt); !ts.IsZero() && ts.After(cutoff) {
+				names = append(names, e.Name)
+			}
 		}
+		next = nextPageURL(link)
 	}
 	storeRepos(key, names)
 	return names
@@ -168,14 +195,17 @@ func listRepos(ctx context.Context, limited *atomic.Bool, org string, days int) 
 func scanRepo(ctx context.Context, limited *atomic.Bool, org, repo string) []Job {
 	var jobs []Job
 	for _, status := range []string{"in_progress", "queued"} {
-		var runs []runEntry
-		if !gh(ctx, limited, &runs, "run", "list", "-R", org+"/"+repo, "--status", status, "--limit", "20", "--json", "databaseId") {
+		var runs runsResponse
+		runsPath := "/repos/" + url.PathEscape(org) + "/" + url.PathEscape(repo) +
+			"/actions/runs?status=" + url.QueryEscape(status) + "&per_page=20"
+		if _, ok := getJSON(ctx, limited, &runs, runsPath); !ok {
 			continue
 		}
-		for _, run := range runs {
+		for _, run := range runs.WorkflowRuns {
 			var resp jobsResponse
-			path := "repos/" + org + "/" + repo + "/actions/runs/" + strconv.FormatInt(run.DatabaseID, 10) + "/jobs"
-			if !gh(ctx, limited, &resp, "api", path) {
+			path := "/repos/" + url.PathEscape(org) + "/" + url.PathEscape(repo) +
+				"/actions/runs/" + strconv.FormatInt(run.DatabaseID, 10) + "/jobs"
+			if _, ok := getJSON(ctx, limited, &resp, path); !ok {
 				continue
 			}
 			for _, j := range resp.Jobs {
