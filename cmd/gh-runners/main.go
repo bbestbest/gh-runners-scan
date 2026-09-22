@@ -39,7 +39,7 @@ func main() {
 	flag.CommandLine.Parse(args)
 
 	if org == "" {
-		fmt.Fprintln(os.Stderr, "gh-runners: no org given; pass one as the first argument or set GH_RUNNERS_ORG")
+		fmt.Fprintln(os.Stderr, "gh-runners: "+noOrgHint())
 		os.Exit(1)
 	}
 
@@ -90,6 +90,13 @@ func splitOrg(argv []string, fallback string) (string, []string) {
 		org = fallback
 	}
 	return org, args
+}
+
+func noOrgHint() string {
+	if path := config.Path(); path != "" {
+		return "no org given; pass one as the first argument, set GH_RUNNERS_ORG, or set org in " + path
+	}
+	return "no org given; pass one as the first argument or set GH_RUNNERS_ORG"
 }
 
 func envOrg(cfg config.Config) string {

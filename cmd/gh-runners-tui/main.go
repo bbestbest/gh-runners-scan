@@ -19,7 +19,7 @@ func main() {
 
 	org, args := splitOrg(os.Args[1:], envOrg(cfg))
 	if org == "" {
-		fmt.Fprintln(os.Stderr, "gh-runners-tui: no org given; pass one as the first argument or set GH_RUNNERS_ORG")
+		fmt.Fprintln(os.Stderr, "gh-runners-tui: "+noOrgHint())
 		os.Exit(1)
 	}
 
@@ -45,6 +45,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "gh-runners-tui:", err)
 		os.Exit(1)
 	}
+}
+
+func noOrgHint() string {
+	if path := config.Path(); path != "" {
+		return "no org given; pass one as the first argument, set GH_RUNNERS_ORG, or set org in " + path
+	}
+	return "no org given; pass one as the first argument or set GH_RUNNERS_ORG"
 }
 
 func envOrg(cfg config.Config) string {
