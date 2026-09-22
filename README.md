@@ -20,7 +20,7 @@ gh-runners <org> --label ARM64    # filter by runner label
 gh-runners <org> --select         # pick a job in fzf, open it in the browser
 ```
 
-The org comes from the first argument, or `GH_RUNNERS_ORG`. With neither, both commands exit 1.
+The org comes from the first argument, `GH_RUNNERS_ORG`, or the config file. With none of them, both commands exit 1.
 
 ## Configuration
 
@@ -31,6 +31,25 @@ The org comes from the first argument, or `GH_RUNNERS_ORG`. With neither, both c
 | `GH_TOKEN` / `GITHUB_TOKEN` | API token; falls back to `gh auth token` | — |
 
 Flags: `--label`, `--days`, `--repo`, `--once`, `--interval` (TUI), `--select` (CLI).
+
+### Config file
+
+`org` and `days` can be stored in `$XDG_CONFIG_HOME/gh-runners/config`, or `~/.config/gh-runners/config` when `XDG_CONFIG_HOME` is unset. One `key = value` per line; `#` starts a comment.
+
+```ini
+# scan this org unless a different one is given
+org = org-a
+days = 30
+```
+
+Both commands resolve each value in this order, first hit wins:
+
+1. CLI argument or flag — the positional org, `--days`
+2. environment — `GH_RUNNERS_ORG`, `GH_RUNNERS_DAYS`
+3. config file
+4. built-in default — org: none (exit 1); days: 7
+
+The file is optional and never written by these commands. A missing file, an unreadable one, or a `days` that is not a number is ignored silently.
 
 ## Reading the output
 

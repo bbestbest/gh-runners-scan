@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/term"
 
+	"gh-runners/internal/config"
 	"gh-runners/internal/scan"
 )
 
@@ -22,22 +23,25 @@ const header = "STATE\tREPO\tWORKFLOW\tBRANCH\tJOB\tRUNNER\tLABELS\tSINCE"
 var frames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func main() {
-	org, args := splitOrg(os.Args[1:], envOrg())
-	if org == "" {
-		fmt.Fprintln(os.Stderr, "gh-runners: no org given; pass one as the first argument or set GH_RUNNERS_ORG")
-		os.Exit(1)
-	}
+	cfg := config.Load()
+
+	org, args := splitOrg(os.Args[1:], envOrg(cfg))
 
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: gh-runners [org] [flags]")
 		flag.PrintDefaults()
 	}
 	label := flag.String("label", "", "filter rows by case-insensitive substring")
-	days := flag.Int("days", envDays(), "only scan repos pushed within N days (0 = all)")
+	days := flag.Int("days", envDays(cfg), "only scan repos pushed within N days (0 = all)")
 	var selectMode bool
 	flag.BoolVar(&selectMode, "select", false, "pick a job in fzf and open it in the browser")
 	flag.BoolVar(&selectMode, "s", false, "pick a job in fzf and open it in the browser")
 	flag.CommandLine.Parse(args)
+
+	if org == "" {
+		fmt.Fprintln(os.Stderr, "gh-runners: no org given; pass one as the first argument or set GH_RUNNERS_ORG")
+		os.Exit(1)
+	}
 
 	rows, scanErr := collect(org, *days, *label)
 
@@ -88,15 +92,21 @@ func splitOrg(argv []string, fallback string) (string, []string) {
 	return org, args
 }
 
-func envOrg() string {
-	return os.Getenv("GH_RUNNERS_ORG")
+func envOrg(cfg config.Config) string {
+	if v := os.Getenv("GH_RUNNERS_ORG"); v != "" {
+		return v
+	}
+	return cfg.Org
 }
 
-func envDays() int {
+func envDays(cfg config.Config) int {
 	if v := os.Getenv("GH_RUNNERS_DAYS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
+	}
+	if cfg.DaysSet {
+		return cfg.Days
 	}
 	return 7
 }

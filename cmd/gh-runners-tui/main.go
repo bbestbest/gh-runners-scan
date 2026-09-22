@@ -5,15 +5,19 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"gh-runners/internal/config"
 	"gh-runners/internal/scan"
 )
 
 func main() {
-	org, args := splitOrg(os.Args[1:], envOrg())
+	cfg := config.Load()
+
+	org, args := splitOrg(os.Args[1:], envOrg(cfg))
 	if org == "" {
 		fmt.Fprintln(os.Stderr, "gh-runners-tui: no org given; pass one as the first argument or set GH_RUNNERS_ORG")
 		os.Exit(1)
@@ -24,7 +28,7 @@ func main() {
 		flag.PrintDefaults()
 	}
 	label := flag.String("label", "", "filter jobs by runner label substring")
-	days := flag.Int("days", 7, "only scan repos pushed within N days (0 = all)")
+	days := flag.Int("days", envDays(cfg), "only scan repos pushed within N days (0 = all)")
 	interval := flag.Int("interval", 150, "rescan interval in seconds")
 	repo := flag.String("repo", "", "highlight this repo")
 	once := flag.Bool("once", false, "print tables once and exit")
@@ -43,8 +47,23 @@ func main() {
 	}
 }
 
-func envOrg() string {
-	return os.Getenv("GH_RUNNERS_ORG")
+func envOrg(cfg config.Config) string {
+	if v := os.Getenv("GH_RUNNERS_ORG"); v != "" {
+		return v
+	}
+	return cfg.Org
+}
+
+func envDays(cfg config.Config) int {
+	if v := os.Getenv("GH_RUNNERS_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	if cfg.DaysSet {
+		return cfg.Days
+	}
+	return 7
 }
 
 func splitOrg(argv []string, fallback string) (string, []string) {
