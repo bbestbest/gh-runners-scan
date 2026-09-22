@@ -18,10 +18,6 @@ func main() {
 	cfg := config.Load()
 
 	org, args := splitOrg(os.Args[1:], envOrg(cfg))
-	if org == "" {
-		fmt.Fprintln(os.Stderr, "gh-runners-tui: "+noOrgHint())
-		os.Exit(1)
-	}
 
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: gh-runners-tui [org] [flags]")
@@ -37,6 +33,10 @@ func main() {
 	opts := options{org: org, label: *label, days: *days, interval: *interval, repo: *repo}
 
 	if *once {
+		if org == "" {
+			fmt.Fprintln(os.Stderr, "gh-runners-tui: "+noOrgHint())
+			os.Exit(1)
+		}
 		printOnce(opts)
 		return
 	}

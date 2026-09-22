@@ -112,6 +112,149 @@ func TestFilterAndRestore(t *testing.T) {
 	}
 }
 
+func typeRunes(m model, s string) model {
+	for _, r := range s {
+		m = send(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	return m
+}
+
+func TestOrgOverlayStartupState(t *testing.T) {
+	tests := []struct {
+		name string
+		org  string
+		want bool
+	}{
+		{"empty org opens overlay", "", true},
+		{"supplied org skips overlay", "org-a", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newModel(options{org: tt.org, interval: 30})
+			if m.orgActive != tt.want {
+				t.Errorf("orgActive = %v, want %v", m.orgActive, tt.want)
+			}
+			if m.scanning == (tt.org == "") {
+				t.Errorf("scanning = %v for org %q", m.scanning, tt.org)
+			}
+		})
+	}
+}
+
+func TestOrgOverlayEnterStartsScan(t *testing.T) {
+	m := newModel(options{interval: 30})
+	m = typeRunes(m, "org-a")
+
+	next, cmd := m.Update(key("enter"))
+	m = next.(model)
+
+	if m.opts.org != "org-a" {
+		t.Fatalf("org = %q, want org-a", m.opts.org)
+	}
+	if m.orgActive {
+		t.Error("overlay still active after enter")
+	}
+	if cmd == nil {
+		t.Error("enter with valid org did not trigger a scan")
+	}
+	if !m.scanning {
+		t.Error("scanning = false after accepting an org")
+	}
+}
+
+func TestOrgOverlayRejectsBlank(t *testing.T) {
+	for _, in := range []string{"", "   "} {
+		m := newModel(options{interval: 30})
+		m = typeRunes(m, in)
+
+		next, cmd := m.Update(key("enter"))
+		m = next.(model)
+
+		if !m.orgActive {
+			t.Errorf("overlay closed on blank input %q", in)
+		}
+		if m.opts.org != "" {
+			t.Errorf("org = %q after blank input %q", m.opts.org, in)
+		}
+		if cmd != nil {
+			t.Errorf("blank input %q returned a command", in)
+		}
+		if m.scanning {
+			t.Errorf("scanning started on blank input %q", in)
+		}
+	}
+}
+
+func TestOrgOverlayEscape(t *testing.T) {
+	m := newModel(options{interval: 30})
+	_, cmd := m.Update(key("esc"))
+	if cmd == nil {
+		t.Fatal("esc with no org set did not quit")
+	}
+	if msg := cmd(); msg != tea.Quit() {
+		t.Errorf("esc with no org sent %T, want quit", msg)
+	}
+
+	withOrg := newTestModel(t)
+	withOrg = send(withOrg, key("O"))
+	if !withOrg.orgActive {
+		t.Fatal("O did not open the overlay")
+	}
+	if got := withOrg.orgInput.Value(); got != "org-c" {
+		t.Errorf("overlay value = %q, want org-c", got)
+	}
+
+	next, cmd := withOrg.Update(key("esc"))
+	withOrg = next.(model)
+	if withOrg.orgActive {
+		t.Error("overlay still active after esc with an org set")
+	}
+	if withOrg.opts.org != "org-c" {
+		t.Errorf("org = %q after esc, want org-c", withOrg.opts.org)
+	}
+	if cmd != nil {
+		t.Error("esc with an org set returned a command")
+	}
+}
+
+func TestOrgOverlayChangeWhileRunning(t *testing.T) {
+	m := newTestModel(t)
+	m = send(m, key("O"))
+	for range "org-c" {
+		m = send(m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	m = typeRunes(m, "org-b")
+
+	next, cmd := m.Update(key("enter"))
+	m = next.(model)
+
+	if m.opts.org != "org-b" {
+		t.Fatalf("org = %q, want org-b", m.opts.org)
+	}
+	if cmd == nil {
+		t.Error("changing org did not trigger a rescan")
+	}
+	if len(m.jobs) != 0 {
+		t.Errorf("jobs = %d after org change, want 0", len(m.jobs))
+	}
+	if !strings.Contains(m.headerView(), "org-b") {
+		t.Error("header does not show the new org")
+	}
+}
+
+func TestOrgOverlayViewReplacesBody(t *testing.T) {
+	m := newModel(options{interval: 30})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	view := next.(model).View()
+
+	if !strings.Contains(view, "org:") {
+		t.Error("overlay view missing the org prompt")
+	}
+	if strings.Contains(view, "Running (") {
+		t.Error("panels rendered while the overlay is active")
+	}
+}
+
 func TestViewContents(t *testing.T) {
 	m := newTestModel(t)
 	view := m.View()

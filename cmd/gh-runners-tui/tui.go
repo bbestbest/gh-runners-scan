@@ -39,7 +39,7 @@ var hints = [4][4]string{
 	{"<↑↓/jk>", "move", "</>", "filter"},
 	{"<tab/1/2>", "panel", "<r>", "rescan"},
 	{"<enter/o>", "open", "<esc>", "clear filter"},
-	{"", "", "<q>", "quit"},
+	{"<O>", "org", "<q>", "quit"},
 }
 
 var runningCols = []string{"Runner", "Repo", "Workflow", "Branch", "Job", "Elapsed"}
@@ -80,6 +80,9 @@ type model struct {
 	filterActive bool
 	filter       string
 
+	orgInput  textinput.Model
+	orgActive bool
+
 	spin      spinner.Model
 	scanning  bool
 	progress  progressMsg
@@ -98,7 +101,8 @@ func newModel(opts options) model {
 		nextIn:    opts.interval,
 		width:     120,
 		height:    40,
-		scanning:  true,
+		scanning:  opts.org != "",
+		orgActive: opts.org == "",
 		progress:  progressMsg{0, scan.TotalUnknown},
 		repoCount: scan.TotalUnknown,
 	}
@@ -110,6 +114,15 @@ func newModel(opts options) model {
 	in.Placeholder = "filter"
 	in.Prompt = "/ "
 	m.filterInput = in
+
+	oi := textinput.New()
+	oi.Placeholder = "organisation"
+	oi.Prompt = "org: "
+	oi.SetValue(opts.org)
+	if m.orgActive {
+		oi.Focus()
+	}
+	m.orgInput = oi
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
@@ -133,6 +146,9 @@ func newTable(cols []string) table.Model {
 }
 
 func (m model) Init() tea.Cmd {
+	if m.opts.org == "" {
+		return tea.Batch(tickCmd(), m.spin.Tick, textinput.Blink)
+	}
 	return tea.Batch(scanCmd(m.opts), tickCmd(), m.spin.Tick)
 }
 
@@ -143,7 +159,7 @@ func tickCmd() tea.Cmd {
 }
 
 func (m *model) startScan() tea.Cmd {
-	if m.scanning {
+	if m.scanning || m.opts.org == "" {
 		return nil
 	}
 	m.scanning = true
@@ -210,6 +226,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.orgActive {
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			if m.opts.org == "" {
+				return m, tea.Quit
+			}
+			m.orgActive = false
+			m.orgInput.SetValue(m.opts.org)
+			m.orgInput.Blur()
+			return m, nil
+		case "enter":
+			org := strings.TrimSpace(m.orgInput.Value())
+			if org == "" {
+				if m.opts.org == "" {
+					return m, nil
+				}
+				m.orgActive = false
+				m.orgInput.SetValue(m.opts.org)
+				m.orgInput.Blur()
+				return m, nil
+			}
+			m.orgActive = false
+			m.orgInput.SetValue(org)
+			m.orgInput.Blur()
+			if org == m.opts.org {
+				return m, nil
+			}
+			m.opts.org = org
+			m.jobs = nil
+			m.scanErr = nil
+			m.lastScan = ""
+			m.repoCount = scan.TotalUnknown
+			m.nextIn = m.opts.interval
+			m.scanning = true
+			m.progress = progressMsg{0, scan.TotalUnknown}
+			m.refresh()
+			return m, scanCmd(m.opts)
+		}
+		var cmd tea.Cmd
+		m.orgInput, cmd = m.orgInput.Update(msg)
+		return m, cmd
+	}
+
 	if m.filterActive {
 		switch msg.String() {
 		case "esc":
@@ -245,6 +306,12 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filterActive = true
 		m.filterInput.Focus()
 		m.layout()
+		return m, textinput.Blink
+	case "O":
+		m.orgActive = true
+		m.orgInput.SetValue(m.opts.org)
+		m.orgInput.CursorEnd()
+		m.orgInput.Focus()
 		return m, textinput.Blink
 	case "r":
 		m.nextIn = m.opts.interval
@@ -487,6 +554,13 @@ func (m model) View() string {
 		inner = 20
 	}
 
+	if m.orgActive {
+		b.WriteString(m.orgOverlayView())
+		b.WriteString("\n")
+		b.WriteString(m.statusView())
+		return b.String()
+	}
+
 	b.WriteString(m.panelView(fmt.Sprintf("Running (%d)", len(m.running)), m.focus == 0, inner, m.runTable))
 	b.WriteString("\n")
 	b.WriteString(m.panelView(fmt.Sprintf("Queued (%d)", len(m.queued)), m.focus == 1, inner, m.qTable))
@@ -501,10 +575,29 @@ func (m model) View() string {
 	return b.String()
 }
 
+func (m model) orgOverlayView() string {
+	hint := "enter confirm · esc cancel"
+	if m.opts.org == "" {
+		hint = "enter confirm · esc quit"
+	}
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorAccent).
+		Padding(1, 2).
+		Render(m.orgInput.View() + "\n\n" + dimStyle.Render(hint))
+
+	body := m.height - headerHeight - 2
+	if body < lipgloss.Height(box) {
+		body = lipgloss.Height(box)
+	}
+	return lipgloss.Place(m.width, body, lipgloss.Center, lipgloss.Center, box)
+}
+
 func (m model) headerView() string {
 	labels := []string{"Org:", "Scanned:", "Last:", "Next:"}
 	values := []string{
-		m.opts.org,
+		m.orgLabel(),
 		m.repoCountLabel(),
 		m.lastScanLabel() + " UTC",
 		fmt.Sprintf("%ds", m.nextIn),
@@ -537,6 +630,13 @@ func (m model) headerView() string {
 		lines = append(lines, l+strings.Repeat(" ", gap)+hint)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m model) orgLabel() string {
+	if m.opts.org == "" {
+		return "—"
+	}
+	return m.opts.org
 }
 
 func (m model) repoCountLabel() string {
@@ -588,7 +688,7 @@ func (m model) statusView() string {
 	if m.focus == 1 {
 		panel = "queued"
 	}
-	left := boldStyle.Render(m.opts.org + " › " + panel)
+	left := boldStyle.Render(m.orgLabel() + " › " + panel)
 	if m.filter != "" {
 		left += dimStyle.Render("   filter: " + m.filter)
 	}
