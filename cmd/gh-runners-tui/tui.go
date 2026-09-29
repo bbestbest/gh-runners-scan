@@ -124,7 +124,6 @@ func newModel(opts options) model {
 	oi := textinput.New()
 	oi.Placeholder = "organisation"
 	oi.Prompt = "org: "
-	oi.SetValue(opts.org)
 	if m.orgActive {
 		oi.Focus()
 	}
@@ -241,7 +240,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			m.orgActive = false
-			m.orgInput.SetValue(m.opts.org)
+			m.orgInput.SetValue("")
 			m.orgInput.Blur()
 			return m, nil
 		case "up":
@@ -257,7 +256,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.orgActive = false
-				m.orgInput.SetValue(m.opts.org)
+				m.orgInput.SetValue("")
 				m.orgInput.Blur()
 				return m, nil
 			}
@@ -280,6 +279,11 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.progress = progressMsg{0, scan.TotalUnknown}
 			m.refresh()
 			return m, scanCmd(m.opts)
+		case "x":
+			if m.orgCursor >= 0 && m.orgCursor < len(m.orgs) {
+				m.removeOrgAtCursor()
+				return m, nil
+			}
 		}
 		m.orgCursor = -1
 		var cmd tea.Cmd
@@ -327,8 +331,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.orgActive = true
 		m.orgs = config.Load().Orgs
 		m.orgCursor = -1
-		m.orgInput.SetValue(m.opts.org)
-		m.orgInput.CursorEnd()
+		m.orgInput.SetValue("")
 		m.orgInput.Focus()
 		return m, textinput.Blink
 	case "r":
@@ -367,8 +370,7 @@ func (m *model) moveOrgCursor(delta int) {
 	}
 	if next < 0 {
 		m.orgCursor = -1
-		m.orgInput.SetValue(m.opts.org)
-		m.orgInput.CursorEnd()
+		m.orgInput.SetValue("")
 		return
 	}
 	if next > len(m.orgs)-1 {
@@ -376,6 +378,29 @@ func (m *model) moveOrgCursor(delta int) {
 	}
 	m.orgCursor = next
 	m.orgInput.SetValue(m.orgs[next])
+	m.orgInput.CursorEnd()
+}
+
+func (m *model) removeOrgAtCursor() {
+	org := m.orgs[m.orgCursor]
+	m.saveErr = config.RemoveOrg(org)
+	kept := make([]string, 0, len(m.orgs))
+	for _, o := range m.orgs {
+		if o != org {
+			kept = append(kept, o)
+		}
+	}
+	m.orgs = kept
+	if len(m.orgs) == 0 {
+		m.orgCursor = -1
+	} else if m.orgCursor > len(m.orgs)-1 {
+		m.orgCursor = len(m.orgs) - 1
+	}
+	if m.orgCursor < 0 {
+		m.orgInput.SetValue("")
+	} else {
+		m.orgInput.SetValue(m.orgs[m.orgCursor])
+	}
 	m.orgInput.CursorEnd()
 }
 
@@ -618,9 +643,9 @@ func (m model) View() string {
 }
 
 func (m model) orgOverlayView() string {
-	hint := "↑↓ pick · enter confirm · esc cancel"
+	hint := "↑↓ pick · x delete · enter confirm · esc cancel"
 	if m.opts.org == "" {
-		hint = "↑↓ pick · enter confirm · esc quit"
+		hint = "↑↓ pick · x delete · enter confirm · esc quit"
 	}
 
 	body := m.orgInput.View()

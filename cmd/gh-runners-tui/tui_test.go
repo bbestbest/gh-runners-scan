@@ -614,3 +614,143 @@ func TestOrgOverlayShortTerminalStillRendersOneRow(t *testing.T) {
 		t.Errorf("rendered rows = %d, want at most %d", rows, maxOrgRows)
 	}
 }
+
+func TestOrgOverlayDeleteRemovesHighlightedRow(t *testing.T) {
+	m := orgModel(t, "one", "two", "three")
+	m = send(m, key("down"))
+	m = send(m, key("down"))
+	if m.orgCursor != 1 {
+		t.Fatalf("cursor = %d, want 1", m.orgCursor)
+	}
+
+	next, cmd := m.Update(key("x"))
+	m = next.(model)
+
+	if cmd != nil {
+		t.Error("deleting an org returned a command")
+	}
+	if want := []string{"one", "three"}; !reflect.DeepEqual(m.orgs, want) {
+		t.Fatalf("orgs = %v, want %v", m.orgs, want)
+	}
+	if m.saveErr != nil {
+		t.Errorf("saveErr = %v, want nil", m.saveErr)
+	}
+	if got := config.Load().Orgs; !reflect.DeepEqual(got, []string{"one", "three"}) {
+		t.Errorf("persisted orgs = %v, want [one three]", got)
+	}
+}
+
+func TestOrgOverlayDeleteWithNoHighlightTypesTheCharacter(t *testing.T) {
+	m := orgModel(t, "one", "two", "three")
+	if m.orgCursor != -1 {
+		t.Fatalf("cursor = %d, want -1", m.orgCursor)
+	}
+	before := append([]string(nil), m.orgs...)
+
+	m = send(m, key("x"))
+
+	if got := m.orgInput.Value(); !strings.Contains(got, "x") {
+		t.Errorf("input = %q, want it to contain a literal x", got)
+	}
+	if !reflect.DeepEqual(m.orgs, before) {
+		t.Errorf("orgs = %v, want unchanged %v", m.orgs, before)
+	}
+	if m.orgCursor != -1 {
+		t.Errorf("cursor = %d, want -1", m.orgCursor)
+	}
+	if got := config.Load().Orgs; !reflect.DeepEqual(got, before) {
+		t.Errorf("persisted orgs = %v, want unchanged %v", got, before)
+	}
+}
+
+func TestOrgOverlayDeleteSavedOrgKeepsSession(t *testing.T) {
+	m := orgModel(t, "one", "two")
+	m = send(m, key("down"))
+	if m.orgs[m.orgCursor] != "one" {
+		t.Fatalf("cursor row = %q, want one", m.orgs[m.orgCursor])
+	}
+
+	next, cmd := m.Update(key("x"))
+	m = next.(model)
+
+	if cmd != nil {
+		t.Error("deleting the saved org triggered a command")
+	}
+	if m.opts.org != "one" {
+		t.Errorf("opts.org = %q, want one unchanged", m.opts.org)
+	}
+	if want := []string{"two"}; !reflect.DeepEqual(m.orgs, want) {
+		t.Errorf("orgs = %v, want %v", m.orgs, want)
+	}
+	if got := config.Load().Org; got != "one" {
+		t.Errorf("persisted org = %q, want one unchanged", got)
+	}
+	if !m.orgActive {
+		t.Error("overlay closed after a delete")
+	}
+}
+
+func TestOrgOverlayDeleteClampsCursor(t *testing.T) {
+	m := orgModel(t, "one", "two", "three")
+	for i := 0; i < 3; i++ {
+		m = send(m, key("down"))
+	}
+	if m.orgCursor != 2 {
+		t.Fatalf("cursor = %d, want 2", m.orgCursor)
+	}
+
+	m = send(m, key("x"))
+
+	if m.orgCursor != 1 {
+		t.Errorf("cursor = %d, want 1 clamped into range", m.orgCursor)
+	}
+	if m.orgCursor >= len(m.orgs) {
+		t.Fatalf("cursor %d out of range for %v", m.orgCursor, m.orgs)
+	}
+	if got := m.orgInput.Value(); got != m.orgs[m.orgCursor] {
+		t.Errorf("input = %q, want the new cursor row %q", got, m.orgs[m.orgCursor])
+	}
+	if got := m.orgListView(); strings.Contains(got, "three") {
+		t.Errorf("list still shows the deleted org: %q", got)
+	}
+}
+
+func TestOrgOverlayDeleteToEmptyRendersCleanly(t *testing.T) {
+	m := orgModel(t, "one", "two")
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	m = next.(model)
+
+	for len(m.orgs) > 0 {
+		m = send(m, key("down"))
+		m = send(m, key("x"))
+	}
+
+	if m.orgCursor != -1 {
+		t.Errorf("cursor = %d on an empty list, want -1", m.orgCursor)
+	}
+	if got := m.orgListView(); got != "" {
+		t.Errorf("list = %q, want empty", got)
+	}
+	if got := m.orgInput.Value(); got != m.opts.org {
+		t.Errorf("input = %q, want the session org %q restored", got, m.opts.org)
+	}
+	overlay := m.orgOverlayView()
+	if !strings.Contains(overlay, "org:") {
+		t.Error("overlay missing the org prompt after emptying the list")
+	}
+	if strings.Contains(overlay, "> ") {
+		t.Error("empty list rendered a cursor row")
+	}
+	if m.opts.org != "one" {
+		t.Errorf("opts.org = %q, want one unchanged", m.opts.org)
+	}
+}
+
+func TestOrgOverlayDeleteHintIsShown(t *testing.T) {
+	m := orgModel(t, "one", "two")
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	m = next.(model)
+	if !strings.Contains(m.orgOverlayView(), "x delete") {
+		t.Error("overlay hint does not mention x delete")
+	}
+}

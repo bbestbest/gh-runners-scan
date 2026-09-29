@@ -65,11 +65,13 @@ The overlay lists the orgs from `orgs` under the input, marking the saved one:
 │  > <org>  (saved) │
 │    org-b           │
 │                        │
-│  ↑↓ pick · enter · esc │
+│  ↑↓ · x · enter · esc  │
 ╰────────────────────────╯
 ```
 
 `↑`/`↓` walk the list and copy the highlighted org into the field; `↑` past the top returns to what you had typed. Typing anything clears the highlight, so the typed value is what `enter` accepts. `j` and `k` stay literal characters — the field is a text input. With no history the box is just the input and the hint, as before.
+
+`x` deletes the highlighted org from the list, so a typo or an org you no longer scan stops being offered. It only deletes while a row is highlighted; with no highlight `x` is an ordinary character typed into the field, like `j` and `k`. Deleting is a list operation and nothing more: only the `orgs` line is rewritten, `org` keeps its value, and the session carries on scanning the same org without a rescan. Deleting the org that `org` names therefore drops it from the list for that session, but the next run reads `org` and offers it again — the saved org is always part of the history. A delete that cannot be written shows `org not saved` and still applies in-session.
 
 `gh-runners` (the CLI) never writes the file.
 

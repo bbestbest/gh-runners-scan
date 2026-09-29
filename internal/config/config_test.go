@@ -313,3 +313,184 @@ func TestSetOrgErrorsWhenPathUnavailable(t *testing.T) {
 		t.Fatal("SetOrg() = nil, want an error when the parent path is a file")
 	}
 }
+
+func TestRemoveOrgRewrite(t *testing.T) {
+	cases := []struct {
+		name   string
+		before string
+		org    string
+		want   string
+	}{
+		{
+			"removes a middle entry keeping order",
+			"orgs = a, b, c\n",
+			"b",
+			"orgs = a, c\n",
+		},
+		{
+			"removes the saved org without touching the org line",
+			"org = org-a\norgs = org-a, other\n",
+			"org-a",
+			"org = org-a\norgs = other\n",
+		},
+		{
+			"absent org leaves the file untouched",
+			"# header\norg = org-a\norgs = org-a, other\ndays = 30\n",
+			"nope",
+			"# header\norg = org-a\norgs = org-a, other\ndays = 30\n",
+		},
+		{
+			"removing the last entry empties the orgs line",
+			"orgs = only\n",
+			"only",
+			"orgs = \n",
+		},
+		{
+			"preserves days comments unknown keys and order",
+			"# scan this org\norg = org-a\n\ndays = 30\ncolour = red\norgs = org-a, b, c\n# tail\n",
+			"b",
+			"# scan this org\norg = org-a\n\ndays = 30\ncolour = red\norgs = org-a, c\n# tail\n",
+		},
+		{
+			"no orgs line is a no-op even with an org key",
+			"org = org-a\ndays = 2\n",
+			"nope",
+			"org = org-a\ndays = 2\n",
+		},
+		{
+			"removes an entry the migration re-adds from org",
+			"org = org-a\ndays = 2\n",
+			"org-a",
+			"org = org-a\ndays = 2\norgs = \n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("XDG_CONFIG_HOME", dir)
+			if err := os.MkdirAll(filepath.Join(dir, "gh-runners"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "gh-runners", "config")
+			if err := os.WriteFile(path, []byte(c.before), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := RemoveOrg(c.org); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != c.want {
+				t.Errorf("file = %q, want %q", string(data), c.want)
+			}
+		})
+	}
+}
+
+func TestRemoveOrgKeepsOrgKeyByte(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	if err := os.MkdirAll(filepath.Join(dir, "gh-runners"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "gh-runners", "config")
+	before := "  org  =  org-a  \norgs = org-a, other\ndays = 5\n"
+	if err := os.WriteFile(path, []byte(before), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveOrg("org-a"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "  org  =  org-a  \norgs = other\ndays = 5\n"
+	if string(data) != want {
+		t.Fatalf("file = %q, want %q", string(data), want)
+	}
+}
+
+func TestRemoveOrgMissingFileIsNoOp(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := RemoveOrg("org-a"); err != nil {
+		t.Fatalf("RemoveOrg() = %v, want nil on a missing file", err)
+	}
+}
+
+func TestRemoveOrgRoundTrip(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	for _, org := range []string{"c", "b", "a"} {
+		if err := SetOrg(org); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := RemoveOrg("b"); err != nil {
+		t.Fatal(err)
+	}
+	got := Load()
+	if got.Org != "a" {
+		t.Errorf("Org = %q, want a", got.Org)
+	}
+	if want := []string{"a", "c"}; !reflect.DeepEqual(got.Orgs, want) {
+		t.Errorf("Orgs = %v, want %v", got.Orgs, want)
+	}
+}
+
+func TestRemoveOrgOfSavedOrgReappearsViaMigration(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := SetOrg("other"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetOrg("org-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveOrg("org-a"); err != nil {
+		t.Fatal(err)
+	}
+	got := Load()
+	if got.Org != "org-a" {
+		t.Errorf("Org = %q, want org-a preserved", got.Org)
+	}
+	if want := []string{"org-a", "other"}; !reflect.DeepEqual(got.Orgs, want) {
+		t.Errorf("Orgs = %v, want %v: parse re-adds Org to Orgs", got.Orgs, want)
+	}
+}
+
+func TestRemoveOrgLastEntryStillLoads(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	if err := os.MkdirAll(filepath.Join(dir, "gh-runners"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gh-runners", "config"), []byte("orgs = only\ndays = 3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveOrg("only"); err != nil {
+		t.Fatal(err)
+	}
+	want := Config{Days: 3, DaysSet: true}
+	if got := Load(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Load() = %+v, want %+v", got, want)
+	}
+}
+
+func TestRemoveOrgLeavesNoTempFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	if err := SetOrg("org-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveOrg("org-a"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "gh-runners"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "config" {
+		t.Errorf("dir entries = %v, want just config", entries)
+	}
+}
