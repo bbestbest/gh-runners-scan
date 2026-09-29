@@ -232,6 +232,47 @@ func scanRepo(ctx context.Context, limited *atomic.Bool, org, repo string) []Job
 
 const TotalUnknown = -1
 
+func SplitRepo(org, repo string) (string, string) {
+	repo = strings.TrimSpace(repo)
+	repo = strings.Trim(repo, "/")
+	if owner, name, ok := strings.Cut(repo, "/"); ok {
+		owner = strings.TrimSpace(owner)
+		name = strings.TrimSpace(name)
+		if owner != "" && name != "" {
+			return owner, name
+		}
+		if name != "" {
+			return org, name
+		}
+		return org, ""
+	}
+	return org, repo
+}
+
+func ScanRepo(ctx context.Context, org, repo string, progress func(done, total int)) ([]Job, error) {
+	owner, name := SplitRepo(org, repo)
+	if name == "" {
+		return nil, nil
+	}
+
+	var limited atomic.Bool
+
+	if progress != nil {
+		progress(0, 1)
+	}
+
+	jobs := scanRepo(ctx, &limited, owner, name)
+
+	if progress != nil {
+		progress(1, 1)
+	}
+
+	if limited.Load() {
+		return jobs, ErrRateLimited
+	}
+	return jobs, nil
+}
+
 func Scan(ctx context.Context, org string, days int, progress func(done, total int)) ([]Job, error) {
 	var limited atomic.Bool
 

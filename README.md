@@ -18,6 +18,7 @@ gh-runners-tui <org>              # live table, rescans on a timer
 gh-runners <org>                  # one-shot, tab-separated
 gh-runners <org> --label ARM64    # filter by runner label
 gh-runners <org> --select         # pick a job in fzf, open it in the browser
+gh-runners <org> --repo web       # scan one repo, not the whole org
 ```
 
 The org comes from the first argument, `GH_RUNNERS_ORG`, or the config file. With none of them, both commands exit 1.
@@ -31,6 +32,8 @@ The org comes from the first argument, `GH_RUNNERS_ORG`, or the config file. Wit
 | `GH_TOKEN` / `GITHUB_TOKEN` | API token; falls back to `gh auth token` | — |
 
 Flags: `--label`, `--days`, `--repo`, `--once`, `--interval` (TUI), `--select` (CLI).
+
+`--repo` scans only that repo instead of the whole org, and accepts either a bare name resolved against the org or an explicit `owner/repo`. In the TUI it also highlights the repo's rows.
 
 ### Config file
 
@@ -73,6 +76,8 @@ The overlay lists the orgs from `orgs` under the input, marking the saved one:
 
 `x` deletes the highlighted org from the list, so a typo or an org you no longer scan stops being offered. It only deletes while a row is highlighted; with no highlight `x` is an ordinary character typed into the field, like `j` and `k`. Deleting is a list operation and nothing more: only the `orgs` line is rewritten, `org` keeps its value, and the session carries on scanning the same org without a rescan. Deleting the org that `org` names therefore drops it from the list for that session, but the next run reads `org` and offers it again — the saved org is always part of the history. A delete that cannot be written shows `org not saved` and still applies in-session.
 
+The field itself always opens **empty**, showing the `organisation` placeholder, whether the overlay comes up at startup or from `<O>`. The saved org is still listed below and still marked `(saved)` — the field starts blank so typing a new org needs no clearing first, and `↑`/`↓` are there when you want the one you already have. `enter` on an empty field is a cancel: it keeps the current org for the session and saves nothing, the same as `esc`.
+
 `gh-runners` (the CLI) never writes the file.
 
 ## Reading the output
@@ -83,7 +88,7 @@ Runner *labels* (`self-hosted,ARM64`) are what a job requests. The runner *name*
 
 ## API usage
 
-Each scan costs roughly `1 + 2×repos` requests, so the org size drives the bill against the 5000/hour quota.
+Each scan costs roughly `1 + 2×repos` requests, so the org size drives the bill against the 5000/hour quota. `--repo` skips the repo listing entirely and costs about 2–3 requests.
 
 Conditional requests keep that cheap: an unchanged repo returns `304 Not Modified`, which does not count against the quota. The ETag cache is **in-memory and per-process**, so:
 

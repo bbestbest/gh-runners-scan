@@ -124,6 +124,7 @@ func newModel(opts options) model {
 	oi := textinput.New()
 	oi.Placeholder = "organisation"
 	oi.Prompt = "org: "
+	oi.Width = orgInputWidth
 	if m.orgActive {
 		oi.Focus()
 	}
@@ -488,7 +489,10 @@ func (m *model) refresh() {
 }
 
 func (m model) rowStyle(repo string) lipgloss.Style {
-	if m.opts.repo != "" && repo == m.opts.repo {
+	if m.opts.repo == "" {
+		return lipgloss.NewStyle()
+	}
+	if _, name := scan.SplitRepo(m.opts.org, m.opts.repo); repo == name {
 		return hlStyle
 	}
 	return lipgloss.NewStyle()
@@ -610,6 +614,8 @@ const headerHeight = 4
 const hintColWidth = 18
 
 const maxOrgRows = 8
+
+const orgInputWidth = 20
 
 func (m model) View() string {
 	var b strings.Builder

@@ -220,8 +220,8 @@ func TestOrgOverlayEscape(t *testing.T) {
 	if !withOrg.orgActive {
 		t.Fatal("O did not open the overlay")
 	}
-	if got := withOrg.orgInput.Value(); got != "org-c" {
-		t.Errorf("overlay value = %q, want org-c", got)
+	if got := withOrg.orgInput.Value(); got != "" {
+		t.Errorf("overlay value = %q, want an empty field", got)
 	}
 
 	next, cmd := withOrg.Update(key("esc"))
@@ -240,9 +240,6 @@ func TestOrgOverlayEscape(t *testing.T) {
 func TestOrgOverlayChangeWhileRunning(t *testing.T) {
 	m := newTestModel(t)
 	m = send(m, key("O"))
-	for range "org-c" {
-		m = send(m, tea.KeyMsg{Type: tea.KeyBackspace})
-	}
 	m = typeRunes(m, "org-b")
 
 	next, cmd := m.Update(key("enter"))
@@ -309,9 +306,6 @@ func TestOrgOverlaySwitchPersistsOrg(t *testing.T) {
 
 	m := newTestModel(t)
 	m = send(m, key("O"))
-	for range "org-c" {
-		m = send(m, tea.KeyMsg{Type: tea.KeyBackspace})
-	}
 	m = typeRunes(m, "org-b")
 	next, _ := m.Update(key("enter"))
 	m = next.(model)
@@ -326,6 +320,7 @@ func TestOrgOverlayReconfirmPersistsOrg(t *testing.T) {
 
 	m := newTestModel(t)
 	m = send(m, key("O"))
+	m = typeRunes(m, "org-c")
 	next, _ := m.Update(key("enter"))
 	m = next.(model)
 
@@ -334,6 +329,28 @@ func TestOrgOverlayReconfirmPersistsOrg(t *testing.T) {
 	}
 	if got := config.Load().Org; got != "org-c" {
 		t.Errorf("persisted org = %q, want org-c", got)
+	}
+}
+
+func TestOrgOverlayEmptyEnterKeepsOrgWithoutSaving(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	m := newTestModel(t)
+	m = send(m, key("O"))
+	next, cmd := m.Update(key("enter"))
+	m = next.(model)
+
+	if m.opts.org != "org-c" {
+		t.Errorf("org = %q, want org-c kept in session", m.opts.org)
+	}
+	if m.orgActive {
+		t.Error("overlay still active after an empty enter")
+	}
+	if cmd != nil {
+		t.Error("an empty enter triggered a rescan")
+	}
+	if got := config.Load().Org; got != "" {
+		t.Errorf("persisted org = %q, want empty: an empty enter is a cancel", got)
 	}
 }
 
@@ -390,9 +407,6 @@ func TestOrgOverlayEscDoesNotPersist(t *testing.T) {
 
 	m := newTestModel(t)
 	m = send(m, key("O"))
-	for range "org-c" {
-		m = send(m, tea.KeyMsg{Type: tea.KeyBackspace})
-	}
 	m = typeRunes(m, "org-b")
 	next, _ := m.Update(key("esc"))
 	m = next.(model)
@@ -446,7 +460,7 @@ func TestOrgOverlayCursorWalksHistory(t *testing.T) {
 		{"down", 2, "three"},
 		{"up", 1, "two"},
 		{"up", 0, "one"},
-		{"up", -1, "one"},
+		{"up", -1, ""},
 	}
 	for _, s := range steps {
 		m = send(m, key(s.key))
@@ -510,9 +524,6 @@ func TestOrgOverlayTypingBeatsHighlightedRow(t *testing.T) {
 
 func TestOrgOverlayArrowsDoNotBreakTyping(t *testing.T) {
 	m := orgModel(t, "one", "two")
-	for range "one" {
-		m = send(m, tea.KeyMsg{Type: tea.KeyBackspace})
-	}
 	m = typeRunes(m, "jk")
 
 	if got := m.orgInput.Value(); got != "jk" {
@@ -731,8 +742,8 @@ func TestOrgOverlayDeleteToEmptyRendersCleanly(t *testing.T) {
 	if got := m.orgListView(); got != "" {
 		t.Errorf("list = %q, want empty", got)
 	}
-	if got := m.orgInput.Value(); got != m.opts.org {
-		t.Errorf("input = %q, want the session org %q restored", got, m.opts.org)
+	if got := m.orgInput.Value(); got != "" {
+		t.Errorf("input = %q, want an empty field", got)
 	}
 	overlay := m.orgOverlayView()
 	if !strings.Contains(overlay, "org:") {
@@ -752,5 +763,118 @@ func TestOrgOverlayDeleteHintIsShown(t *testing.T) {
 	m = next.(model)
 	if !strings.Contains(m.orgOverlayView(), "x delete") {
 		t.Error("overlay hint does not mention x delete")
+	}
+}
+
+func TestOrgOverlayOpensWithAnEmptyField(t *testing.T) {
+	t.Run("at startup with no org", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		m := newModel(options{interval: 30})
+		if got := m.orgInput.Value(); got != "" {
+			t.Errorf("value = %q, want empty", got)
+		}
+	})
+
+	t.Run("at startup with a saved org", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		m := newModel(options{org: "org-c", interval: 30})
+		if got := m.orgInput.Value(); got != "" {
+			t.Errorf("value = %q, want empty even though org is set", got)
+		}
+	})
+
+	t.Run("reopened with O", func(t *testing.T) {
+		m := orgModel(t, "one", "two")
+		if got := m.orgInput.Value(); got != "" {
+			t.Errorf("value = %q, want empty after O", got)
+		}
+		if !m.orgActive {
+			t.Error("O did not open the overlay")
+		}
+	})
+
+	t.Run("saved org still listed", func(t *testing.T) {
+		m := orgModel(t, "one", "two")
+		next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+		m = next.(model)
+		list := m.orgListView()
+		if !strings.Contains(list, "one") {
+			t.Errorf("list does not show the saved org: %q", list)
+		}
+		if !strings.Contains(list, "(saved)") {
+			t.Errorf("list does not mark the saved org: %q", list)
+		}
+	})
+
+	t.Run("placeholder visible while empty", func(t *testing.T) {
+		m := orgModel(t, "one", "two")
+		next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+		m = next.(model)
+		if !strings.Contains(m.orgOverlayView(), "organisation") {
+			t.Error("overlay does not show the organisation placeholder")
+		}
+	})
+
+	t.Run("reopening after a pick is empty again", func(t *testing.T) {
+		m := orgModel(t, "one", "two")
+		m = send(m, key("down"))
+		m = send(m, key("down"))
+		next, _ := m.Update(key("enter"))
+		m = next.(model)
+		if m.opts.org != "two" {
+			t.Fatalf("org = %q, want two", m.opts.org)
+		}
+		m = send(m, key("O"))
+		if got := m.orgInput.Value(); got != "" {
+			t.Errorf("value = %q, want empty on reopen", got)
+		}
+	})
+}
+
+func TestOrgOverlayBlankEnterUnchangedWithEmptyField(t *testing.T) {
+	t.Run("no org set rejects", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		m := newModel(options{interval: 30})
+		next, cmd := m.Update(key("enter"))
+		m = next.(model)
+		if !m.orgActive {
+			t.Error("overlay closed on an empty field with no org set")
+		}
+		if cmd != nil {
+			t.Error("empty field with no org set returned a command")
+		}
+		if m.opts.org != "" {
+			t.Errorf("org = %q, want empty", m.opts.org)
+		}
+	})
+
+	t.Run("org set keeps it and closes", func(t *testing.T) {
+		m := orgModel(t, "one", "two")
+		next, cmd := m.Update(key("enter"))
+		m = next.(model)
+		if m.orgActive {
+			t.Error("overlay still active after enter on an empty field")
+		}
+		if m.opts.org != "one" {
+			t.Errorf("org = %q, want one kept", m.opts.org)
+		}
+		if cmd != nil {
+			t.Error("empty-field enter triggered a rescan")
+		}
+	})
+}
+
+func TestOrgOverlayArrowPastTopClearsField(t *testing.T) {
+	m := orgModel(t, "one", "two")
+	m = send(m, key("down"))
+	if got := m.orgInput.Value(); got != "one" {
+		t.Fatalf("value = %q, want one copied in", got)
+	}
+	m = send(m, key("up"))
+	if m.orgCursor != -1 {
+		t.Fatalf("cursor = %d, want -1", m.orgCursor)
+	}
+	if got := m.orgInput.Value(); got != "" {
+		t.Errorf("value = %q, want empty after arrowing past the top", got)
 	}
 }

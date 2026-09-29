@@ -26,7 +26,7 @@ func main() {
 	label := flag.String("label", "", "filter jobs by runner label substring")
 	days := flag.Int("days", envDays(cfg), "only scan repos pushed within N days (0 = all)")
 	interval := flag.Int("interval", 150, "rescan interval in seconds")
-	repo := flag.String("repo", "", "highlight this repo")
+	repo := flag.String("repo", "", "scan only this repo (owner/repo or a bare name) and highlight it")
 	once := flag.Bool("once", false, "print tables once and exit")
 	flag.CommandLine.Parse(args)
 
@@ -99,6 +99,13 @@ func splitOrg(argv []string, fallback string) (string, []string) {
 	return org, args
 }
 
+func scanTarget(ctx context.Context, opts options, progress func(done, total int)) ([]scan.Job, error) {
+	if opts.repo != "" {
+		return scan.ScanRepo(ctx, opts.org, opts.repo, progress)
+	}
+	return scan.Scan(ctx, opts.org, opts.days, progress)
+}
+
 func printOnce(opts options) {
 	jobs, scanErr := scanLabeled(context.Background(), opts, func(done, total int) {
 		if total < 0 {
@@ -143,7 +150,7 @@ func printOnce(opts options) {
 }
 
 func scanLabeled(ctx context.Context, opts options, progress func(done, total int)) ([]scan.Job, error) {
-	jobs, scanErr := scan.Scan(ctx, opts.org, opts.days, progress)
+	jobs, scanErr := scanTarget(ctx, opts, progress)
 	if opts.label == "" {
 		return jobs, scanErr
 	}

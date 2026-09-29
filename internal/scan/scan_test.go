@@ -5,11 +5,18 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type progressCall struct {
+	done  int
+	total int
+}
 
 func withClient(t *testing.T, base string) {
 	t.Helper()
@@ -189,5 +196,167 @@ func TestScanReturnsErrRateLimited(t *testing.T) {
 	}
 	if len(jobs) != 0 {
 		t.Fatalf("jobs = %+v", jobs)
+	}
+}
+
+func TestSplitRepoResolvesBothForms(t *testing.T) {
+	cases := []struct {
+		org, repo   string
+		owner, name string
+	}{
+		{"org-a", "web", "org-a", "web"},
+		{"org-a", "other/web", "other", "web"},
+		{"org-a", " org-a/web ", "org-a", "web"},
+		{"org-a", "/web", "org-a", "web"},
+		{"org-a", "web/", "org-a", "web"},
+		{"org-a", "", "org-a", ""},
+		{"org-a", "  ", "org-a", ""},
+	}
+	for _, c := range cases {
+		owner, name := SplitRepo(c.org, c.repo)
+		if owner != c.owner || name != c.name {
+			t.Errorf("SplitRepo(%q, %q) = %q, %q want %q, %q", c.org, c.repo, owner, name, c.owner, c.name)
+		}
+	}
+}
+
+func TestScanRepoSkipsRepoListing(t *testing.T) {
+	resetRepoCache(t)
+	var orgCalls atomic.Int64
+	var paths []string
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if strings.HasPrefix(r.URL.Path, "/orgs/") {
+			orgCalls.Add(1)
+			t.Errorf("single-repo scan listed org repos: %s", r.URL.Path)
+			fmt.Fprint(w, `[]`)
+			return
+		}
+		switch r.URL.Path {
+		case "/repos/org-a/web/actions/runs":
+			if r.URL.Query().Get("status") == "in_progress" {
+				fmt.Fprint(w, `{"workflow_runs":[{"id":11}]}`)
+				return
+			}
+			fmt.Fprint(w, `{"workflow_runs":[]}`)
+		case "/repos/org-a/web/actions/runs/11/jobs":
+			fmt.Fprint(w, `{"jobs":[{"status":"in_progress","workflow_name":"CI","head_branch":"main","name":"build","runner_name":"rnr-1","labels":["self-hosted"],"started_at":"2026-09-20T10:00:00Z","created_at":"2026-09-20T09:59:00Z","html_url":"https://gh/j/11"}]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	var got []progressCall
+	jobs, err := ScanRepo(context.Background(), "org-a", "web", func(done, total int) {
+		got = append(got, progressCall{done, total})
+	})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if orgCalls.Load() != 0 {
+		t.Fatalf("listRepos was called %d times", orgCalls.Load())
+	}
+	if len(jobs) != 1 || jobs[0].Repo != "web" || jobs[0].Runner != "rnr-1" {
+		t.Fatalf("jobs = %+v", jobs)
+	}
+	mu.Lock()
+	n := len(paths)
+	mu.Unlock()
+	if n != 3 {
+		t.Fatalf("issued %d requests (%v), want 3", n, paths)
+	}
+	want := []progressCall{{0, 1}, {1, 1}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("progress = %v want %v", got, want)
+	}
+}
+
+func TestScanRepoOwnerFormOverridesOrg(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/repos/other/web/") {
+			t.Errorf("owner/repo form hit %s, want the other owner", r.URL.Path)
+		}
+		if strings.HasSuffix(r.URL.Path, "/runs") {
+			fmt.Fprint(w, `{"workflow_runs":[]}`)
+			return
+		}
+		fmt.Fprint(w, `{"jobs":[]}`)
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	if _, err := ScanRepo(context.Background(), "org-a", "other/web", nil); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestScanRepoEmptyNameScansNothing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("empty repo name issued a request to %s", r.URL.Path)
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	jobs, err := ScanRepo(context.Background(), "org-a", "   ", nil)
+	if err != nil || jobs != nil {
+		t.Fatalf("jobs = %+v err = %v, want no scan", jobs, err)
+	}
+}
+
+func TestScanRepoReturnsOnlyThatRepo(t *testing.T) {
+	var paths []string
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if strings.HasSuffix(r.URL.Path, "/jobs") {
+			fmt.Fprint(w, `{"jobs":[{"status":"queued","workflow_name":"deploy","name":"job","html_url":"https://example.com/q"}]}`)
+			return
+		}
+		if r.URL.Query().Get("status") == "in_progress" {
+			fmt.Fprint(w, `{"workflow_runs":[{"id":11}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"workflow_runs":[]}`)
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	jobs, err := ScanRepo(context.Background(), "org-a", "only-this", nil)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	for _, j := range jobs {
+		if j.Repo != "only-this" {
+			t.Errorf("job from %q, want only-this", j.Repo)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range paths {
+		if !strings.Contains(p, "/repos/org-a/only-this") {
+			t.Errorf("requested %q, want only /repos/org-a/only-this", p)
+		}
+	}
+}
+
+func TestScanRepoPropagatesRateLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	if _, err := ScanRepo(context.Background(), "org-a", "web", nil); err != ErrRateLimited {
+		t.Fatalf("err = %v, want ErrRateLimited", err)
 	}
 }
