@@ -49,7 +49,11 @@ Both commands resolve each value in this order, first hit wins:
 3. config file
 4. built-in default — org: none (exit 1); days: 7
 
-The file is optional and never written by these commands. A missing file, an unreadable one, or a `days` that is not a number is ignored silently.
+The file is optional. A missing file, an unreadable one, or a `days` that is not a number is ignored silently.
+
+`gh-runners-tui` writes it. Accepting an org in the `<O>` overlay saves `org = <value>`, creating the file and its directory if needed, so the next run starts in that org with no prompt — set it once, like `git remote add`. Every accept saves, including a later switch to a different org. Only the `org` line changes: `days`, comments, blank lines, unknown keys and their order are preserved, and the write is atomic, so an interrupt cannot truncate the file. A save that fails is not fatal — the org still applies for that session and the status line shows `org not saved`.
+
+`gh-runners` (the CLI) never writes the file.
 
 ## Reading the output
 

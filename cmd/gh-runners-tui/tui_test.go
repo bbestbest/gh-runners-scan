@@ -1,12 +1,15 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"gh-runners/internal/config"
 	"gh-runners/internal/scan"
 )
 
@@ -262,5 +265,125 @@ func TestViewContents(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Errorf("view missing %q", want)
 		}
+	}
+}
+
+func TestOrgOverlayPersistsOrg(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	m := newModel(options{interval: 30})
+	m = typeRunes(m, "org-a")
+	next, _ := m.Update(key("enter"))
+	m = next.(model)
+
+	if m.saveErr != nil {
+		t.Fatalf("saveErr = %v, want nil", m.saveErr)
+	}
+	if got := config.Load().Org; got != "org-a" {
+		t.Errorf("persisted org = %q, want org-a", got)
+	}
+}
+
+func TestOrgOverlaySwitchPersistsOrg(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := config.SetOrg("org-c"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newTestModel(t)
+	m = send(m, key("O"))
+	for range "org-c" {
+		m = send(m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	m = typeRunes(m, "org-b")
+	next, _ := m.Update(key("enter"))
+	m = next.(model)
+
+	if got := config.Load().Org; got != "org-b" {
+		t.Errorf("persisted org = %q, want org-b", got)
+	}
+}
+
+func TestOrgOverlayReconfirmPersistsOrg(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	m := newTestModel(t)
+	m = send(m, key("O"))
+	next, _ := m.Update(key("enter"))
+	m = next.(model)
+
+	if m.opts.org != "org-c" {
+		t.Fatalf("org = %q, want org-c", m.opts.org)
+	}
+	if got := config.Load().Org; got != "org-c" {
+		t.Errorf("persisted org = %q, want org-c", got)
+	}
+}
+
+func TestOrgOverlaySaveFailureKeepsSessionUsable(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	if err := os.WriteFile(filepath.Join(dir, "gh-runners"), []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newModel(options{interval: 30})
+	m = typeRunes(m, "org-a")
+	next, cmd := m.Update(key("enter"))
+	m = next.(model)
+
+	if m.saveErr == nil {
+		t.Fatal("saveErr = nil, want an error")
+	}
+	if m.opts.org != "org-a" {
+		t.Errorf("org = %q, want org-a applied in-session despite the save failure", m.opts.org)
+	}
+	if m.orgActive {
+		t.Error("overlay still active after a failed save")
+	}
+	if !m.scanning {
+		t.Error("scanning = false after a failed save")
+	}
+	if cmd == nil {
+		t.Error("a failed save suppressed the scan")
+	}
+	if !strings.Contains(m.statusView(), "org not saved") {
+		t.Error("status line does not surface the save failure")
+	}
+}
+
+func TestOrgOverlayBlankDoesNotPersist(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	m := newModel(options{interval: 30})
+	m = typeRunes(m, "   ")
+	next, _ := m.Update(key("enter"))
+	m = next.(model)
+
+	if got := config.Load().Org; got != "" {
+		t.Errorf("persisted org = %q, want empty", got)
+	}
+	if !m.orgActive {
+		t.Error("overlay closed on blank input")
+	}
+}
+
+func TestOrgOverlayEscDoesNotPersist(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	m := newTestModel(t)
+	m = send(m, key("O"))
+	for range "org-c" {
+		m = send(m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	m = typeRunes(m, "org-b")
+	next, _ := m.Update(key("esc"))
+	m = next.(model)
+
+	if got := config.Load().Org; got != "" {
+		t.Errorf("persisted org = %q, want empty after esc", got)
+	}
+	if m.opts.org != "org-c" {
+		t.Errorf("org = %q, want org-c", m.opts.org)
 	}
 }

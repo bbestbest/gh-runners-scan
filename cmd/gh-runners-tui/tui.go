@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"gh-runners/internal/config"
 	"gh-runners/internal/scan"
 )
 
@@ -90,6 +91,7 @@ type model struct {
 	lastScan  string
 	nextIn    int
 	scanErr   error
+	saveErr   error
 
 	width  int
 	height int
@@ -252,6 +254,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.orgActive = false
 			m.orgInput.SetValue(org)
 			m.orgInput.Blur()
+			m.saveErr = config.SetOrg(org)
 			if org == m.opts.org {
 				return m, nil
 			}
@@ -708,6 +711,10 @@ func (m model) statusView() string {
 		right = redStyle.Render("rate limited · incomplete") + dimStyle.Render("   "+right)
 	} else {
 		right = dimStyle.Render(right)
+	}
+
+	if m.saveErr != nil {
+		right = yellowStyle.Render("org not saved") + dimStyle.Render("   ") + right
 	}
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
