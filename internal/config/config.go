@@ -8,8 +8,11 @@ import (
 	"strings"
 )
 
+const maxOrgs = 10
+
 type Config struct {
 	Org     string
+	Orgs    []string
 	Days    int
 	DaysSet bool
 }
@@ -53,6 +56,8 @@ func parse(text string) Config {
 		switch key {
 		case "org":
 			cfg.Org = value
+		case "orgs":
+			cfg.Orgs = splitOrgs(value)
 		case "days":
 			n, err := strconv.Atoi(value)
 			if err != nil {
@@ -62,7 +67,37 @@ func parse(text string) Config {
 			cfg.DaysSet = true
 		}
 	}
+	if cfg.Org != "" {
+		cfg.Orgs = mergeOrgs(cfg.Orgs, cfg.Org)
+	}
 	return cfg
+}
+
+func splitOrgs(value string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" || seen[part] {
+			continue
+		}
+		seen[part] = true
+		out = append(out, part)
+	}
+	return out
+}
+
+func mergeOrgs(orgs []string, org string) []string {
+	out := []string{org}
+	for _, o := range orgs {
+		if o != org {
+			out = append(out, o)
+		}
+	}
+	if len(out) > maxOrgs {
+		out = out[:maxOrgs]
+	}
+	return out
 }
 
 func SetOrg(org string) error {
@@ -78,11 +113,15 @@ func SetOrg(org string) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return writeFileAtomic(path, replaceOrg(string(existing), org))
+	text := string(existing)
+	orgs := mergeOrgs(parse(text).Orgs, org)
+	text = replaceKey(text, "org", org)
+	text = replaceKey(text, "orgs", strings.Join(orgs, ", "))
+	return writeFileAtomic(path, text)
 }
 
-func replaceOrg(text, org string) string {
-	line := "org = " + org + "\n"
+func replaceKey(text, key, value string) string {
+	line := key + " = " + value + "\n"
 	if strings.TrimSpace(text) == "" {
 		return line
 	}
@@ -92,8 +131,8 @@ func replaceOrg(text, org string) string {
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		key, _, ok := strings.Cut(trimmed, "=")
-		if !ok || strings.TrimSpace(key) != "org" {
+		k, _, ok := strings.Cut(trimmed, "=")
+		if !ok || strings.TrimSpace(k) != key {
 			continue
 		}
 		lines[i] = line

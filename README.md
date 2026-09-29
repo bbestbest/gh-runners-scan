@@ -34,13 +34,16 @@ Flags: `--label`, `--days`, `--repo`, `--once`, `--interval` (TUI), `--select` (
 
 ### Config file
 
-`org` and `days` can be stored in `$XDG_CONFIG_HOME/gh-runners/config`, or `~/.config/gh-runners/config` when `XDG_CONFIG_HOME` is unset. One `key = value` per line; `#` starts a comment.
+`org`, `orgs` and `days` can be stored in `$XDG_CONFIG_HOME/gh-runners/config`, or `~/.config/gh-runners/config` when `XDG_CONFIG_HOME` is unset. One `key = value` per line; `#` starts a comment.
 
 ```ini
 # scan this org unless a different one is given
 org = org-a
+orgs = org-a, org-b
 days = 30
 ```
+
+`orgs` is the history the `<O>` overlay offers, most recently used first, comma-separated. Only `org` decides what a run scans; `orgs` is there so you can pick instead of retype.
 
 Both commands resolve each value in this order, first hit wins:
 
@@ -51,7 +54,22 @@ Both commands resolve each value in this order, first hit wins:
 
 The file is optional. A missing file, an unreadable one, or a `days` that is not a number is ignored silently.
 
-`gh-runners-tui` writes it. Accepting an org in the `<O>` overlay saves `org = <value>`, creating the file and its directory if needed, so the next run starts in that org with no prompt — set it once, like `git remote add`. Every accept saves, including a later switch to a different org. Only the `org` line changes: `days`, comments, blank lines, unknown keys and their order are preserved, and the write is atomic, so an interrupt cannot truncate the file. A save that fails is not fatal — the org still applies for that session and the status line shows `org not saved`.
+`gh-runners-tui` writes it. Accepting an org in the `<O>` overlay saves `org = <value>` and moves that org to the front of `orgs`, creating the file and its directory if needed, so the next run starts in that org with no prompt — set it once, like `git remote add`. Every accept saves, including a later switch to a different org. The history is capped at 10, dropping the least recently used. A file that has `org` but no `orgs` line reads as a one-entry history. Only the `org` and `orgs` lines change: `days`, comments, blank lines, unknown keys and their order are preserved, and the write is atomic, so an interrupt cannot truncate the file. A save that fails is not fatal — the org still applies for that session and the status line shows `org not saved`.
+
+The overlay lists the orgs from `orgs` under the input, marking the saved one:
+
+```
+╭────────────────────────╮
+│  org: ▊                │
+│                        │
+│  > <org>  (saved) │
+│    org-b           │
+│                        │
+│  ↑↓ pick · enter · esc │
+╰────────────────────────╯
+```
+
+`↑`/`↓` walk the list and copy the highlighted org into the field; `↑` past the top returns to what you had typed. Typing anything clears the highlight, so the typed value is what `enter` accepts. `j` and `k` stay literal characters — the field is a text input. With no history the box is just the input and the hint, as before.
 
 `gh-runners` (the CLI) never writes the file.
 

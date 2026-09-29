@@ -83,6 +83,8 @@ type model struct {
 
 	orgInput  textinput.Model
 	orgActive bool
+	orgs      []string
+	orgCursor int
 
 	spin      spinner.Model
 	scanning  bool
@@ -107,6 +109,8 @@ func newModel(opts options) model {
 		orgActive: opts.org == "",
 		progress:  progressMsg{0, scan.TotalUnknown},
 		repoCount: scan.TotalUnknown,
+		orgs:      config.Load().Orgs,
+		orgCursor: -1,
 	}
 
 	m.runTable = newTable(runningCols)
@@ -240,6 +244,12 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.orgInput.SetValue(m.opts.org)
 			m.orgInput.Blur()
 			return m, nil
+		case "up":
+			m.moveOrgCursor(-1)
+			return m, nil
+		case "down":
+			m.moveOrgCursor(1)
+			return m, nil
 		case "enter":
 			org := strings.TrimSpace(m.orgInput.Value())
 			if org == "" {
@@ -255,6 +265,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.orgInput.SetValue(org)
 			m.orgInput.Blur()
 			m.saveErr = config.SetOrg(org)
+			m.orgs = config.Load().Orgs
+			m.orgCursor = -1
 			if org == m.opts.org {
 				return m, nil
 			}
@@ -269,6 +281,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.refresh()
 			return m, scanCmd(m.opts)
 		}
+		m.orgCursor = -1
 		var cmd tea.Cmd
 		m.orgInput, cmd = m.orgInput.Update(msg)
 		return m, cmd
@@ -312,6 +325,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, textinput.Blink
 	case "O":
 		m.orgActive = true
+		m.orgs = config.Load().Orgs
+		m.orgCursor = -1
 		m.orgInput.SetValue(m.opts.org)
 		m.orgInput.CursorEnd()
 		m.orgInput.Focus()
@@ -340,6 +355,28 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m *model) moveOrgCursor(delta int) {
+	if len(m.orgs) == 0 {
+		return
+	}
+	next := m.orgCursor + delta
+	if m.orgCursor < 0 && delta < 0 {
+		next = len(m.orgs) - 1
+	}
+	if next < 0 {
+		m.orgCursor = -1
+		m.orgInput.SetValue(m.opts.org)
+		m.orgInput.CursorEnd()
+		return
+	}
+	if next > len(m.orgs)-1 {
+		next = len(m.orgs) - 1
+	}
+	m.orgCursor = next
+	m.orgInput.SetValue(m.orgs[next])
+	m.orgInput.CursorEnd()
 }
 
 func (m *model) moveCursor(delta int) {
@@ -547,6 +584,8 @@ const headerHeight = 4
 
 const hintColWidth = 18
 
+const maxOrgRows = 8
+
 func (m model) View() string {
 	var b strings.Builder
 	b.WriteString(m.headerView())
@@ -579,22 +618,64 @@ func (m model) View() string {
 }
 
 func (m model) orgOverlayView() string {
-	hint := "enter confirm · esc cancel"
+	hint := "↑↓ pick · enter confirm · esc cancel"
 	if m.opts.org == "" {
-		hint = "enter confirm · esc quit"
+		hint = "↑↓ pick · enter confirm · esc quit"
+	}
+
+	body := m.orgInput.View()
+	if list := m.orgListView(); list != "" {
+		body += "\n\n" + list
 	}
 
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorAccent).
 		Padding(1, 2).
-		Render(m.orgInput.View() + "\n\n" + dimStyle.Render(hint))
+		Render(body + "\n\n" + dimStyle.Render(hint))
 
-	body := m.height - headerHeight - 2
-	if body < lipgloss.Height(box) {
-		body = lipgloss.Height(box)
+	area := m.height - headerHeight - 2
+	if area < lipgloss.Height(box) {
+		area = lipgloss.Height(box)
 	}
-	return lipgloss.Place(m.width, body, lipgloss.Center, lipgloss.Center, box)
+	return lipgloss.Place(m.width, area, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m model) orgListView() string {
+	orgs := m.orgs
+	cursor := m.orgCursor
+	if limit := m.orgListLimit(); len(orgs) > limit {
+		start := 0
+		if cursor >= limit {
+			start = cursor - limit + 1
+		}
+		orgs = orgs[start : start+limit]
+		cursor -= start
+	}
+
+	var lines []string
+	for i, org := range orgs {
+		row := "  " + org
+		if i == cursor {
+			row = accentStyle.Render("> " + org)
+		}
+		if org == m.opts.org {
+			row += dimStyle.Render("  (saved)")
+		}
+		lines = append(lines, row)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) orgListLimit() int {
+	limit := m.height - headerHeight - 10
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > maxOrgRows {
+		limit = maxOrgRows
+	}
+	return limit
 }
 
 func (m model) headerView() string {

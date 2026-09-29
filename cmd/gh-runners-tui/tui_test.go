@@ -3,6 +3,8 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +14,17 @@ import (
 	"gh-runners/internal/config"
 	"gh-runners/internal/scan"
 )
+
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "gh-runners-test-*")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("XDG_CONFIG_HOME", dir)
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 func testJobs() []scan.Job {
 	now := time.Now().UTC()
@@ -44,6 +57,10 @@ func key(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	case "esc":
 		return tea.KeyMsg{Type: tea.KeyEsc}
+	case "up":
+		return tea.KeyMsg{Type: tea.KeyUp}
+	case "down":
+		return tea.KeyMsg{Type: tea.KeyDown}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
 }
@@ -385,5 +402,215 @@ func TestOrgOverlayEscDoesNotPersist(t *testing.T) {
 	}
 	if m.opts.org != "org-c" {
 		t.Errorf("org = %q, want org-c", m.opts.org)
+	}
+}
+
+func orgModel(t *testing.T, org string, history ...string) model {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	for i := len(history) - 1; i >= 0; i-- {
+		if err := config.SetOrg(history[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if org != "" {
+		if err := config.SetOrg(org); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := newModel(options{org: org, interval: 30})
+	if org != "" {
+		m = send(m, key("O"))
+	}
+	return m
+}
+
+func TestOrgOverlayCursorWalksHistory(t *testing.T) {
+	m := orgModel(t, "one", "two", "three")
+
+	if want := []string{"one", "two", "three"}; !reflect.DeepEqual(m.orgs, want) {
+		t.Fatalf("orgs = %v, want %v", m.orgs, want)
+	}
+	if m.orgCursor != -1 {
+		t.Fatalf("initial cursor = %d, want -1", m.orgCursor)
+	}
+
+	steps := []struct {
+		key    string
+		cursor int
+		value  string
+	}{
+		{"down", 0, "one"},
+		{"down", 1, "two"},
+		{"down", 2, "three"},
+		{"down", 2, "three"},
+		{"up", 1, "two"},
+		{"up", 0, "one"},
+		{"up", -1, "one"},
+	}
+	for _, s := range steps {
+		m = send(m, key(s.key))
+		if m.orgCursor != s.cursor {
+			t.Errorf("after %s cursor = %d, want %d", s.key, m.orgCursor, s.cursor)
+		}
+		if got := m.orgInput.Value(); got != s.value {
+			t.Errorf("after %s value = %q, want %q", s.key, got, s.value)
+		}
+	}
+}
+
+func TestOrgOverlayEnterAcceptsHighlightedRow(t *testing.T) {
+	m := orgModel(t, "one", "two", "three")
+	m = send(m, key("down"))
+	m = send(m, key("down"))
+
+	next, cmd := m.Update(key("enter"))
+	m = next.(model)
+
+	if m.opts.org != "two" {
+		t.Fatalf("org = %q, want two", m.opts.org)
+	}
+	if cmd == nil {
+		t.Error("picking a different org did not trigger a rescan")
+	}
+	if got := config.Load().Org; got != "two" {
+		t.Errorf("persisted org = %q, want two", got)
+	}
+	if m.orgCursor != -1 {
+		t.Errorf("cursor = %d after accepting, want -1", m.orgCursor)
+	}
+	if want := []string{"two", "one", "three"}; !reflect.DeepEqual(m.orgs, want) {
+		t.Errorf("orgs = %v, want %v", m.orgs, want)
+	}
+}
+
+func TestOrgOverlayTypingBeatsHighlightedRow(t *testing.T) {
+	m := orgModel(t, "one", "two", "three")
+	m = send(m, key("down"))
+	m = send(m, key("down"))
+	if m.orgCursor != 1 {
+		t.Fatalf("cursor = %d, want 1", m.orgCursor)
+	}
+
+	for range "two" {
+		m = send(m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	m = typeRunes(m, "typed")
+	if m.orgCursor != -1 {
+		t.Fatalf("cursor = %d after typing, want -1", m.orgCursor)
+	}
+
+	next, _ := m.Update(key("enter"))
+	m = next.(model)
+
+	if m.opts.org != "typed" {
+		t.Errorf("org = %q, want typed", m.opts.org)
+	}
+}
+
+func TestOrgOverlayArrowsDoNotBreakTyping(t *testing.T) {
+	m := orgModel(t, "one", "two")
+	for range "one" {
+		m = send(m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	m = typeRunes(m, "jk")
+
+	if got := m.orgInput.Value(); got != "jk" {
+		t.Errorf("value = %q, want jk typed literally", got)
+	}
+	if m.orgCursor != -1 {
+		t.Errorf("cursor = %d, want -1 after typing", m.orgCursor)
+	}
+}
+
+func TestOrgOverlayEmptyHistoryRendersCleanly(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	m := newModel(options{interval: 30})
+	if len(m.orgs) != 0 {
+		t.Fatalf("orgs = %v, want empty", m.orgs)
+	}
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	m = next.(model)
+
+	if got := m.orgListView(); got != "" {
+		t.Errorf("org list = %q, want empty", got)
+	}
+	overlay := m.orgOverlayView()
+	if !strings.Contains(overlay, "org:") {
+		t.Error("overlay missing the org prompt")
+	}
+	if strings.Contains(overlay, "> ") {
+		t.Error("empty history rendered a cursor row")
+	}
+	if strings.Contains(overlay, "(saved)") {
+		t.Error("empty history rendered a saved marker")
+	}
+
+	m = send(m, key("down"))
+	if m.orgCursor != -1 {
+		t.Errorf("cursor = %d on empty history, want -1", m.orgCursor)
+	}
+}
+
+func TestOrgOverlayListMarksSavedAndCursor(t *testing.T) {
+	m := orgModel(t, "one", "two")
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	m = next.(model)
+
+	list := m.orgListView()
+	if !strings.Contains(list, "(saved)") {
+		t.Errorf("list does not mark the saved org: %q", list)
+	}
+	if strings.Contains(list, ">") {
+		t.Errorf("list shows a cursor before navigating: %q", list)
+	}
+
+	m = send(m, key("down"))
+	if got := m.orgListView(); !strings.Contains(got, "> one") {
+		t.Errorf("list does not mark the cursor row: %q", got)
+	}
+}
+
+func TestOrgOverlayListCapsRenderedRows(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	for i := 12; i >= 1; i-- {
+		if err := config.SetOrg("org" + strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := newModel(options{org: "org1", interval: 30})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	m = next.(model)
+	m = send(m, key("O"))
+
+	if len(m.orgs) != 10 {
+		t.Fatalf("orgs = %d, want 10", len(m.orgs))
+	}
+	rows := strings.Count(m.orgListView(), "\n") + 1
+	if rows > maxOrgRows {
+		t.Errorf("rendered rows = %d, want at most %d", rows, maxOrgRows)
+	}
+
+	for i := 0; i < 10; i++ {
+		m = send(m, key("down"))
+	}
+	if !strings.Contains(m.orgListView(), "> "+m.orgs[len(m.orgs)-1]) {
+		t.Errorf("last org not visible after scrolling: %q", m.orgListView())
+	}
+}
+
+func TestOrgOverlayShortTerminalStillRendersOneRow(t *testing.T) {
+	m := orgModel(t, "one", "two", "three")
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	m = next.(model)
+
+	rows := strings.Count(m.orgListView(), "\n") + 1
+	if rows < 1 {
+		t.Errorf("rendered rows = %d, want at least 1", rows)
+	}
+	if rows > maxOrgRows {
+		t.Errorf("rendered rows = %d, want at most %d", rows, maxOrgRows)
 	}
 }
