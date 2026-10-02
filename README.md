@@ -96,6 +96,7 @@ The field itself always opens **empty**, showing the `organisation` placeholder,
 | `r` | rescan now |
 | `O` | switch org |
 | `c` | cancel the selected job's workflow run |
+| `u` | API usage overlay; `esc`, `u` or `q` closes it |
 | `q` | quit |
 
 The vim keys work in normal mode only. The first `g` arms a pending state; a second `g` jumps to the top, and any other key (including a lone `g` followed by `j`) clears it. While the filter, the org overlay or the cancel prompt is open they are ordinary typed characters, or abort the prompt. There is no count prefix (`5j`) because `1` and `2` already switch panels, and no `n`/`N` search; `n` only answers the cancel prompt.
@@ -132,6 +133,14 @@ The timer never starts a scan while one is still running: the countdown pauses d
 Scans run 6 workers. Raising that trips GitHub's *secondary* rate limit (burst detection), which is separate from the hourly quota and invisible to `gh api rate_limit`.
 
 When a scan is rate-limited it says so on stderr and exits 2, rather than printing an empty table that looks like an idle org.
+
+### Rate limit in the TUI
+
+The right side of the status line always shows the quota, for example `api 4084/5000 · resets 16:42` (reset time in local time). It turns yellow below 20% remaining and red below 5%. Before the first response arrives it shows `api –`.
+
+`u` opens an overlay with the resource, limit, used, remaining, the reset time with a countdown, requests sent this session, how many came back `304` (free), how many were rate limited, the cost of the last scan (`N requests, M free (304)`) and the current `--interval`. `esc`, `u` or `q` closes it; other keys, including the table keys, do nothing while it is open. With no response yet it says `no data yet`.
+
+The numbers are read from the `X-RateLimit-*` headers of the responses the tool itself receives, with no extra request. They are the token's real counters, so they include usage by anything else sharing the same token. The request, `304` and rate-limited counts cover only this process.
 
 ### Checking your rate limit
 

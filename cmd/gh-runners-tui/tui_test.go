@@ -1358,3 +1358,104 @@ func TestVisibleRowsMatchesRenderedWindow(t *testing.T) {
 		}
 	}
 }
+
+func stubUsage(t *testing.T, u scan.UsageSnapshot) {
+	t.Helper()
+	orig := usage
+	usage = func() scan.UsageSnapshot { return u }
+	t.Cleanup(func() { usage = orig })
+}
+
+func TestUsageOverlayOpenClose(t *testing.T) {
+	stubUsage(t, scan.UsageSnapshot{})
+	for _, closer := range []string{"esc", "u", "q"} {
+		m := send(newTestModel(t), key("u"))
+		if !m.usageActive {
+			t.Fatalf("u did not open overlay")
+		}
+		m = send(m, key(closer))
+		if m.usageActive {
+			t.Fatalf("%s did not close overlay", closer)
+		}
+	}
+}
+
+func TestUsageOverlayIgnoresTableKeys(t *testing.T) {
+	stubUsage(t, scan.UsageSnapshot{})
+	m := send(newTestModel(t), key("u"))
+	cursor := m.runTable.Cursor()
+	focus := m.focus
+	for _, k := range []string{"j", "k", "G", "g", "tab", "2", "c", "/", "O", "r", "enter"} {
+		m = send(m, key(k))
+	}
+	if !m.usageActive || m.runTable.Cursor() != cursor || m.focus != focus || m.confirming || m.filterActive || m.orgActive {
+		t.Fatalf("keys leaked through overlay: %+v", m.usageActive)
+	}
+}
+
+func TestUsageOverlayNoData(t *testing.T) {
+	stubUsage(t, scan.UsageSnapshot{})
+	m := send(newTestModel(t), key("u"))
+	view := m.View()
+	if !strings.Contains(view, "no data yet") {
+		t.Fatalf("view lacks no-data text:\n%s", view)
+	}
+	if !strings.Contains(view, "api –") {
+		t.Fatalf("status line lacks api –")
+	}
+}
+
+func TestUsageOverlayContents(t *testing.T) {
+	stubUsage(t, scan.UsageSnapshot{
+		HasData: true, Resource: "core", Limit: 5000, Remaining: 4084, Used: 916,
+		Reset: time.Now().Add(10*time.Minute + 30*time.Second), Requests: 120, NotModified: 100, RateLimited: 2,
+	})
+	m := newTestModel(t)
+	m.lastCost = &scanCost{requests: 40, free: 30}
+	m = send(m, key("u"))
+	view := m.View()
+	for _, want := range []string{"core", "5000", "916", "4084", "in 10m", "120", "100", "40 requests, 30 free (304)", "30s"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("overlay lacks %q", want)
+		}
+	}
+}
+
+func TestUsageIndicator(t *testing.T) {
+	reset := time.Now().Add(time.Hour)
+	for _, tc := range []struct {
+		remaining int
+		style     string
+	}{{4084, "dim"}, {900, "warn"}, {100, "err"}} {
+		stubUsage(t, scan.UsageSnapshot{HasData: true, Limit: 5000, Remaining: tc.remaining, Reset: reset})
+		m := newTestModel(t)
+		want := "api " + strconv.Itoa(tc.remaining) + "/5000 · resets " + reset.Local().Format("15:04")
+		if !strings.Contains(m.statusView(), want) {
+			t.Fatalf("status line lacks %q: %q", want, m.statusView())
+		}
+		u := usage()
+		var got string
+		switch usageStyle(u).GetForeground() {
+		case colorDim:
+			got = "dim"
+		case colorYellow:
+			got = "warn"
+		case colorRed:
+			got = "err"
+		}
+		if got != tc.style {
+			t.Errorf("remaining %d style = %s, want %s", tc.remaining, got, tc.style)
+		}
+	}
+}
+
+func TestScanDoneRecordsCost(t *testing.T) {
+	stubUsage(t, scan.UsageSnapshot{})
+	m := newTestModel(t)
+	m.scanID = 3
+	next, _ := m.Update(scanDoneMsg{id: 3, requests: 12, free: 9})
+	m = next.(model)
+	if m.lastCost == nil || m.lastCost.requests != 12 || m.lastCost.free != 9 {
+		t.Fatalf("lastCost = %+v", m.lastCost)
+	}
+}

@@ -52,6 +52,80 @@ type client struct {
 	token string
 	http  *http.Client
 	cache *etagCache
+	usage usageStats
+}
+
+type usageStats struct {
+	mu          sync.Mutex
+	snap        UsageSnapshot
+	requests    int64
+	notModified int64
+	limited     int64
+}
+
+type UsageSnapshot struct {
+	HasData     bool
+	Resource    string
+	Limit       int
+	Remaining   int
+	Used        int
+	Reset       time.Time
+	Requests    int64
+	NotModified int64
+	RateLimited int64
+}
+
+func (u *usageStats) record(resp *http.Response) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.requests++
+	if resp.StatusCode == http.StatusNotModified {
+		u.notModified++
+	}
+	if isRateLimitStatus(resp) {
+		u.limited++
+	}
+	h := resp.Header
+	limit, err := strconv.Atoi(strings.TrimSpace(h.Get("X-RateLimit-Limit")))
+	if err != nil {
+		return
+	}
+	remaining, err := strconv.Atoi(strings.TrimSpace(h.Get("X-RateLimit-Remaining")))
+	if err != nil {
+		return
+	}
+	used, err := strconv.Atoi(strings.TrimSpace(h.Get("X-RateLimit-Used")))
+	if err != nil {
+		used = limit - remaining
+	}
+	u.snap.HasData = true
+	u.snap.Limit = limit
+	u.snap.Remaining = remaining
+	u.snap.Used = used
+	if epoch, err := strconv.ParseInt(strings.TrimSpace(h.Get("X-RateLimit-Reset")), 10, 64); err == nil {
+		u.snap.Reset = time.Unix(epoch, 0)
+	}
+	if r := h.Get("X-RateLimit-Resource"); r != "" {
+		u.snap.Resource = r
+	}
+}
+
+func (u *usageStats) snapshot() UsageSnapshot {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	s := u.snap
+	s.Requests = u.requests
+	s.NotModified = u.notModified
+	s.RateLimited = u.limited
+	return s
+}
+
+func Usage() UsageSnapshot {
+	c, err := sharedClient()
+	if err != nil {
+		return UsageSnapshot{}
+	}
+	return c.usage.snapshot()
 }
 
 var (
@@ -148,6 +222,7 @@ func (c *client) fetch(ctx context.Context, url string) ([]byte, string, error) 
 		return nil, "", err
 	}
 	defer resp.Body.Close()
+	c.usage.record(resp)
 
 	if resp.StatusCode == http.StatusNotModified && hasCached {
 		return cached.body, resp.Header.Get("Link"), nil
@@ -193,6 +268,7 @@ func (c *client) post(ctx context.Context, url string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	c.usage.record(resp)
 	io.Copy(io.Discard, resp.Body)
 
 	if isRateLimitStatus(resp) {

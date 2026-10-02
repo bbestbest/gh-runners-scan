@@ -54,9 +54,16 @@ type progressMsg struct {
 }
 
 type scanDoneMsg struct {
-	id   int
-	jobs []scan.Job
-	err  error
+	id       int
+	jobs     []scan.Job
+	err      error
+	requests int64
+	free     int64
+}
+
+type scanCost struct {
+	requests int64
+	free     int64
 }
 
 type cancelDoneMsg struct {
@@ -104,6 +111,9 @@ type model struct {
 	nextIn    int
 	scanErr   error
 	saveErr   error
+
+	usageActive bool
+	lastCost    *scanCost
 
 	cancels    map[int64]bool
 	confirming bool
@@ -203,6 +213,8 @@ func (m *model) beginScan() tea.Cmd {
 
 var cancelRun = scan.CancelRun
 
+var usage = scan.Usage
+
 func cancelCmd(j scan.Job) tea.Cmd {
 	return func() tea.Msg {
 		return cancelDoneMsg{job: j, err: cancelRun(context.Background(), j.Owner, j.Repo, j.RunID)}
@@ -211,12 +223,20 @@ func cancelCmd(j scan.Job) tea.Cmd {
 
 func scanCmd(ctx context.Context, opts options, id int) tea.Cmd {
 	return func() tea.Msg {
+		before := usage()
 		jobs, scanErr := scanLabeled(ctx, opts, func(done, total int) {
 			if program != nil {
 				program.Send(progressMsg{done, total})
 			}
 		})
-		return scanDoneMsg{id: id, jobs: jobs, err: scanErr}
+		after := usage()
+		return scanDoneMsg{
+			id:       id,
+			jobs:     jobs,
+			err:      scanErr,
+			requests: after.Requests - before.Requests,
+			free:     after.NotModified - before.NotModified,
+		}
 	}
 }
 
@@ -242,6 +262,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scanning = false
 		m.jobs = msg.jobs
 		m.scanErr = msg.err
+		m.lastCost = &scanCost{requests: msg.requests, free: msg.free}
 		m.lastScan = time.Now().UTC().Format("15:04:05")
 		m.nextIn = m.opts.interval
 		m.refresh()
@@ -335,6 +356,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.jobs = nil
 			m.scanErr = nil
 			m.lastScan = ""
+			m.lastCost = nil
 			m.repoCount = scan.TotalUnknown
 			m.nextIn = m.opts.interval
 			cmd := m.beginScan()
@@ -371,6 +393,16 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.filterInput, cmd = m.filterInput.Update(msg)
 		return m, cmd
+	}
+
+	if m.usageActive {
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc", "u", "q":
+			m.usageActive = false
+		}
+		return m, nil
 	}
 
 	m.notice = ""
@@ -430,6 +462,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.orgInput.SetValue("")
 		m.orgInput.Focus()
 		return m, textinput.Blink
+	case "u":
+		m.usageActive = true
+		return m, nil
 	case "r":
 		m.nextIn = m.opts.interval
 		return m, m.startScan()
@@ -869,6 +904,13 @@ func (m model) View() string {
 	b.WriteString(m.headerView())
 	b.WriteString("\n")
 
+	if m.usageActive {
+		b.WriteString(m.usageOverlayView())
+		b.WriteString("\n")
+		b.WriteString(m.statusView())
+		return b.String()
+	}
+
 	inner := m.width - 2
 	if inner < 20 {
 		inner = 20
@@ -917,6 +959,97 @@ func (m model) orgOverlayView() string {
 		area = lipgloss.Height(box)
 	}
 	return lipgloss.Place(m.width, area, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m model) usageOverlayView() string {
+	u := usage()
+	label := func(k, v string) string {
+		return dimStyle.Render(fmt.Sprintf("%-18s", k)) + v
+	}
+
+	var lines []string
+	if u.HasData {
+		resource := u.Resource
+		if resource == "" {
+			resource = "-"
+		}
+		reset := "-"
+		if !u.Reset.IsZero() {
+			reset = u.Reset.Local().Format("15:04:05") + " (" + fmtCountdown(time.Until(u.Reset)) + ")"
+		}
+		lines = append(lines,
+			label("resource", resource),
+			label("limit", strconv.Itoa(u.Limit)),
+			label("used", strconv.Itoa(u.Used)),
+			label("remaining", usageStyle(u).Render(strconv.Itoa(u.Remaining))),
+			label("resets", reset),
+		)
+	} else {
+		lines = append(lines, label("rate limit", dimStyle.Render("no data yet")))
+	}
+
+	lines = append(lines,
+		"",
+		label("requests", strconv.FormatInt(u.Requests, 10)),
+		label("not modified (304)", strconv.FormatInt(u.NotModified, 10)),
+		label("rate limited", strconv.FormatInt(u.RateLimited, 10)),
+	)
+
+	last := "no scan yet"
+	if m.lastCost != nil {
+		last = fmt.Sprintf("%d requests, %d free (304)", m.lastCost.requests, m.lastCost.free)
+	}
+	lines = append(lines,
+		"",
+		label("last scan", last),
+		label("interval", fmt.Sprintf("%ds", m.opts.interval)),
+	)
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorAccent).
+		Padding(1, 2).
+		Render(strings.Join(lines, "\n") + "\n\n" + dimStyle.Render("esc/u/q close"))
+
+	area := m.height - headerHeight - 2
+	if area < lipgloss.Height(box) {
+		area = lipgloss.Height(box)
+	}
+	return lipgloss.Place(m.width, area, lipgloss.Center, lipgloss.Center, box)
+}
+
+func fmtCountdown(d time.Duration) string {
+	if d <= 0 {
+		return "now"
+	}
+	total := int(d.Round(time.Second).Seconds())
+	return fmt.Sprintf("in %dm%02ds", total/60, total%60)
+}
+
+func usageStyle(u scan.UsageSnapshot) lipgloss.Style {
+	if u.Limit <= 0 {
+		return dimStyle
+	}
+	pct := u.Remaining * 100 / u.Limit
+	if pct < 5 {
+		return redStyle
+	}
+	if pct < 20 {
+		return yellowStyle
+	}
+	return dimStyle
+}
+
+func (m model) usageIndicator() string {
+	u := usage()
+	if !u.HasData {
+		return dimStyle.Render("api –")
+	}
+	text := fmt.Sprintf("api %d/%d", u.Remaining, u.Limit)
+	if !u.Reset.IsZero() {
+		text += " · resets " + u.Reset.Local().Format("15:04")
+	}
+	return usageStyle(u).Render(text)
 }
 
 func (m model) orgListView() string {
@@ -1083,6 +1216,8 @@ func (m model) statusView() string {
 		}
 		right = style.Render(m.notice) + dimStyle.Render("   ") + right
 	}
+
+	right += dimStyle.Render("   ") + m.usageIndicator()
 
 	if m.confirming {
 		prompt := "cancel run " + m.confirmJob.Workflow + " (" + m.confirmJob.Repo + ")? stops every job in this run · y/n"

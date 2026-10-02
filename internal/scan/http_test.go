@@ -307,3 +307,126 @@ func TestCancelRunReportsRateLimitSentinel(t *testing.T) {
 		t.Fatalf("err = %v, want ErrRateLimited", err)
 	}
 }
+
+func rateHeaders(w http.ResponseWriter, limit, remaining, used int, reset int64, resource string) {
+	w.Header().Set("X-RateLimit-Limit", fmt.Sprint(limit))
+	w.Header().Set("X-RateLimit-Remaining", fmt.Sprint(remaining))
+	w.Header().Set("X-RateLimit-Used", fmt.Sprint(used))
+	w.Header().Set("X-RateLimit-Reset", fmt.Sprint(reset))
+	w.Header().Set("X-RateLimit-Resource", resource)
+}
+
+func TestUsageRecordsHeadersAndCounters(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ok":
+			rateHeaders(w, 5000, 4900, 100, 1900000000, "core")
+			w.Header().Set("ETag", `W/"v1"`)
+			fmt.Fprint(w, `{}`)
+		case "/cached":
+			if r.Header.Get("If-None-Match") != "" {
+				rateHeaders(w, 5000, 4900, 100, 1900000000, "core")
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			rateHeaders(w, 5000, 4901, 99, 1900000000, "core")
+			w.Header().Set("ETag", `W/"v2"`)
+			fmt.Fprint(w, `{}`)
+		case "/bare":
+			fmt.Fprint(w, `{}`)
+		case "/limited":
+			rateHeaders(w, 5000, 0, 5000, 1900000500, "core")
+			w.WriteHeader(http.StatusForbidden)
+		}
+	}))
+	defer srv.Close()
+
+	c := testClient(srv.URL)
+	if got := c.usage.snapshot(); got.HasData || got.Requests != 0 {
+		t.Fatalf("fresh snapshot = %+v", got)
+	}
+
+	if _, _, err := c.fetch(context.Background(), srv.URL+"/ok"); err != nil {
+		t.Fatal(err)
+	}
+	got := c.usage.snapshot()
+	if !got.HasData || got.Limit != 5000 || got.Remaining != 4900 || got.Used != 100 || got.Resource != "core" || got.Reset.Unix() != 1900000000 {
+		t.Fatalf("after 200 = %+v", got)
+	}
+	if got.Requests != 1 || got.NotModified != 0 || got.RateLimited != 0 {
+		t.Fatalf("counters after 200 = %+v", got)
+	}
+
+	if _, _, err := c.fetch(context.Background(), srv.URL+"/cached"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := c.fetch(context.Background(), srv.URL+"/cached"); err != nil {
+		t.Fatal(err)
+	}
+	got = c.usage.snapshot()
+	if got.Requests != 3 || got.NotModified != 1 || got.Remaining != 4900 || got.Used != 100 {
+		t.Fatalf("after 304 = %+v", got)
+	}
+
+	if _, _, err := c.fetch(context.Background(), srv.URL+"/bare"); err != nil {
+		t.Fatal(err)
+	}
+	bare := c.usage.snapshot()
+	if bare.Requests != 4 {
+		t.Fatalf("requests = %d", bare.Requests)
+	}
+	bare.Requests = got.Requests
+	if bare != got {
+		t.Fatalf("headerless response changed values: %+v vs %+v", bare, got)
+	}
+
+	if _, _, err := c.fetch(context.Background(), srv.URL+"/limited"); !isRateLimit(err) {
+		t.Fatalf("err = %v", err)
+	}
+	got = c.usage.snapshot()
+	if got.RateLimited != 1 || got.Remaining != 0 || got.Requests != 5 {
+		t.Fatalf("after 403 = %+v", got)
+	}
+}
+
+func TestUsageCountsPost(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rateHeaders(w, 5000, 10, 4990, 1900000000, "core")
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	c := testClient(srv.URL)
+	if err := c.post(context.Background(), srv.URL+"/cancel"); err != nil {
+		t.Fatal(err)
+	}
+	got := c.usage.snapshot()
+	if got.Requests != 1 || got.Remaining != 10 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+func TestUsageConcurrent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rateHeaders(w, 5000, 4000, 1000, 1900000000, "core")
+		fmt.Fprint(w, `{}`)
+	}))
+	defer srv.Close()
+
+	c := testClient(srv.URL)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				c.fetch(context.Background(), srv.URL+"/x")
+				c.usage.snapshot()
+			}
+		}()
+	}
+	wg.Wait()
+	if got := c.usage.snapshot(); got.Requests != 100 || got.Remaining != 4000 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
