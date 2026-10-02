@@ -3,9 +3,11 @@ package scan
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -210,5 +212,98 @@ func TestRunsResponseDecodesRESTShape(t *testing.T) {
 	}
 	if len(runs.WorkflowRuns) != 1 || runs.WorkflowRuns[0].DatabaseID != 4242 {
 		t.Fatalf("runs = %+v; REST uses id inside workflow_runs, not databaseId", runs)
+	}
+}
+
+func TestCancelRunStatusMapping(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		headers map[string]string
+		check   func(error) bool
+	}{
+		{"accepted", http.StatusAccepted, nil, func(err error) bool { return err == nil }},
+		{"conflict", http.StatusConflict, nil, func(err error) bool { return errors.Is(err, ErrRunFinished) }},
+		{"forbidden without rate headers", http.StatusForbidden, nil, func(err error) bool { return errors.Is(err, ErrNoCancelPermission) }},
+		{"not found", http.StatusNotFound, nil, func(err error) bool { return errors.Is(err, ErrNoCancelPermission) }},
+		{"forbidden rate limited", http.StatusForbidden, map[string]string{"X-RateLimit-Remaining": "0"}, isRateLimit},
+		{"too many requests", http.StatusTooManyRequests, map[string]string{"Retry-After": "7"}, isRateLimit},
+		{"server error", http.StatusInternalServerError, nil, func(err error) bool {
+			return err != nil && !isRateLimit(err) && !errors.Is(err, ErrNoCancelPermission) && !errors.Is(err, ErrRunFinished)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var method, path, accept, version, auth string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				method, path = r.Method, r.URL.Path
+				accept = r.Header.Get("Accept")
+				version = r.Header.Get("X-GitHub-Api-Version")
+				auth = r.Header.Get("Authorization")
+				for k, v := range tc.headers {
+					w.Header().Set(k, v)
+				}
+				w.WriteHeader(tc.status)
+			}))
+			defer srv.Close()
+
+			c := testClient(srv.URL)
+			err := c.cancelRun(context.Background(), "org-a", "web", 99)
+			if !tc.check(err) {
+				t.Fatalf("status %d mapped to %v", tc.status, err)
+			}
+			if err != nil && strings.Contains(err.Error(), "test-token") {
+				t.Fatalf("token leaked in error: %v", err)
+			}
+			if method != http.MethodPost || path != "/repos/org-a/web/actions/runs/99/cancel" {
+				t.Fatalf("request = %s %s", method, path)
+			}
+			if accept != "application/vnd.github+json" || version != "2022-11-28" || auth != "Bearer test-token" {
+				t.Fatalf("headers = %q %q %q", accept, version, auth)
+			}
+		})
+	}
+}
+
+func TestCancelRunLeavesETagCacheUntouched(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			if r.Header.Get("If-None-Match") != "" {
+				t.Errorf("POST sent If-None-Match")
+			}
+			w.Header().Set("ETag", `W/"post"`)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		w.Header().Set("ETag", `W/"v1"`)
+		fmt.Fprint(w, `{}`)
+	}))
+	defer srv.Close()
+
+	c := testClient(srv.URL)
+	if _, _, err := c.fetch(context.Background(), srv.URL+"/x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.cancelRun(context.Background(), "org-a", "web", 5); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.cache.entries) != 1 {
+		t.Fatalf("cache entries = %d, want 1", len(c.cache.entries))
+	}
+	if entry, ok := c.cache.get(srv.URL + "/x"); !ok || entry.etag != `W/"v1"` {
+		t.Fatalf("cached GET entry changed: %+v %v", entry, ok)
+	}
+}
+
+func TestCancelRunReportsRateLimitSentinel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	if err := CancelRun(context.Background(), "org-a", "web", 1); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("err = %v, want ErrRateLimited", err)
 	}
 }

@@ -80,6 +80,36 @@ The field itself always opens **empty**, showing the `organisation` placeholder,
 
 `gh-runners` (the CLI) never writes the file.
 
+## Keys
+
+| key | action |
+|---|---|
+| `↑`/`↓`, `j`/`k` | move one row |
+| `gg` / `home` | jump to the first row |
+| `G` / `end` | jump to the last row |
+| `pgup` / `pgdown`, `ctrl+b` / `ctrl+f` | move one page |
+| `ctrl+u` / `ctrl+d` | move half a page |
+| `H` / `M` / `L` | jump to the top, middle or bottom row of the visible window |
+| `tab`, `1`, `2` | switch between Running and Queued |
+| `/`, `esc` | filter, clear the filter |
+| `enter` / `o` | open the job in the browser |
+| `r` | rescan now |
+| `O` | switch org |
+| `c` | cancel the selected job's workflow run |
+| `q` | quit |
+
+The vim keys work in normal mode only. The first `g` arms a pending state; a second `g` jumps to the top, and any other key (including a lone `g` followed by `j`) clears it. While the filter, the org overlay or the cancel prompt is open they are ordinary typed characters, or abort the prompt. There is no count prefix (`5j`) because `1` and `2` already switch panels, and no `n`/`N` search; `n` only answers the cancel prompt.
+
+`c` asks first, in the status line:
+
+```
+cancel run <workflow> (<repo>)? stops every job in this run · y/n
+```
+
+`y` sends the cancel; any other key aborts. GitHub has no per-job cancel, so this stops **every job in the run**, not only the selected one. The row shows `cancelling` until a later scheduled scan no longer lists it, and the status line reports the outcome: accepted, already finished, no permission, or rate limited. A run whose cancel is in flight or already accepted cannot be cancelled again in the same session. A cancel does not trigger a rescan. `c`, `y` and `n` are ordinary typed characters while the filter or the org overlay is open.
+
+Cancelling needs a token that can write Actions: `actions:write` on a fine-grained token, or the `repo` scope on a classic one. Without it GitHub answers 403/404 and the status line says so. Rerunning a finished run is not supported; completed runs are out of scope.
+
 ## Reading the output
 
 **Running** is sorted by runner name, so two jobs on the same runner sit together. **Queued** is sorted oldest first — the top row has waited longest.
@@ -88,12 +118,16 @@ Runner *labels* (`self-hosted,ARM64`) are what a job requests. The runner *name*
 
 ## API usage
 
-Each scan costs roughly `1 + 2×repos` requests, so the org size drives the bill against the 5000/hour quota. `--repo` skips the repo listing entirely and costs about 2–3 requests.
+Each scan costs roughly `1 + 2×repos` requests, plus one more per active run (and one per extra 100 jobs in a run), so the org size drives the bill against the 5000/hour quota. `--repo` skips the repo listing entirely and costs about 2–3 requests.
 
 Conditional requests keep that cheap: an unchanged repo returns `304 Not Modified`, which does not count against the quota. The ETag cache is **in-memory and per-process**, so:
 
 - a long-running `gh-runners-tui` pays full price on its first scan, then close to nothing
 - each `--once` invocation is a fresh process and pays full price every time
+
+A cancel (`c`) is one `POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel`. It is never cached, counts toward the 5000/hour quota like any other call, and also counts toward GitHub's secondary content-creation limit, so mashing it on many runs can trip that limit. It does not start a rescan.
+
+The timer never starts a scan while one is still running: the countdown pauses during a scan and restarts from `--interval` when it ends, so a scan that outlasts the interval makes the real cycle scan time plus the interval. `r` is ignored while a scan runs.
 
 Scans run 6 workers. Raising that trips GitHub's *secondary* rate limit (burst detection), which is separate from the hourly quota and invisible to `gh api rate_limit`.
 
@@ -114,5 +148,5 @@ curl -s -D- -o /dev/null -H "Authorization: token $(gh auth token)" \
 ## Limitations
 
 - Only repos pushed within `--days` are scanned; a queued job on a dormant repo is missed. Use `--days 0` for everything.
-- At most 20 in-progress and 20 queued runs per repo per status.
+- At most 20 in-progress and 20 queued runs per repo per status. A run's jobs are fetched 100 per page and every page is followed.
 - Completed jobs are out of scope by design.

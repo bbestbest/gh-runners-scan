@@ -89,7 +89,7 @@ func TestScanRepoMapsRESTEndpoints(t *testing.T) {
 		case r.URL.Path == "/repos/org-a/web/actions/runs/7/jobs":
 			jobsCalls.Add(1)
 			fmt.Fprint(w, `{"jobs":[
-				{"status":"in_progress","workflow_name":"CI","head_branch":"main","name":"build","runner_name":"rnr-1","labels":["self-hosted","linux"],"started_at":"2026-09-20T10:00:00Z","created_at":"2026-09-20T09:59:00Z","html_url":"https://gh/j/1"},
+				{"run_id":7,"status":"in_progress","workflow_name":"CI","head_branch":"main","name":"build","runner_name":"rnr-1","labels":["self-hosted","linux"],"started_at":"2026-09-20T10:00:00Z","created_at":"2026-09-20T09:59:00Z","html_url":"https://gh/j/1"},
 				{"status":"completed","workflow_name":"CI","head_branch":"main","name":"done","runner_name":"rnr-2","labels":[],"started_at":"","created_at":"","html_url":""}
 			]}`)
 		default:
@@ -111,6 +111,9 @@ func TestScanRepoMapsRESTEndpoints(t *testing.T) {
 	}
 	if j.StartedAt.IsZero() || j.CreatedAt.IsZero() || j.URL != "https://gh/j/1" {
 		t.Fatalf("job times/url = %+v", j)
+	}
+	if j.RunID != 7 || j.Owner != "org-a" {
+		t.Fatalf("job run id/owner = %d %q, want 7 org-a", j.RunID, j.Owner)
 	}
 	if jobsCalls.Load() != 1 {
 		t.Fatalf("jobs endpoint called %d times", jobsCalls.Load())
@@ -358,5 +361,51 @@ func TestScanRepoPropagatesRateLimit(t *testing.T) {
 
 	if _, err := ScanRepo(context.Background(), "org-a", "web", nil); err != ErrRateLimited {
 		t.Fatalf("err = %v, want ErrRateLimited", err)
+	}
+}
+
+func TestScanRepoFollowsJobsPagination(t *testing.T) {
+	var srv *httptest.Server
+	var jobsCalls atomic.Int64
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/org-a/web/actions/runs":
+			if r.URL.Query().Get("per_page") != "20" {
+				t.Errorf("runs per_page = %q, want 20", r.URL.Query().Get("per_page"))
+			}
+			if r.URL.Query().Get("status") == "in_progress" {
+				fmt.Fprint(w, `{"workflow_runs":[{"id":7}]}`)
+				return
+			}
+			fmt.Fprint(w, `{"workflow_runs":[]}`)
+		case "/repos/org-a/web/actions/runs/7/jobs":
+			jobsCalls.Add(1)
+			if r.URL.Query().Get("page") == "2" {
+				fmt.Fprint(w, `{"jobs":[{"run_id":7,"status":"in_progress","name":"second-page","runner_name":"rnr-2"}]}`)
+				return
+			}
+			if r.URL.Query().Get("per_page") != "100" {
+				t.Errorf("jobs per_page = %q, want 100", r.URL.Query().Get("per_page"))
+			}
+			w.Header().Set("Link", fmt.Sprintf(`<%s/repos/org-a/web/actions/runs/7/jobs?per_page=100&page=2>; rel="next"`, srv.URL))
+			fmt.Fprint(w, `{"jobs":[{"run_id":7,"status":"in_progress","name":"first-page","runner_name":"rnr-1"},{"run_id":7,"status":"completed","name":"done"}]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	var limited atomic.Bool
+	jobs := scanRepo(context.Background(), &limited, "org-a", "web")
+	if len(jobs) != 2 || jobs[0].Name != "first-page" || jobs[1].Name != "second-page" {
+		t.Fatalf("jobs = %+v, want first-page and second-page", jobs)
+	}
+	if jobsCalls.Load() != 2 {
+		t.Fatalf("jobs endpoint called %d times, want 2", jobsCalls.Load())
+	}
+	if limited.Load() {
+		t.Fatal("should not be rate limited")
 	}
 }

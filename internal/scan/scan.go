@@ -26,6 +26,8 @@ const repoCacheTTL = 12 * time.Minute
 var ErrRateLimited = errors.New("github api rate limited; results are incomplete")
 
 type Job struct {
+	Owner     string
+	RunID     int64
 	Status    string
 	Repo      string
 	Workflow  string
@@ -54,6 +56,7 @@ type runsResponse struct {
 
 type jobsResponse struct {
 	Jobs []struct {
+		RunID        int64    `json:"run_id"`
 		Status       string   `json:"status"`
 		WorkflowName string   `json:"workflow_name"`
 		HeadBranch   string   `json:"head_branch"`
@@ -202,28 +205,34 @@ func scanRepo(ctx context.Context, limited *atomic.Bool, org, repo string) []Job
 			continue
 		}
 		for _, run := range runs.WorkflowRuns {
-			var resp jobsResponse
-			path := "/repos/" + url.PathEscape(org) + "/" + url.PathEscape(repo) +
-				"/actions/runs/" + strconv.FormatInt(run.DatabaseID, 10) + "/jobs"
-			if _, ok := getJSON(ctx, limited, &resp, path); !ok {
-				continue
-			}
-			for _, j := range resp.Jobs {
-				if j.Status == "completed" {
-					continue
+			next := "/repos/" + url.PathEscape(org) + "/" + url.PathEscape(repo) +
+				"/actions/runs/" + strconv.FormatInt(run.DatabaseID, 10) + "/jobs?per_page=100"
+			for next != "" {
+				var resp jobsResponse
+				link, ok := getJSON(ctx, limited, &resp, next)
+				if !ok {
+					break
 				}
-				jobs = append(jobs, Job{
-					Status:    j.Status,
-					Repo:      repo,
-					Workflow:  j.WorkflowName,
-					Branch:    j.HeadBranch,
-					Name:      j.Name,
-					Runner:    j.RunnerName,
-					Labels:    strings.Join(j.Labels, ","),
-					StartedAt: parseTime(j.StartedAt),
-					CreatedAt: parseTime(j.CreatedAt),
-					URL:       j.HTMLURL,
-				})
+				for _, j := range resp.Jobs {
+					if j.Status == "completed" {
+						continue
+					}
+					jobs = append(jobs, Job{
+						Owner:     org,
+						RunID:     j.RunID,
+						Status:    j.Status,
+						Repo:      repo,
+						Workflow:  j.WorkflowName,
+						Branch:    j.HeadBranch,
+						Name:      j.Name,
+						Runner:    j.RunnerName,
+						Labels:    strings.Join(j.Labels, ","),
+						StartedAt: parseTime(j.StartedAt),
+						CreatedAt: parseTime(j.CreatedAt),
+						URL:       j.HTMLURL,
+					})
+				}
+				next = nextPageURL(link)
 			}
 		}
 	}

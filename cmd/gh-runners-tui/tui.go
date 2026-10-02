@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,7 +41,7 @@ var (
 var hints = [4][4]string{
 	{"<↑↓/jk>", "move", "</>", "filter"},
 	{"<tab/1/2>", "panel", "<r>", "rescan"},
-	{"<enter/o>", "open", "<esc>", "clear filter"},
+	{"<enter/o>", "open", "<c>", "cancel run"},
 	{"<O>", "org", "<q>", "quit"},
 }
 
@@ -52,8 +54,14 @@ type progressMsg struct {
 }
 
 type scanDoneMsg struct {
+	id   int
 	jobs []scan.Job
 	err  error
+}
+
+type cancelDoneMsg struct {
+	job scan.Job
+	err error
 }
 
 type tickMsg time.Time
@@ -88,12 +96,21 @@ type model struct {
 
 	spin      spinner.Model
 	scanning  bool
+	scanID    int
+	stopScan  context.CancelFunc
 	progress  progressMsg
 	repoCount int
 	lastScan  string
 	nextIn    int
 	scanErr   error
 	saveErr   error
+
+	cancels    map[int64]bool
+	confirming bool
+	confirmJob scan.Job
+	pendingG   bool
+	notice     string
+	noticeErr  bool
 
 	width  int
 	height int
@@ -111,6 +128,7 @@ func newModel(opts options) model {
 		repoCount: scan.TotalUnknown,
 		orgs:      config.Load().Orgs,
 		orgCursor: -1,
+		cancels:   map[int64]bool{},
 	}
 
 	m.runTable = newTable(runningCols)
@@ -155,7 +173,7 @@ func (m model) Init() tea.Cmd {
 	if m.opts.org == "" {
 		return tea.Batch(tickCmd(), m.spin.Tick, textinput.Blink)
 	}
-	return tea.Batch(scanCmd(m.opts), tickCmd(), m.spin.Tick)
+	return tea.Batch(scanCmd(context.Background(), m.opts, 0), tickCmd(), m.spin.Tick)
 }
 
 func tickCmd() tea.Cmd {
@@ -168,19 +186,37 @@ func (m *model) startScan() tea.Cmd {
 	if m.scanning || m.opts.org == "" {
 		return nil
 	}
-	m.scanning = true
-	m.progress = progressMsg{0, scan.TotalUnknown}
-	return scanCmd(m.opts)
+	return m.beginScan()
 }
 
-func scanCmd(opts options) tea.Cmd {
+func (m *model) beginScan() tea.Cmd {
+	if m.stopScan != nil {
+		m.stopScan()
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	m.stopScan = stop
+	m.scanID++
+	m.scanning = true
+	m.progress = progressMsg{0, scan.TotalUnknown}
+	return scanCmd(ctx, m.opts, m.scanID)
+}
+
+var cancelRun = scan.CancelRun
+
+func cancelCmd(j scan.Job) tea.Cmd {
 	return func() tea.Msg {
-		jobs, scanErr := scanLabeled(context.Background(), opts, func(done, total int) {
+		return cancelDoneMsg{job: j, err: cancelRun(context.Background(), j.Owner, j.Repo, j.RunID)}
+	}
+}
+
+func scanCmd(ctx context.Context, opts options, id int) tea.Cmd {
+	return func() tea.Msg {
+		jobs, scanErr := scanLabeled(ctx, opts, func(done, total int) {
 			if program != nil {
 				program.Send(progressMsg{done, total})
 			}
 		})
-		return scanDoneMsg{jobs: jobs, err: scanErr}
+		return scanDoneMsg{id: id, jobs: jobs, err: scanErr}
 	}
 }
 
@@ -200,11 +236,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case scanDoneMsg:
+		if msg.id != m.scanID {
+			return m, nil
+		}
 		m.scanning = false
 		m.jobs = msg.jobs
 		m.scanErr = msg.err
 		m.lastScan = time.Now().UTC().Format("15:04:05")
 		m.nextIn = m.opts.interval
+		m.refresh()
+		return m, nil
+
+	case cancelDoneMsg:
+		label := msg.job.Workflow + " (" + msg.job.Repo + ")"
+		m.noticeErr = true
+		switch {
+		case msg.err == nil:
+			m.noticeErr = false
+			m.notice = "cancel accepted · " + label
+		case errors.Is(msg.err, scan.ErrRunFinished):
+			m.notice = "run already finished · " + label
+		case errors.Is(msg.err, scan.ErrNoCancelPermission):
+			delete(m.cancels, msg.job.RunID)
+			m.notice = "no permission to cancel · token needs actions:write"
+		case errors.Is(msg.err, scan.ErrRateLimited):
+			delete(m.cancels, msg.job.RunID)
+			m.notice = "rate limited · cancel not sent"
+		default:
+			delete(m.cancels, msg.job.RunID)
+			m.notice = "cancel failed · " + msg.err.Error()
+		}
 		m.refresh()
 		return m, nil
 
@@ -276,10 +337,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.lastScan = ""
 			m.repoCount = scan.TotalUnknown
 			m.nextIn = m.opts.interval
-			m.scanning = true
-			m.progress = progressMsg{0, scan.TotalUnknown}
+			cmd := m.beginScan()
 			m.refresh()
-			return m, scanCmd(m.opts)
+			return m, cmd
 		case "x":
 			if m.orgCursor >= 0 && m.orgCursor < len(m.orgs) {
 				m.removeOrgAtCursor()
@@ -313,9 +373,44 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	m.notice = ""
+
+	if m.confirming {
+		m.confirming = false
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "y":
+			job := m.confirmJob
+			if m.cancels[job.RunID] {
+				return m, nil
+			}
+			m.cancels[job.RunID] = true
+			m.refresh()
+			return m, cancelCmd(job)
+		}
+		return m, nil
+	}
+
+	armed := m.pendingG
+	m.pendingG = false
+
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
+	case "c":
+		job, ok := m.selected()
+		if !ok || job.RunID == 0 {
+			return m, nil
+		}
+		if m.cancels[job.RunID] {
+			m.notice = "cancel already requested · " + job.Workflow + " (" + job.Repo + ")"
+			m.noticeErr = true
+			return m, nil
+		}
+		m.confirming = true
+		m.confirmJob = job
+		return m, nil
 	case "esc":
 		if m.filter != "" {
 			m.filter = ""
@@ -355,6 +450,40 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "k", "up":
 		m.moveCursor(-1)
+		return m, nil
+	case "g":
+		if armed {
+			m.gotoEdge(false)
+			return m, nil
+		}
+		m.pendingG = true
+		return m, nil
+	case "home":
+		m.gotoEdge(false)
+		return m, nil
+	case "G", "end":
+		m.gotoEdge(true)
+		return m, nil
+	case "pgup", "ctrl+b":
+		m.moveCursor(-m.page())
+		return m, nil
+	case "pgdown", "ctrl+f":
+		m.moveCursor(m.page())
+		return m, nil
+	case "ctrl+u":
+		m.moveCursor(-m.halfPage())
+		return m, nil
+	case "ctrl+d":
+		m.moveCursor(m.halfPage())
+		return m, nil
+	case "H":
+		m.moveToVisible(0)
+		return m, nil
+	case "M":
+		m.moveToVisible(1)
+		return m, nil
+	case "L":
+		m.moveToVisible(2)
 		return m, nil
 	}
 
@@ -405,15 +534,97 @@ func (m *model) removeOrgAtCursor() {
 	m.orgInput.CursorEnd()
 }
 
-func (m *model) moveCursor(delta int) {
-	t := &m.runTable
+func (m *model) focusedTable() *table.Model {
 	if m.focus == 1 {
-		t = &m.qTable
+		return &m.qTable
 	}
+	return &m.runTable
+}
+
+func (m *model) page() int {
+	if h := m.focusedTable().Height(); h > 1 {
+		return h
+	}
+	return 1
+}
+
+func (m *model) halfPage() int {
+	if h := m.page() / 2; h > 1 {
+		return h
+	}
+	return 1
+}
+
+func visibleRows(t table.Model) (int, int) {
+	rows := make([]table.Row, len(t.Rows()))
+	for i := range rows {
+		rows[i] = table.Row{strconv.Itoa(i)}
+	}
+	t.SetRows(rows)
+	t.SetColumns([]table.Column{{Title: "i", Width: 8}})
+	t.SetStyles(table.Styles{})
+
+	first, last := -1, -1
+	for _, line := range strings.Split(t.View(), "\n")[1:] {
+		i, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil {
+			continue
+		}
+		if first < 0 {
+			first = i
+		}
+		last = i
+	}
+	return first, last
+}
+
+func (m *model) moveToVisible(pos int) {
+	t := m.focusedTable()
 	if len(t.Rows()) == 0 {
 		return
 	}
-	t.SetCursor(t.Cursor() + delta)
+	first, last := visibleRows(*t)
+	if first < 0 {
+		return
+	}
+	m.moveCursor(first + (last-first)*pos/2 - t.Cursor())
+}
+
+func (m *model) moveCursor(delta int) {
+	t := m.focusedTable()
+	if len(t.Rows()) == 0 || delta == 0 {
+		return
+	}
+	if delta < 0 {
+		t.MoveUp(-delta)
+		return
+	}
+	t.MoveDown(delta)
+}
+
+func (m *model) gotoEdge(bottom bool) {
+	t := m.focusedTable()
+	if len(t.Rows()) == 0 {
+		return
+	}
+	if bottom {
+		t.GotoBottom()
+		return
+	}
+	t.GotoTop()
+}
+
+func (m *model) selected() (scan.Job, bool) {
+	jobs := m.running
+	cursor := m.runTable.Cursor()
+	if m.focus == 1 {
+		jobs = m.queued
+		cursor = m.qTable.Cursor()
+	}
+	if cursor < 0 || cursor >= len(jobs) {
+		return scan.Job{}, false
+	}
+	return jobs[cursor], true
 }
 
 func (m *model) open() {
@@ -446,13 +657,18 @@ func (m *model) refresh() {
 			elapsed = fmtElapsed(now.Sub(j.StartedAt))
 		}
 		rest := m.rowStyle(j.Repo)
+		elapsedStyle := rest
+		if m.cancelling(j) {
+			elapsed = "cancelling"
+			elapsedStyle = yellowStyle
+		}
 		runRows = append(runRows, table.Row{
 			cell(j.Runner, greenStyle, cols, 0),
 			cell(j.Repo, rest, cols, 1),
 			cell(j.Workflow, rest, cols, 2),
 			cell(j.Branch, rest, cols, 3),
 			cell(j.Name, rest, cols, 4),
-			cell(elapsed, rest, cols, 5),
+			cell(elapsed, elapsedStyle, cols, 5),
 		})
 	}
 
@@ -470,6 +686,10 @@ func (m *model) refresh() {
 				waitStyle = yellowStyle
 			}
 		}
+		if m.cancelling(j) {
+			wait = "cancelling"
+			waitStyle = yellowStyle
+		}
 		rest := m.rowStyle(j.Repo)
 		qRows = append(qRows, table.Row{
 			cell(wait, waitStyle, qcols, 0),
@@ -481,11 +701,30 @@ func (m *model) refresh() {
 		})
 	}
 
-	m.runTable.SetRows(runRows)
-	m.qTable.SetRows(qRows)
-	m.runTable.SetCursor(clamp(runCursor, len(runRows)))
-	m.qTable.SetCursor(clamp(qCursor, len(qRows)))
+	setRows(&m.runTable, runRows, runCursor)
+	setRows(&m.qTable, qRows, qCursor)
 	m.layout()
+}
+
+func setRows(t *table.Model, rows []table.Row, cursor int) {
+	t.SetRows(rows)
+	t.SetCursor(clamp(cursor, len(rows)))
+	if cursor >= len(rows) {
+		reseat(t)
+	}
+}
+
+func reseat(t *table.Model) {
+	if len(t.Rows()) == 0 {
+		return
+	}
+	cursor := t.Cursor()
+	t.GotoTop()
+	t.MoveDown(cursor)
+}
+
+func (m model) cancelling(j scan.Job) bool {
+	return j.RunID != 0 && m.cancels[j.RunID]
 }
 
 func (m model) rowStyle(repo string) lipgloss.Style {
@@ -560,10 +799,18 @@ func (m *model) layout() {
 	runBox := body / 2
 	qBox := body - runBox
 
-	m.runTable.SetHeight(tableHeight(runBox))
-	m.qTable.SetHeight(tableHeight(qBox))
+	setHeight(&m.runTable, tableHeight(runBox))
+	setHeight(&m.qTable, tableHeight(qBox))
 	m.runTable.SetWidth(inner)
 	m.qTable.SetWidth(inner)
+}
+
+func setHeight(t *table.Model, h int) {
+	before := t.Height()
+	t.SetHeight(h)
+	if t.Height() != before {
+		reseat(t)
+	}
 }
 
 func tableHeight(box int) int {
@@ -827,6 +1074,19 @@ func (m model) statusView() string {
 
 	if m.saveErr != nil {
 		right = yellowStyle.Render("org not saved") + dimStyle.Render("   ") + right
+	}
+
+	if m.notice != "" {
+		style := greenStyle
+		if m.noticeErr {
+			style = yellowStyle
+		}
+		right = style.Render(m.notice) + dimStyle.Render("   ") + right
+	}
+
+	if m.confirming {
+		prompt := "cancel run " + m.confirmJob.Workflow + " (" + m.confirmJob.Repo + ")? stops every job in this run · y/n"
+		return yellowStyle.Render(prompt)
 	}
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)

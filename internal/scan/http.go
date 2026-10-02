@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -171,6 +172,63 @@ func (c *client) fetch(ctx context.Context, url string) ([]byte, string, error) 
 	}
 	c.cache.put(url, resp.Header.Get("ETag"), body)
 	return body, resp.Header.Get("Link"), nil
+}
+
+var (
+	ErrRunFinished        = errors.New("run already finished or cannot be cancelled")
+	ErrNoCancelPermission = errors.New("cancel refused: token likely lacks actions:write (fine-grained) or repo (classic) scope")
+)
+
+func (c *client) post(ctx context.Context, url string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	if isRateLimitStatus(resp) {
+		if d, ok := retryAfter(resp); ok {
+			return &rateLimitError{wait: d}
+		}
+		return &rateLimitError{}
+	}
+
+	switch resp.StatusCode {
+	case http.StatusAccepted:
+		return nil
+	case http.StatusConflict:
+		return ErrRunFinished
+	case http.StatusForbidden, http.StatusNotFound:
+		return ErrNoCancelPermission
+	}
+	return fmt.Errorf("github api: %s for %s", resp.Status, req.URL.Path)
+}
+
+func (c *client) cancelRun(ctx context.Context, owner, repo string, runID int64) error {
+	path := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repo) +
+		"/actions/runs/" + strconv.FormatInt(runID, 10) + "/cancel"
+	return c.post(ctx, c.base+path)
+}
+
+func CancelRun(ctx context.Context, owner, repo string, runID int64) error {
+	c, err := sharedClient()
+	if err != nil {
+		return err
+	}
+	err = c.cancelRun(ctx, owner, repo, runID)
+	if isRateLimit(err) {
+		return ErrRateLimited
+	}
+	return err
 }
 
 type rateLimitError struct {
