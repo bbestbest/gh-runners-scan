@@ -41,8 +41,8 @@ Flags: `--label`, `--days`, `--repo`, `--once`, `--interval` (TUI), `--select` (
 
 ```ini
 # scan this org unless a different one is given
-org = org-a
-orgs = org-a, org-b
+org = <org>
+orgs = <org>, <other-org>
 days = 30
 ```
 
@@ -65,8 +65,8 @@ The overlay lists the orgs from `orgs` under the input, marking the saved one:
 ╭────────────────────────╮
 │  org: ▊                │
 │                        │
-│  > <org>  (saved) │
-│    org-b           │
+│  > <org>  (saved)      │
+│    <other-org>         │
 │                        │
 │  ↑↓ · x · enter · esc  │
 ╰────────────────────────╯
