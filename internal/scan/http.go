@@ -98,15 +98,29 @@ func (u *usageStats) record(resp *http.Response) {
 	if err != nil {
 		used = limit - remaining
 	}
-	u.snap.HasData = true
-	u.snap.Limit = limit
-	u.snap.Remaining = remaining
-	u.snap.Used = used
+	var reset time.Time
+	hasReset := false
 	if epoch, err := strconv.ParseInt(strings.TrimSpace(h.Get("X-RateLimit-Reset")), 10, 64); err == nil {
-		u.snap.Reset = time.Unix(epoch, 0)
+		reset = time.Unix(epoch, 0)
+		hasReset = true
 	}
 	if r := h.Get("X-RateLimit-Resource"); r != "" {
 		u.snap.Resource = r
+	}
+	switch {
+	case !u.snap.HasData || (hasReset && reset.After(u.snap.Reset)):
+		u.snap.HasData = true
+		u.snap.Limit = limit
+		u.snap.Remaining = remaining
+		u.snap.Used = used
+		if hasReset {
+			u.snap.Reset = reset
+		}
+	case hasReset && reset.Before(u.snap.Reset):
+	default:
+		u.snap.Limit = limit
+		u.snap.Remaining = min(u.snap.Remaining, remaining)
+		u.snap.Used = max(u.snap.Used, used)
 	}
 }
 

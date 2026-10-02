@@ -430,3 +430,56 @@ func TestUsageConcurrent(t *testing.T) {
 		t.Fatalf("snapshot = %+v", got)
 	}
 }
+
+func usageResp(limit, remaining, used int, reset int64) *http.Response {
+	h := http.Header{}
+	h.Set("X-RateLimit-Limit", fmt.Sprint(limit))
+	h.Set("X-RateLimit-Remaining", fmt.Sprint(remaining))
+	h.Set("X-RateLimit-Used", fmt.Sprint(used))
+	if reset != 0 {
+		h.Set("X-RateLimit-Reset", fmt.Sprint(reset))
+	}
+	return &http.Response{StatusCode: http.StatusOK, Header: h}
+}
+
+func TestUsageKeepsMinRemainingWithinWindow(t *testing.T) {
+	var u usageStats
+	u.record(usageResp(5000, 4090, 910, 1900000000))
+	u.record(usageResp(5000, 4080, 920, 1900000000))
+	u.record(usageResp(5000, 4085, 915, 1900000000))
+	got := u.snapshot()
+	if got.Remaining != 4080 || got.Used != 920 || got.Limit != 5000 || got.Reset.Unix() != 1900000000 || got.Requests != 3 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+func TestUsageNewWindowReplaces(t *testing.T) {
+	var u usageStats
+	u.record(usageResp(5000, 4080, 920, 1900000000))
+	u.record(usageResp(5000, 5000, 0, 1900003600))
+	got := u.snapshot()
+	if got.Remaining != 5000 || got.Used != 0 || got.Reset.Unix() != 1900003600 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+func TestUsageStaleWindowIgnored(t *testing.T) {
+	var u usageStats
+	u.record(usageResp(5000, 4990, 10, 1900003600))
+	u.record(usageResp(5000, 100, 4900, 1900000000))
+	got := u.snapshot()
+	if got.Remaining != 4990 || got.Used != 10 || got.Reset.Unix() != 1900003600 || got.Requests != 2 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+func TestUsageMissingResetAppliesMinMax(t *testing.T) {
+	var u usageStats
+	u.record(usageResp(5000, 4000, 1000, 1900000000))
+	u.record(usageResp(5000, 4500, 500, 0))
+	u.record(usageResp(5000, 3900, 1100, 0))
+	got := u.snapshot()
+	if got.Remaining != 3900 || got.Used != 1100 || got.Reset.Unix() != 1900000000 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
