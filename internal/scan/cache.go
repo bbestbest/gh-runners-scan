@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 )
 
-const cacheVersion = 1
+const cacheVersion = 2
 
 type diskEntry struct {
 	ETag string `json:"etag"`

@@ -138,7 +138,7 @@ When a scan is rate-limited it says so on stderr and exits 2, rather than printi
 
 `gh-runners` and `gh-runners-tui` share one cache file: `$XDG_CACHE_HOME/gh-runners/etags.json`, or `~/.cache/gh-runners/etags.json` when `XDG_CACHE_HOME` is unset. The directory is created `0700` and the file `0600`. It is written after every finished scan and when the TUI quits, and only holds the URLs the last run actually used.
 
-The file holds **private API response bodies** (repo, branch, workflow and job names), not just ETags. It is keyed by a SHA-256 of the token, never the token itself, so switching `GH_TOKEN` starts cold. A missing, corrupt or old-version file is ignored.
+The file holds each response reduced to the fields the tool reads: repo names, run ids, job, workflow, branch and runner names, labels, times and URLs. It holds no emails, commit messages, logins or descriptions. It is keyed by a SHA-256 of the token, never the token itself, so switching `GH_TOKEN` starts cold. A missing, corrupt or old-version file is ignored.
 
 To clear it: `rm ~/.cache/gh-runners/etags.json` (or under `$XDG_CACHE_HOME`).
 

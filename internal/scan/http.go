@@ -2,6 +2,7 @@ package scan
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -225,10 +226,29 @@ func isRateLimitStatus(resp *http.Response) bool {
 	return resp.Header.Get("Retry-After") != ""
 }
 
-func (c *client) fetch(ctx context.Context, url string) ([]byte, string, error) {
+func (c *client) getInto(ctx context.Context, url string, out any) (string, error) {
+	body, link, etag, err := c.fetch(ctx, url)
+	if err != nil {
+		return "", err
+	}
+	if out == nil {
+		return link, nil
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return "", err
+	}
+	trimmed, err := json.Marshal(out)
+	if err != nil {
+		return "", err
+	}
+	c.cache.put(url, etag, trimmed)
+	return link, nil
+}
+
+func (c *client) fetch(ctx context.Context, url string) ([]byte, string, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
@@ -241,34 +261,33 @@ func (c *client) fetch(ctx context.Context, url string) ([]byte, string, error) 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	defer resp.Body.Close()
 	c.usage.record(resp)
 
 	if resp.StatusCode == http.StatusNotModified && hasCached {
-		return cached.body, resp.Header.Get("Link"), nil
+		return cached.body, resp.Header.Get("Link"), "", nil
 	}
 
 	if isRateLimitStatus(resp) {
 		io.Copy(io.Discard, resp.Body)
 		if d, ok := retryAfter(resp); ok {
-			return nil, "", &rateLimitError{wait: d}
+			return nil, "", "", &rateLimitError{wait: d}
 		}
-		return nil, "", &rateLimitError{}
+		return nil, "", "", &rateLimitError{}
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(io.Discard, resp.Body)
-		return nil, "", fmt.Errorf("github api: %s for %s", resp.Status, req.URL.Path)
+		return nil, "", "", fmt.Errorf("github api: %s for %s", resp.Status, req.URL.Path)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
-	c.cache.put(url, resp.Header.Get("ETag"), body)
-	return body, resp.Header.Get("Link"), nil
+	return body, resp.Header.Get("Link"), resp.Header.Get("ETag"), nil
 }
 
 var (

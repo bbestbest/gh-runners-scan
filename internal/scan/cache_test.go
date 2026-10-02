@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -42,7 +44,7 @@ func TestCacheRoundTrip(t *testing.T) {
 	srv := etagServer(t)
 
 	a := cacheClient("tok")
-	if _, _, err := a.fetch(context.Background(), srv.URL+"/x"); err != nil {
+	if _, err := getMap(a, srv.URL+"/x"); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.saveCache(); err != nil {
@@ -50,12 +52,12 @@ func TestCacheRoundTrip(t *testing.T) {
 	}
 
 	b := cacheClient("tok")
-	body, _, err := b.fetch(context.Background(), srv.URL+"/x")
+	body, err := getMap(b, srv.URL+"/x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != `{"path":"/x"}` {
-		t.Fatalf("body = %q", body)
+	if js(body) != `{"path":"/x"}` {
+		t.Fatalf("body = %v", body)
 	}
 	if got := b.usage.snapshot().NotModified; got != 1 {
 		t.Fatalf("NotModified = %d, want 1", got)
@@ -67,7 +69,7 @@ func TestCacheStartsColdWithoutError(t *testing.T) {
 	good := func(t *testing.T) string {
 		dir := useCacheDir(t)
 		a := cacheClient("tok")
-		if _, _, err := a.fetch(context.Background(), srv.URL+"/x"); err != nil {
+		if _, err := getMap(a, srv.URL+"/x"); err != nil {
 			t.Fatal(err)
 		}
 		if err := a.saveCache(); err != nil {
@@ -116,7 +118,7 @@ func TestCacheStartsColdWithoutError(t *testing.T) {
 			if len(c.cache.entries) != 0 {
 				t.Fatalf("expected cold start, got %d entries", len(c.cache.entries))
 			}
-			if _, _, err := c.fetch(context.Background(), srv.URL+"/x"); err != nil {
+			if _, err := getMap(c, srv.URL+"/x"); err != nil {
 				t.Fatal(err)
 			}
 			if got := c.usage.snapshot().NotModified; got != 0 {
@@ -132,7 +134,7 @@ func TestCacheWritesOnlyUsedEntries(t *testing.T) {
 
 	a := cacheClient("tok")
 	for _, p := range []string{"/old", "/kept"} {
-		if _, _, err := a.fetch(context.Background(), srv.URL+p); err != nil {
+		if _, err := getMap(a, srv.URL+p); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -141,10 +143,10 @@ func TestCacheWritesOnlyUsedEntries(t *testing.T) {
 	}
 
 	b := cacheClient("tok")
-	if _, _, err := b.fetch(context.Background(), srv.URL+"/kept"); err != nil {
+	if _, err := getMap(b, srv.URL+"/kept"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := b.fetch(context.Background(), srv.URL+"/new"); err != nil {
+	if _, err := getMap(b, srv.URL+"/new"); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.saveCache(); err != nil {
@@ -176,7 +178,7 @@ func TestCacheNeverWritesToken(t *testing.T) {
 	dir := useCacheDir(t)
 	srv := etagServer(t)
 	a := cacheClient("super-secret-token")
-	if _, _, err := a.fetch(context.Background(), srv.URL+"/x"); err != nil {
+	if _, err := getMap(a, srv.URL+"/x"); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.saveCache(); err != nil {
@@ -195,7 +197,7 @@ func TestCacheFileModes(t *testing.T) {
 	dir := useCacheDir(t)
 	srv := etagServer(t)
 	a := cacheClient("tok")
-	if _, _, err := a.fetch(context.Background(), srv.URL+"/x"); err != nil {
+	if _, err := getMap(a, srv.URL+"/x"); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.saveCache(); err != nil {
@@ -229,5 +231,127 @@ func TestCachePathFallsBackToHome(t *testing.T) {
 	want := filepath.Join(home, ".cache", "gh-runners", "etags.json")
 	if got := cachePath(); got != want {
 		t.Fatalf("cachePath = %q, want %q", got, want)
+	}
+}
+
+func useClient(t *testing.T, c *client) {
+	t.Helper()
+	prev := defaultClient
+	prevErr := defaultClientErr
+	prevActive := activeClient.Load()
+	defaultClientOnce.Do(func() {})
+	defaultClient = c
+	defaultClientErr = nil
+	activeClient.Store(c)
+	t.Cleanup(func() {
+		activeClient.Store(prevActive)
+		defaultClient = prev
+		defaultClientErr = prevErr
+	})
+}
+
+func sensitiveServer(t *testing.T, conditional *int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `W/"s1"`)
+		if r.Header.Get("If-None-Match") == `W/"s1"` {
+			*conditional++
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/repos"):
+			fmt.Fprint(w, `[{"name":"alpha","pushed_at":"2999-01-01T00:00:00Z","archived":false,"description":"SECRET-DESC","owner":{"login":"SECRET-OWNER"}}]`)
+		case strings.HasSuffix(r.URL.Path, "/runs"):
+			fmt.Fprint(w, `{"total_count":1,"workflow_runs":[{"id":77,"actor":{"login":"SECRET-ACTOR"},"triggering_actor":{"login":"SECRET-TRIG"},"head_commit":{"message":"SECRET-MSG","author":{"name":"SECRET-NAME","email":"secret@example.com"}}}]}`)
+		default:
+			fmt.Fprint(w, `{"total_count":1,"jobs":[{"run_id":77,"status":"queued","workflow_name":"ci","head_branch":"main","name":"build","runner_name":"r1","labels":["self-hosted","linux"],"started_at":"2026-01-02T03:04:05Z","created_at":"2026-01-02T03:00:00Z","html_url":"https://github.com/o/alpha/actions/runs/77/job/1","steps":[{"name":"SECRET-STEP"}],"actor":{"login":"SECRET-JOBACTOR"}}]}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestCacheStoresOnlyUsedFields(t *testing.T) {
+	dir := useCacheDir(t)
+	var conditional int
+	srv := sensitiveServer(t, &conditional)
+
+	a := cacheClient("tok")
+	a.base = srv.URL
+	useClient(t, a)
+	var limited atomic.Bool
+	jobs := scanRepo(context.Background(), &limited, "o", "alpha")
+	if len(jobs) == 0 {
+		t.Fatal("no jobs")
+	}
+	var repos []repoEntry
+	if _, ok := getJSON(context.Background(), &limited, &repos, "/orgs/o/repos"); !ok {
+		t.Fatal("repos fetch failed")
+	}
+	if err := SaveCache(); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "gh-runners", "etags.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, bad := range []string{"SECRET", "secret@example.com", "email", "message", "login", "description", "head_commit", "actor"} {
+		if strings.Contains(text, bad) {
+			t.Fatalf("cache file contains %q: %s", bad, text)
+		}
+	}
+	for _, want := range []string{"alpha", "pushed_at", "archived", `\"id\":77`, "run_id", "queued", "workflow_name", "head_branch", "build", "runner_name", "self-hosted", "started_at", "created_at", "html_url", "actions/runs/77/job/1", `W/\"s1\"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("cache file missing %q: %s", want, text)
+		}
+	}
+}
+
+func TestCache304FromTrimmedCacheMatchesOriginal(t *testing.T) {
+	useCacheDir(t)
+	var conditional int
+	srv := sensitiveServer(t, &conditional)
+
+	a := cacheClient("tok")
+	a.base = srv.URL
+	useClient(t, a)
+	var limited atomic.Bool
+	first := scanRepo(context.Background(), &limited, "o", "alpha")
+	if len(first) != 2 {
+		t.Fatalf("first jobs = %d", len(first))
+	}
+	if err := SaveCache(); err != nil {
+		t.Fatal(err)
+	}
+
+	b := cacheClient("tok")
+	b.base = srv.URL
+	useClient(t, b)
+	conditional = 0
+	second := scanRepo(context.Background(), &limited, "o", "alpha")
+	if conditional == 0 {
+		t.Fatal("no 304 served")
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("jobs differ:\n%+v\n%+v", first, second)
+	}
+}
+
+func TestCacheOldVersionFileStartsCold(t *testing.T) {
+	dir := useCacheDir(t)
+	path := filepath.Join(dir, "gh-runners", "etags.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := fmt.Sprintf(`{"version":1,"token_hash":%q,"entries":{"http://x/y":{"etag":"W/\"v1\"","body":"{\"head_commit\":{\"message\":\"SECRET\"}}"}}}`, tokenHash("tok"))
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := cacheClient("tok")
+	if len(c.cache.entries) != 0 {
+		t.Fatalf("expected cold start, got %d entries", len(c.cache.entries))
 	}
 }

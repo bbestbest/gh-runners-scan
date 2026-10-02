@@ -2,7 +2,6 @@ package scan
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/url"
 	"sort"
@@ -104,12 +103,9 @@ func getJSON(ctx context.Context, limited *atomic.Bool, out any, path string) (s
 		full = c.base + path
 	}
 	for attempt := 0; ; attempt++ {
-		data, link, err := c.fetch(ctx, full)
+		link, err := c.getInto(ctx, full, out)
 		if err == nil {
-			if out == nil {
-				return link, true
-			}
-			return link, json.Unmarshal(data, out) == nil
+			return link, true
 		}
 		if !isRateLimit(err) {
 			return "", false

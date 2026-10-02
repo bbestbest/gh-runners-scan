@@ -17,6 +17,17 @@ func testClient(base string) *client {
 	return &client{base: base, token: "test-token", http: &http.Client{}, cache: newETagCache()}
 }
 
+func getMap(c *client, url string) (map[string]any, error) {
+	var m map[string]any
+	_, err := c.getInto(context.Background(), url, &m)
+	return m, err
+}
+
+func js(m map[string]any) string {
+	data, _ := json.Marshal(m)
+	return string(data)
+}
+
 func TestETag304ReusesCachedBody(t *testing.T) {
 	var hits atomic.Int64
 	var conditional atomic.Int64
@@ -34,20 +45,20 @@ func TestETag304ReusesCachedBody(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(srv.URL)
-	body, _, err := c.fetch(context.Background(), srv.URL+"/x")
+	body, err := getMap(c, srv.URL+"/x")
 	if err != nil {
 		t.Fatalf("first fetch: %v", err)
 	}
-	if string(body) != `{"value":"first"}` {
-		t.Fatalf("first body = %q", body)
+	if js(body) != `{"value":"first"}` {
+		t.Fatalf("first body = %v", body)
 	}
 
-	body2, _, err := c.fetch(context.Background(), srv.URL+"/x")
+	body2, err := getMap(c, srv.URL+"/x")
 	if err != nil {
 		t.Fatalf("second fetch: %v", err)
 	}
-	if string(body2) != `{"value":"first"}` {
-		t.Fatalf("304 did not reuse cached body, got %q", body2)
+	if js(body2) != `{"value":"first"}` {
+		t.Fatalf("304 did not reuse cached body, got %v", body2)
 	}
 	if conditional.Load() != 1 {
 		t.Fatalf("expected 1 conditional request, got %d", conditional.Load())
@@ -74,19 +85,19 @@ func TestETag200ReplacesCachedBody(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(srv.URL)
-	if body, _, err := c.fetch(context.Background(), srv.URL+"/x"); err != nil || string(body) != `{"value":"body1"}` {
-		t.Fatalf("first = %q %v", body, err)
+	if body, err := getMap(c, srv.URL+"/x"); err != nil || js(body) != `{"value":"body1"}` {
+		t.Fatalf("first = %v %v", body, err)
 	}
 	version.Store(2)
-	body, _, err := c.fetch(context.Background(), srv.URL+"/x")
+	body, err := getMap(c, srv.URL+"/x")
 	if err != nil {
 		t.Fatalf("changed fetch: %v", err)
 	}
-	if string(body) != `{"value":"body2"}` {
-		t.Fatalf("200 did not replace cached body, got %q", body)
+	if js(body) != `{"value":"body2"}` {
+		t.Fatalf("200 did not replace cached body, got %v", body)
 	}
-	if body3, _, _ := c.fetch(context.Background(), srv.URL+"/x"); string(body3) != `{"value":"body2"}` {
-		t.Fatalf("new etag not stored, got %q", body3)
+	if body3, _ := getMap(c, srv.URL+"/x"); js(body3) != `{"value":"body2"}` {
+		t.Fatalf("new etag not stored, got %v", body3)
 	}
 }
 
@@ -110,9 +121,9 @@ func TestETagCacheConcurrent(t *testing.T) {
 			go func(i int) {
 				defer wg.Done()
 				want := fmt.Sprintf(`{"p":"/r%d"}`, i)
-				body, _, err := c.fetch(context.Background(), fmt.Sprintf("%s/r%d", srv.URL, i))
-				if err != nil || string(body) != want {
-					t.Errorf("got %q %v want %q", body, err, want)
+				body, err := getMap(c, fmt.Sprintf("%s/r%d", srv.URL, i))
+				if err != nil || js(body) != want {
+					t.Errorf("got %v %v want %q", body, err, want)
 				}
 			}(i)
 		}
@@ -128,7 +139,7 @@ func TestRateLimitErrorFrom403(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(srv.URL)
-	_, _, err := c.fetch(context.Background(), srv.URL+"/x")
+	_, err := getMap(c, srv.URL+"/x")
 	if !isRateLimit(err) {
 		t.Fatalf("403 with remaining=0 should be rate limit, got %v", err)
 	}
@@ -141,7 +152,7 @@ func TestNonRateLimitErrorNotRetried(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(srv.URL)
-	_, _, err := c.fetch(context.Background(), srv.URL+"/x")
+	_, err := getMap(c, srv.URL+"/x")
 	if err == nil || isRateLimit(err) {
 		t.Fatalf("404 should be a plain error, got %v", err)
 	}
@@ -156,7 +167,7 @@ func TestAuthHeaderSentAndTokenNotLeaked(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(srv.URL)
-	_, _, err := c.fetch(context.Background(), srv.URL+"/x")
+	_, err := getMap(c, srv.URL+"/x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +292,7 @@ func TestCancelRunLeavesETagCacheUntouched(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(srv.URL)
-	if _, _, err := c.fetch(context.Background(), srv.URL+"/x"); err != nil {
+	if _, err := getMap(c, srv.URL+"/x"); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.cancelRun(context.Background(), "org-a", "web", 5); err != nil {
@@ -346,7 +357,7 @@ func TestUsageRecordsHeadersAndCounters(t *testing.T) {
 		t.Fatalf("fresh snapshot = %+v", got)
 	}
 
-	if _, _, err := c.fetch(context.Background(), srv.URL+"/ok"); err != nil {
+	if _, err := getMap(c, srv.URL+"/ok"); err != nil {
 		t.Fatal(err)
 	}
 	got := c.usage.snapshot()
@@ -357,10 +368,10 @@ func TestUsageRecordsHeadersAndCounters(t *testing.T) {
 		t.Fatalf("counters after 200 = %+v", got)
 	}
 
-	if _, _, err := c.fetch(context.Background(), srv.URL+"/cached"); err != nil {
+	if _, err := getMap(c, srv.URL+"/cached"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := c.fetch(context.Background(), srv.URL+"/cached"); err != nil {
+	if _, err := getMap(c, srv.URL+"/cached"); err != nil {
 		t.Fatal(err)
 	}
 	got = c.usage.snapshot()
@@ -368,7 +379,7 @@ func TestUsageRecordsHeadersAndCounters(t *testing.T) {
 		t.Fatalf("after 304 = %+v", got)
 	}
 
-	if _, _, err := c.fetch(context.Background(), srv.URL+"/bare"); err != nil {
+	if _, err := getMap(c, srv.URL+"/bare"); err != nil {
 		t.Fatal(err)
 	}
 	bare := c.usage.snapshot()
@@ -380,7 +391,7 @@ func TestUsageRecordsHeadersAndCounters(t *testing.T) {
 		t.Fatalf("headerless response changed values: %+v vs %+v", bare, got)
 	}
 
-	if _, _, err := c.fetch(context.Background(), srv.URL+"/limited"); !isRateLimit(err) {
+	if _, err := getMap(c, srv.URL+"/limited"); !isRateLimit(err) {
 		t.Fatalf("err = %v", err)
 	}
 	got = c.usage.snapshot()
@@ -420,7 +431,7 @@ func TestUsageConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 5; j++ {
-				c.fetch(context.Background(), srv.URL+"/x")
+				getMap(c, srv.URL+"/x")
 				c.usage.snapshot()
 			}
 		}()
