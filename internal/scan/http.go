@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,16 +26,20 @@ type etagEntry struct {
 type etagCache struct {
 	mu      sync.Mutex
 	entries map[string]etagEntry
+	used    map[string]bool
 }
 
 func newETagCache() *etagCache {
-	return &etagCache{entries: map[string]etagEntry{}}
+	return &etagCache{entries: map[string]etagEntry{}, used: map[string]bool{}}
 }
 
 func (c *etagCache) get(url string) (etagEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.entries[url]
+	if ok {
+		c.used[url] = true
+	}
 	return entry, ok
 }
 
@@ -45,6 +50,7 @@ func (c *etagCache) put(url, etag string, body []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries[url] = etagEntry{etag: etag, body: body}
+	c.used[url] = true
 }
 
 type client struct {
@@ -146,6 +152,7 @@ var (
 	defaultClientOnce sync.Once
 	defaultClient     *client
 	defaultClientErr  error
+	activeClient      atomic.Pointer[client]
 )
 
 func resolveToken() (string, error) {
@@ -174,8 +181,9 @@ func sharedClient() (*client, error) {
 			base:  apiBase,
 			token: token,
 			http:  &http.Client{Timeout: 30 * time.Second},
-			cache: newETagCache(),
+			cache: loadETagCache(token),
 		}
+		activeClient.Store(defaultClient)
 	})
 	return defaultClient, defaultClientErr
 }

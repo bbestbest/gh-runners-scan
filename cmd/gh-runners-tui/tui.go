@@ -215,6 +215,20 @@ var cancelRun = scan.CancelRun
 
 var usage = scan.Usage
 
+var saveCache = scan.SaveCache
+
+func saveCacheCmd() tea.Msg {
+	saveCache()
+	return nil
+}
+
+func quitCmd() tea.Cmd {
+	return func() tea.Msg {
+		saveCache()
+		return tea.QuitMsg{}
+	}
+}
+
 func cancelCmd(j scan.Job) tea.Cmd {
 	return func() tea.Msg {
 		return cancelDoneMsg{job: j, err: cancelRun(context.Background(), j.Owner, j.Repo, j.RunID)}
@@ -266,7 +280,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastScan = time.Now().UTC().Format("15:04:05")
 		m.nextIn = m.opts.interval
 		m.refresh()
-		return m, nil
+		return m, saveCacheCmd
 
 	case cancelDoneMsg:
 		label := msg.job.Workflow + " (" + msg.job.Repo + ")"
@@ -317,10 +331,10 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.orgActive {
 		switch msg.String() {
 		case "ctrl+c":
-			return m, tea.Quit
+			return m, quitCmd()
 		case "esc":
 			if m.opts.org == "" {
-				return m, tea.Quit
+				return m, quitCmd()
 			}
 			m.orgActive = false
 			m.orgInput.SetValue("")
@@ -398,7 +412,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.usageActive {
 		switch msg.String() {
 		case "ctrl+c":
-			return m, tea.Quit
+			return m, quitCmd()
 		case "esc", "u", "q":
 			m.usageActive = false
 		}
@@ -411,7 +425,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.confirming = false
 		switch msg.String() {
 		case "ctrl+c":
-			return m, tea.Quit
+			return m, quitCmd()
 		case "y":
 			job := m.confirmJob
 			if m.cancels[job.RunID] {
@@ -429,7 +443,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.String() {
 	case "q", "ctrl+c":
-		return m, tea.Quit
+		return m, quitCmd()
 	case "c":
 		job, ok := m.selected()
 		if !ok || job.RunID == 0 {

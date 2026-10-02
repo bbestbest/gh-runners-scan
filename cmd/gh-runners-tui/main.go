@@ -115,6 +115,7 @@ func printOnce(opts options) {
 		fmt.Fprintf(os.Stderr, "\r\033[Kscanning %s  %d/%d repos", opts.org, done, total)
 	})
 	fmt.Fprint(os.Stderr, "\r\033[K")
+	scan.SaveCache()
 
 	running, queued := scan.SplitJobs(jobs)
 	now := time.Now().UTC()

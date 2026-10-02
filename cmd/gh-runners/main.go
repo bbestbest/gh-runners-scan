@@ -45,6 +45,7 @@ func main() {
 	}
 
 	rows, scanErr := collect(org, *repo, *days, *label)
+	scan.SaveCache()
 
 	if selectMode {
 		if scanErr != nil {

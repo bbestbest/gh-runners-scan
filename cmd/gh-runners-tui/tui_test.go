@@ -24,6 +24,8 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	os.Setenv("XDG_CONFIG_HOME", dir)
+	os.Setenv("XDG_CACHE_HOME", dir)
+	saveCache = func() error { return nil }
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -1457,5 +1459,52 @@ func TestScanDoneRecordsCost(t *testing.T) {
 	m = next.(model)
 	if m.lastCost == nil || m.lastCost.requests != 12 || m.lastCost.free != 9 {
 		t.Fatalf("lastCost = %+v", m.lastCost)
+	}
+}
+
+func stubSaveCache(t *testing.T) *int {
+	t.Helper()
+	calls := new(int)
+	orig := saveCache
+	saveCache = func() error {
+		*calls++
+		return nil
+	}
+	t.Cleanup(func() { saveCache = orig })
+	return calls
+}
+
+func TestScanDoneSavesCache(t *testing.T) {
+	calls := stubSaveCache(t)
+	m := newTestModel(t)
+	_, cmd := m.Update(scanDoneMsg{id: m.scanID, jobs: testJobs()})
+	if cmd == nil {
+		t.Fatal("scanDoneMsg returned no save command")
+	}
+	cmd()
+	if *calls != 1 {
+		t.Fatalf("save calls after scan = %d, want 1", *calls)
+	}
+
+	_, cmd = m.Update(scanDoneMsg{id: m.scanID + 99})
+	if cmd != nil {
+		t.Fatal("stale scanDoneMsg triggered a save")
+	}
+}
+
+func TestQuitSavesCache(t *testing.T) {
+	for _, k := range []string{"q", "ctrl+c"} {
+		calls := stubSaveCache(t)
+		m := newTestModel(t)
+		_, cmd := m.Update(key(k))
+		if cmd == nil {
+			t.Fatalf("%s returned no command", k)
+		}
+		if msg := cmd(); msg != tea.Quit() {
+			t.Fatalf("%s sent %T, want quit", k, msg)
+		}
+		if *calls != 1 {
+			t.Fatalf("save calls after %s = %d, want 1", k, *calls)
+		}
 	}
 }

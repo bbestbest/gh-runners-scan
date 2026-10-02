@@ -121,10 +121,10 @@ Runner *labels* (`self-hosted,ARM64`) are what a job requests. The runner *name*
 
 Each scan costs roughly `1 + 2×repos` requests, plus one more per active run (and one per extra 100 jobs in a run), so the org size drives the bill against the 5000/hour quota. `--repo` skips the repo listing entirely and costs about 2–3 requests.
 
-Conditional requests keep that cheap: an unchanged repo returns `304 Not Modified`, which does not count against the quota. The ETag cache is **in-memory and per-process**, so:
+Conditional requests keep that cheap: an unchanged repo returns `304 Not Modified`, which does not count against the quota. The ETag cache is persisted between runs (see [ETag cache on disk](#etag-cache-on-disk)), so:
 
-- a long-running `gh-runners-tui` pays full price on its first scan, then close to nothing
-- each `--once` invocation is a fresh process and pays full price every time
+- the first scan after a restart or a new CLI invocation reuses the last run's ETags and mostly gets free `304`s
+- a cold scan (no cache file, other token, or entries GitHub has since changed) pays full price
 
 A cancel (`c`) is one `POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel`. It is never cached, counts toward the 5000/hour quota like any other call, and also counts toward GitHub's secondary content-creation limit, so mashing it on many runs can trip that limit. It does not start a rescan.
 
@@ -133,6 +133,14 @@ The timer never starts a scan while one is still running: the countdown pauses d
 Scans run 6 workers. Raising that trips GitHub's *secondary* rate limit (burst detection), which is separate from the hourly quota and invisible to `gh api rate_limit`.
 
 When a scan is rate-limited it says so on stderr and exits 2, rather than printing an empty table that looks like an idle org.
+
+### ETag cache on disk
+
+`gh-runners` and `gh-runners-tui` share one cache file: `$XDG_CACHE_HOME/gh-runners/etags.json`, or `~/.cache/gh-runners/etags.json` when `XDG_CACHE_HOME` is unset. The directory is created `0700` and the file `0600`. It is written after every finished scan and when the TUI quits, and only holds the URLs the last run actually used.
+
+The file holds **private API response bodies** (repo, branch, workflow and job names), not just ETags. It is keyed by a SHA-256 of the token, never the token itself, so switching `GH_TOKEN` starts cold. A missing, corrupt or old-version file is ignored.
+
+To clear it: `rm ~/.cache/gh-runners/etags.json` (or under `$XDG_CACHE_HOME`).
 
 ### Rate limit in the TUI
 
