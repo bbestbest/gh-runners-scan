@@ -646,9 +646,10 @@ func (m *model) moveCursor(delta int) {
 	}
 	if delta < 0 {
 		t.MoveUp(-delta)
-		return
+	} else {
+		t.MoveDown(delta)
 	}
-	t.MoveDown(delta)
+	m.refresh()
 }
 
 func (m *model) gotoEdge(bottom bool) {
@@ -658,9 +659,10 @@ func (m *model) gotoEdge(bottom bool) {
 	}
 	if bottom {
 		t.GotoBottom()
-		return
+	} else {
+		t.GotoTop()
 	}
-	t.GotoTop()
+	m.refresh()
 }
 
 func (m *model) selected() (scan.Job, bool) {
@@ -700,19 +702,24 @@ func (m *model) refresh() {
 	now := time.Now().UTC()
 	cols := m.runTable.Columns()
 	runRows := make([]table.Row, 0, len(m.running))
-	for _, j := range m.running {
+	runSel := clamp(runCursor, len(m.running))
+	for i, j := range m.running {
 		elapsed := "-"
 		if !j.StartedAt.IsZero() {
 			elapsed = fmtElapsed(now.Sub(j.StartedAt))
 		}
+		runnerStyle := greenStyle
 		rest := m.rowStyle(j.Repo)
 		elapsedStyle := rest
 		if m.cancelling(j) {
 			elapsed = "cancelling"
 			elapsedStyle = yellowStyle
 		}
+		if i == runSel {
+			runnerStyle, rest, elapsedStyle = lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle()
+		}
 		runRows = append(runRows, table.Row{
-			cell(j.Runner, greenStyle, cols, 0),
+			cell(j.Runner, runnerStyle, cols, 0),
 			cell(j.Repo, rest, cols, 1),
 			cell(j.Workflow, rest, cols, 2),
 			cell(j.Branch, rest, cols, 3),
@@ -723,7 +730,8 @@ func (m *model) refresh() {
 
 	qcols := m.qTable.Columns()
 	qRows := make([]table.Row, 0, len(m.queued))
-	for _, j := range m.queued {
+	qSel := clamp(qCursor, len(m.queued))
+	for i, j := range m.queued {
 		wait := "-"
 		waitStyle := m.rowStyle(j.Repo)
 		if !j.CreatedAt.IsZero() {
@@ -740,6 +748,9 @@ func (m *model) refresh() {
 			waitStyle = yellowStyle
 		}
 		rest := m.rowStyle(j.Repo)
+		if i == qSel {
+			waitStyle, rest = lipgloss.NewStyle(), lipgloss.NewStyle()
+		}
 		qRows = append(qRows, table.Row{
 			cell(wait, waitStyle, qcols, 0),
 			cell(j.Repo, rest, qcols, 1),

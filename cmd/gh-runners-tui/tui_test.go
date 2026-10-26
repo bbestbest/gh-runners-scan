@@ -13,6 +13,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"gh-runners/internal/config"
 	"gh-runners/internal/scan"
@@ -1505,6 +1507,40 @@ func TestQuitSavesCache(t *testing.T) {
 		}
 		if *calls != 1 {
 			t.Fatalf("save calls after %s = %d, want 1", k, *calls)
+		}
+	}
+}
+
+func TestSelectedRowKeepsHighlightAcrossCells(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	t.Cleanup(func() { lipgloss.SetColorProfile(prev) })
+
+	now := time.Now().UTC()
+	m := newModel(options{org: "org-c", interval: 30, repo: "repo"})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	m = next.(model)
+	m.jobs = manyJobs(5)
+	for i := 0; i < 3; i++ {
+		m.jobs = append(m.jobs, scan.Job{Status: "queued", Owner: "org-c", Repo: "repo", Workflow: "wf", Branch: "main", Name: "queued-" + strconv.Itoa(i), RunID: int64(2000 + i), CreatedAt: now.Add(-45 * time.Minute)})
+	}
+	m.cancels[1002] = true
+	m.refresh()
+
+	for _, focus := range []string{"1", "2"} {
+		m = send(m, key(focus))
+		for step := 0; step < 3; step++ {
+			m = send(m, key("j"))
+			tbl := m.focusedTable()
+			lines := strings.Split(tbl.View(), "\n")
+			selected := lines[2+tbl.Cursor()]
+			if n := strings.Count(selected, "\x1b[0m"); n != 1 || !strings.HasSuffix(selected, "\x1b[0m") {
+				t.Fatalf("panel %s cursor %d: selected row has %d resets, want 1 at the end: %q", focus, tbl.Cursor(), n, selected)
+			}
+			above := lines[1+tbl.Cursor()]
+			if !strings.Contains(above, "\x1b[") {
+				t.Fatalf("panel %s cursor %d: row above lost its own styling: %q", focus, tbl.Cursor(), above)
+			}
 		}
 	}
 }
