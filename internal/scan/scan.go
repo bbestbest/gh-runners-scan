@@ -159,6 +159,7 @@ func storeRepos(key string, names []string) {
 }
 
 func listRepos(ctx context.Context, limited *atomic.Bool, org string, days int) []string {
+	sharedClient()
 	key := org + "\x00" + strconv.Itoa(days)
 	if names, ok := cachedRepos(key); ok {
 		return names

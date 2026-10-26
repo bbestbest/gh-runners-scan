@@ -184,6 +184,7 @@ func sharedClient() (*client, error) {
 			http:  &http.Client{Timeout: 30 * time.Second},
 			cache: loadETagCache(token),
 		}
+		loadRepoCache(token)
 		activeClient.Store(defaultClient)
 	})
 	return defaultClient, defaultClientErr

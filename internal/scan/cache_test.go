@@ -10,8 +10,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func etagServer(t *testing.T) *httptest.Server {
@@ -353,5 +355,181 @@ func TestCacheOldVersionFileStartsCold(t *testing.T) {
 	c := cacheClient("tok")
 	if len(c.cache.entries) != 0 {
 		t.Fatalf("expected cold start, got %d entries", len(c.cache.entries))
+	}
+}
+
+func reposServer(t *testing.T, hits *atomic.Int64) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		t.Errorf("unexpected request %s", r.URL.Path)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func persistRepos(t *testing.T, token, key string, names []string, expires time.Time) {
+	t.Helper()
+	resetRepoCache(t)
+	repoCacheMu.Lock()
+	repoCache[key] = repoCacheEntry{names: names, expires: expires}
+	repoCacheMu.Unlock()
+	if err := cacheClient(token).saveRepoCache(); err != nil {
+		t.Fatal(err)
+	}
+	resetRepoCache(t)
+}
+
+func TestRepoCacheRoundTripServesWithoutRequests(t *testing.T) {
+	useCacheDir(t)
+	var hits atomic.Int64
+	srv := reposServer(t, &hits)
+	withClient(t, srv.URL)
+	persistRepos(t, "tok", "o\x007", []string{"alpha", "beta"}, time.Now().Add(time.Minute))
+
+	loadRepoCache("tok")
+	var limited atomic.Bool
+	names := listRepos(context.Background(), &limited, "o", 7)
+	if !reflect.DeepEqual(names, []string{"alpha", "beta"}) {
+		t.Fatalf("names = %v", names)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("requests = %d, want 0", hits.Load())
+	}
+}
+
+func TestRepoCacheColdCases(t *testing.T) {
+	cases := []struct {
+		name  string
+		token string
+		key   string
+		ttl   time.Duration
+		prep  func(t *testing.T, path string)
+	}{
+		{"expired", "tok", "o\x007", -time.Minute, nil},
+		{"different days", "tok", "o\x0030", time.Minute, nil},
+		{"different token", "other", "o\x007", time.Minute, nil},
+		{"missing file", "tok", "o\x007", time.Minute, func(t *testing.T, path string) {
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"corrupt", "tok", "o\x007", time.Minute, func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"wrong version", "tok", "o\x007", time.Minute, func(t *testing.T, path string) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var disk diskRepos
+			if err := json.Unmarshal(data, &disk); err != nil {
+				t.Fatal(err)
+			}
+			disk.Version = repoCacheVersion + 1
+			data, _ = json.Marshal(disk)
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := useCacheDir(t)
+			persistRepos(t, "tok", "o\x007", []string{"alpha"}, time.Now().Add(tc.ttl))
+			if tc.prep != nil {
+				tc.prep(t, filepath.Join(dir, "gh-runners", "repos.json"))
+			}
+			if tc.token == "tok" && tc.key == "o\x0030" {
+				loadRepoCache("tok")
+				if _, ok := cachedRepos(tc.key); ok {
+					t.Fatal("served wrong days")
+				}
+				return
+			}
+			loadRepoCache(tc.token)
+			if _, ok := cachedRepos("o\x007"); ok {
+				t.Fatal("expected cold start")
+			}
+		})
+	}
+}
+
+func TestRepoCacheSurvivesRepoOnlyRun(t *testing.T) {
+	useCacheDir(t)
+	srv := etagServer(t)
+	persistRepos(t, "tok", "o\x007", []string{"alpha"}, time.Now().Add(time.Minute))
+
+	loadRepoCache("tok")
+	a := cacheClient("tok")
+	a.base = srv.URL
+	useClient(t, a)
+	if _, err := getMap(a, srv.URL+"/x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveCache(); err != nil {
+		t.Fatal(err)
+	}
+
+	resetRepoCache(t)
+	loadRepoCache("tok")
+	if names, ok := cachedRepos("o\x007"); !ok || !reflect.DeepEqual(names, []string{"alpha"}) {
+		t.Fatalf("repo list dropped: %v %v", names, ok)
+	}
+}
+
+func TestRepoCacheFileModesAndNoToken(t *testing.T) {
+	dir := useCacheDir(t)
+	persistRepos(t, "super-secret-token", "o\x007", []string{"alpha"}, time.Now().Add(time.Minute))
+	sub := filepath.Join(dir, "gh-runners")
+	di, err := os.Stat(sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if di.Mode().Perm() != 0o700 {
+		t.Fatalf("dir mode = %v, want 0700", di.Mode().Perm())
+	}
+	path := filepath.Join(sub, "repos.json")
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("file mode = %v, want 0600", fi.Mode().Perm())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "super-secret-token") {
+		t.Fatal("token written to repo cache file")
+	}
+	left, _ := filepath.Glob(filepath.Join(sub, ".etags-*"))
+	if len(left) != 0 {
+		t.Fatalf("temp files left: %v", left)
+	}
+}
+
+func TestListReposLoadsPersistedListBeforeClientExists(t *testing.T) {
+	useCacheDir(t)
+	t.Setenv("GH_TOKEN", "tok")
+	persistRepos(t, "tok", "o\x007", []string{"alpha"}, time.Now().Add(time.Minute))
+
+	prev, prevErr := defaultClient, defaultClientErr
+	prevActive := activeClient.Load()
+	defaultClientOnce = sync.Once{}
+	defaultClient, defaultClientErr = nil, nil
+	t.Cleanup(func() {
+		defaultClientOnce.Do(func() {})
+		defaultClient, defaultClientErr = prev, prevErr
+		activeClient.Store(prevActive)
+	})
+
+	var limited atomic.Bool
+	names := listRepos(context.Background(), &limited, "o", 7)
+	if !reflect.DeepEqual(names, []string{"alpha"}) {
+		t.Fatalf("names = %v", names)
 	}
 }

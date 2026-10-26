@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const cacheVersion = 2
+
+const repoCacheVersion = 1
 
 type diskEntry struct {
 	ETag string `json:"etag"`
@@ -26,15 +29,88 @@ func tokenHash(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func cachePath() string {
+func cacheFile(name string) string {
 	if dir := os.Getenv("XDG_CACHE_HOME"); dir != "" {
-		return filepath.Join(dir, "gh-runners", "etags.json")
+		return filepath.Join(dir, "gh-runners", name)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".cache", "gh-runners", "etags.json")
+	return filepath.Join(home, ".cache", "gh-runners", name)
+}
+
+func cachePath() string {
+	return cacheFile("etags.json")
+}
+
+type diskRepoEntry struct {
+	Names   []string  `json:"names"`
+	Expires time.Time `json:"expires"`
+}
+
+type diskRepos struct {
+	Version   int                      `json:"version"`
+	TokenHash string                   `json:"token_hash"`
+	Entries   map[string]diskRepoEntry `json:"entries"`
+}
+
+func loadRepoCache(token string) {
+	path := cacheFile("repos.json")
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var disk diskRepos
+	if json.Unmarshal(data, &disk) != nil {
+		return
+	}
+	if disk.Version != repoCacheVersion || disk.TokenHash != tokenHash(token) {
+		return
+	}
+	now := time.Now()
+	repoCacheMu.Lock()
+	defer repoCacheMu.Unlock()
+	for key, e := range disk.Entries {
+		if now.Before(e.Expires) {
+			repoCache[key] = repoCacheEntry{names: e.Names, expires: e.Expires}
+		}
+	}
+}
+
+func (c *client) saveRepoCache() error {
+	path := cacheFile("repos.json")
+	if path == "" {
+		return nil
+	}
+	now := time.Now()
+	repoCacheMu.Lock()
+	entries := make(map[string]diskRepoEntry, len(repoCache))
+	for key, e := range repoCache {
+		if now.Before(e.expires) {
+			entries[key] = diskRepoEntry{Names: e.names, Expires: e.expires}
+		}
+	}
+	repoCacheMu.Unlock()
+	if len(entries) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(diskRepos{
+		Version:   repoCacheVersion,
+		TokenHash: tokenHash(c.token),
+		Entries:   entries,
+	})
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return writeFileAtomic(dir, path, data)
 }
 
 func loadETagCache(token string) *etagCache {
@@ -124,5 +200,9 @@ func SaveCache() error {
 	if c == nil {
 		return nil
 	}
-	return c.saveCache()
+	err := c.saveCache()
+	if rerr := c.saveRepoCache(); err == nil {
+		err = rerr
+	}
+	return err
 }
