@@ -50,3 +50,7 @@ The page talks only to `api.github.com` and never changes anything. It's free to
 ## Limits
 
 Only queued and running jobs; up to 20 runs per status per repo; repos older than `--days` are skipped.
+
+## License
+
+[MIT](LICENSE)
