@@ -12,6 +12,8 @@ const SETTINGS_KEY = 'gh-runner:settings'
 
 const TOKEN_KEY = 'gh-runner:token'
 
+const SESSION_KEY = 'gh-runner:session'
+
 const KDF_ITERATIONS = 600000
 
 const REPO_TTL = 12 * 60 * 1000
@@ -264,6 +266,7 @@ function logout(message) {
   state.scanning = false
   account = {}
   forgetToken()
+  dropSession()
   openConnect(message)
 }
 
@@ -383,11 +386,15 @@ async function submitToken() {
   $('token').disabled = true
   $('newPass').disabled = true
   const ok = await verifyToken(value) === 'ok'
-  if (ok && !remember) forgetToken()
+  if (ok && !remember) {
+    forgetToken()
+    dropSession()
+  }
   if (ok && remember) {
     setBusy('encrypting token…')
     try {
       await saveToken(value, pass, account.login)
+      keepSession(value)
     } catch (err) {
       $('loginError').textContent = `token works but could not be saved: ${err.message}`
     }
@@ -427,9 +434,13 @@ async function submitUnlock() {
   }
   $('unlockPass').value = ''
   const result = await verifyToken(value)
-  if (result === 'ok') return showConfig()
+  if (result === 'ok') {
+    keepSession(value)
+    return showConfig()
+  }
   if (result === 'rejected') {
     forgetToken()
+    dropSession()
     showTokenStep()
     $('loginError').textContent = 'the saved token was rejected (401) and has been forgotten; paste a new one'
   }
@@ -481,6 +492,54 @@ async function suggestPassphrase() {
   } catch {}
 }
 
+function keepSession(value) {
+  try {
+    sessionStorage.setItem(SESSION_KEY, value)
+  } catch {}
+}
+
+function sessionToken() {
+  try {
+    return sessionStorage.getItem(SESSION_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+function dropSession() {
+  try {
+    sessionStorage.removeItem(SESSION_KEY)
+  } catch {}
+}
+
+async function resumeSession() {
+  const value = sessionToken()
+  if (!value || !savedToken()) {
+    dropSession()
+    return openConnect()
+  }
+  openConnect()
+  $('unlockPass').disabled = true
+  setBusy('restoring session…')
+  const result = await verifyToken(value)
+  $('unlockPass').disabled = false
+  if (result === 'ok') return openConnect()
+  if (result === 'rejected') {
+    forgetToken()
+    dropSession()
+    return openConnect('the saved token was rejected (401) and has been forgotten; paste a new one')
+  }
+  openConnect($('loginError').textContent)
+}
+
+function formDays() {
+  return Math.max(0, parseInt($('days').value, 10) || 0)
+}
+
+function repoKey(org) {
+  return org + '\u0000' + formDays()
+}
+
 function forgetToken() {
   try {
     localStorage.removeItem(TOKEN_KEY)
@@ -491,6 +550,8 @@ async function loadRepos(org, keep) {
   const select = $('repo')
   const note = $('repoNote')
   const seq = ++repoSeq
+  const days = formDays()
+  const within = days > 0 ? ` pushed in the last ${days} ${days === 1 ? 'day' : 'days'}` : ''
   reposFor = ''
   note.className = 'dim'
   if (!org) {
@@ -502,8 +563,9 @@ async function loadRepos(org, keep) {
   }
   select.replaceChildren(new Option('loading repositories…', ''))
   select.disabled = true
-  note.textContent = `loading repositories of ${org}…`
+  note.textContent = `loading repositories of ${org}${within}…`
   setBusy('loading repositories…')
+  const cutoff = Date.now() - days * 24 * 3600 * 1000
   const names = []
   let failure = ''
   try {
@@ -513,26 +575,38 @@ async function loadRepos(org, keep) {
     while (next) {
       const page = await connectGet(next)
       if (seq !== repoSeq) return
-      for (const r of page.data) if (!r.archived) names.push(r.name)
-      note.textContent = `loading repositories of ${org}… ${names.length}`
-      next = page.next
+      let older = false
+      for (const r of page.data) {
+        if (r.archived) continue
+        if (days > 0 && !r.pushed_at) continue
+        if (days > 0 && Date.parse(r.pushed_at) <= cutoff) {
+          older = true
+          break
+        }
+        names.push(r.name)
+      }
+      note.textContent = `loading repositories of ${org}${within}… ${names.length}`
+      next = older ? '' : page.next
     }
   } catch (err) {
     if (seq !== repoSeq) return
     failure = err.message
   }
+  if (!failure) repoCache.set(org + '\u0000' + days, { names, expires: Date.now() + REPO_TTL })
   select.replaceChildren(new Option('All repositories', ''), ...names.map(n => new Option(n, n)))
   if (keep && names.includes(keep)) select.value = keep
   select.disabled = false
-  reposFor = org
+  reposFor = org + '\u0000' + days
   setBusy('')
   if (failure) {
     note.className = 'red'
     note.textContent = `cannot list repositories of ${org}: ${failure}`
   } else if (!names.length) {
     note.className = 'yellow'
-    note.textContent = 'this token sees no repositories here; check the token\'s resource owner'
-  } else note.textContent = `${names.length} ${names.length === 1 ? 'repository' : 'repositories'} visible to this token`
+    note.textContent = days > 0
+      ? `no repositories${within}; raise "Pushed within" or set it to 0`
+      : 'this token sees no repositories here; check the token\'s resource owner'
+  } else note.textContent = `${names.length} ${names.length === 1 ? 'repository' : 'repositories'}${within}`
 }
 
 function target() {
@@ -825,7 +899,7 @@ function submitConnect(e) {
     return $('org').focus()
   }
   $('loginError').textContent = ''
-  if (org !== reposFor) return loadRepos(org)
+  if (repoKey(org) !== reposFor) return loadRepos(org, $('repo').value)
   start()
 }
 
@@ -869,9 +943,13 @@ function init() {
   loadSettings()
   renderHints()
   $('login').addEventListener('submit', submitConnect)
-  $('changeToken').addEventListener('click', showTokenStep)
+  $('changeToken').addEventListener('click', () => {
+    dropSession()
+    showTokenStep()
+  })
   $('forgetToken').addEventListener('click', () => {
     forgetToken()
+    dropSession()
     $('loginError').textContent = ''
     showTokenStep()
   })
@@ -880,13 +958,15 @@ function init() {
     $('rememberFields').hidden = !$('remember').checked
     if ($('remember').checked) $('newPass').focus()
   })
-  $('org').addEventListener('input', () => {
+  const reloadRepos = () => {
     clearTimeout(orgTimer)
     orgTimer = setTimeout(() => {
       const org = $('org').value.trim()
-      if (org && org !== reposFor) loadRepos(org)
+      if (org && repoKey(org) !== reposFor) loadRepos(org, $('repo').value)
     }, 500)
-  })
+  }
+  $('org').addEventListener('input', reloadRepos)
+  $('days').addEventListener('input', reloadRepos)
   $('filter').addEventListener('input', () => {
     state.filter = $('filter').value
     refresh()
@@ -894,7 +974,7 @@ function init() {
   document.addEventListener('keydown', onKey)
   setInterval(tick, 1000)
   refresh()
-  openConnect()
+  resumeSession()
 }
 
 init()
