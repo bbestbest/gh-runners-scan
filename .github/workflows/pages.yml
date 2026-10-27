@@ -66,15 +66,16 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Stamp asset URLs and pin scripts and styles to this site's path
+      - name: Stamp asset URLs and pin scripts, styles and the icon to this site's path
         env:
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
           base="https://${owner}.github.io/${GITHUB_REPOSITORY#*/}/"
           sed -i "s/?v=dev/?v=${VERSION}/g" web/index.html
-          sed -i "s|script-src 'self'|script-src ${base}|; s|style-src 'self'|style-src ${base}|" web/index.html
+          sed -i "s|script-src 'self'|script-src ${base}|; s|style-src 'self'|style-src ${base}|; s|img-src 'self'|img-src ${base}icon.svg|" web/index.html
           grep -q "script-src ${base}" web/index.html
+          grep -q "img-src ${base}icon.svg;" web/index.html
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
