@@ -405,7 +405,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.jobs = msg.jobs
 		m.scanErr = msg.err
 		m.lastCost = &scanCost{requests: msg.requests, free: msg.free}
-		m.lastScan = time.Now().UTC().Format("15:04:05")
+		m.lastScan = clock(time.Now(), "15:04:05")
 		m.nextIn = m.opts.interval
 		m.refresh()
 		return m, saveCacheCmd
@@ -1403,7 +1403,7 @@ func countFooter(t table.Model) string {
 
 func (m model) statusPanelLines(width int) []string {
 	owners := " " + hlStyle.Render(ansi.Truncate(m.orgLabel(), width-2, "…"))
-	first := " " + dimStyle.Render(m.repoCountLabel()+" · scanned "+m.lastScanLabel()+" UTC")
+	first := " " + dimStyle.Render(m.repoCountLabel()+" · scanned "+m.lastScanLabel())
 	second := " " + dimStyle.Render("no scan yet")
 	switch {
 	case !m.hasTargets():
@@ -1613,11 +1613,11 @@ func (m model) detailPanel(w, h int) string {
 	if isRunning {
 		lines = append(lines, kv("Runner", greenStyle.Render(j.Runner)))
 		if !j.StartedAt.IsZero() {
-			lines = append(lines, kv("Elapsed", fmtElapsed(now.Sub(j.StartedAt))+dimStyle.Render("  (since "+j.StartedAt.UTC().Format("15:04")+" UTC)")))
+			lines = append(lines, kv("Elapsed", fmtElapsed(now.Sub(j.StartedAt))+dimStyle.Render("  (since "+clock(j.StartedAt, "15:04")+")")))
 		}
 	} else if !j.CreatedAt.IsZero() {
 		mins := int(now.Sub(j.CreatedAt).Minutes())
-		lines = append(lines, kv("Waiting", waitColor(mins, lipgloss.NewStyle()).Render(fmt.Sprintf("%dm", mins))+dimStyle.Render("  (since "+j.CreatedAt.UTC().Format("15:04")+" UTC)")))
+		lines = append(lines, kv("Waiting", waitColor(mins, lipgloss.NewStyle()).Render(fmt.Sprintf("%dm", mins))+dimStyle.Render("  (since "+clock(j.CreatedAt, "15:04")+")")))
 	}
 	lines = append(lines,
 		kv("Branch", j.Branch),
@@ -1723,7 +1723,7 @@ func (m model) usageOverlayView() string {
 		}
 		reset := "-"
 		if !u.Reset.IsZero() {
-			reset = u.Reset.Local().Format("15:04:05") + " (" + fmtCountdown(time.Until(u.Reset)) + ")"
+			reset = clock(u.Reset, "15:04:05") + " (" + fmtCountdown(time.Until(u.Reset)) + ")"
 		}
 		lines = append(lines,
 			label("resource", resource),
@@ -1795,7 +1795,7 @@ func (m model) usageIndicator() string {
 	}
 	text := fmt.Sprintf("api %d/%d", u.Remaining, u.Limit)
 	if !u.Reset.IsZero() {
-		text += " · resets " + u.Reset.Local().Format("15:04")
+		text += " · resets " + clock(u.Reset, "15:04")
 	}
 	return usageStyle(u).Render(text)
 }
@@ -1812,6 +1812,28 @@ func (m model) repoCountLabel() string {
 		return "—"
 	}
 	return fmt.Sprintf("%d repos", m.repoCount)
+}
+
+func clock(t time.Time, layout string) string {
+	t = t.Local()
+	_, off := t.Zone()
+	return t.Format(layout) + " " + zoneLabel(off)
+}
+
+func zoneLabel(off int) string {
+	if off == 0 {
+		return "UTC"
+	}
+	sign := "+"
+	if off < 0 {
+		sign = "-"
+		off = -off
+	}
+	label := fmt.Sprintf("UTC%s%d", sign, off/3600)
+	if m := off % 3600 / 60; m != 0 {
+		label += fmt.Sprintf(":%02d", m)
+	}
+	return label
 }
 
 func (m model) lastScanLabel() string {

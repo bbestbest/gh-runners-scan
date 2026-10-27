@@ -1015,21 +1015,40 @@ func TestRepoPanelCapsRows(t *testing.T) {
 func TestStatusPanelKeepsEachFactOnItsLine(t *testing.T) {
 	m := newModel(options{targets: []scan.Target{{Owner: "org-a", Repos: []string{"web", "api"}}, {Owner: "org-long-name-b", All: true}, {Owner: "org-long-name-c", All: true}}, interval: 30})
 	m.repoCount = 89
-	m.lastScan = "09:12"
-	lines := m.statusPanelLines(30)
+	m.lastScan = "09:12 UTC+7"
+	lines := m.statusPanelLines(40)
 	if len(lines) != 3 {
 		t.Fatalf("status lines = %d, want 3", len(lines))
 	}
 	for i, l := range lines {
-		if w := ansi.StringWidth(l); w > 30 {
-			t.Fatalf("line %d width %d > 30: %q", i, w, ansi.Strip(l))
+		if w := ansi.StringWidth(l); w > 40 {
+			t.Fatalf("line %d width %d > 40: %q", i, w, ansi.Strip(l))
 		}
 	}
 	if got := ansi.Strip(lines[0]); !strings.HasPrefix(got, " org-a") || !strings.HasSuffix(got, "…") {
 		t.Fatalf("owners line = %q, want cut with …", got)
 	}
-	if got := ansi.Strip(lines[1]); got != " 89 repos · scanned 09:12 UTC" {
+	if got := ansi.Strip(lines[1]); got != " 89 repos · scanned 09:12 UTC+7" {
 		t.Fatalf("scan line = %q", got)
+	}
+}
+
+func TestZoneLabel(t *testing.T) {
+	cases := map[int]string{0: "UTC", 7 * 3600: "UTC+7", 5*3600 + 1800: "UTC+5:30", -5 * 3600: "UTC-5", -(3*3600 + 1800): "UTC-3:30", 12*3600 + 2700: "UTC+12:45"}
+	for off, want := range cases {
+		if got := zoneLabel(off); got != want {
+			t.Errorf("zoneLabel(%d) = %q, want %q", off, got, want)
+		}
+	}
+}
+
+func TestClockUsesLocalZone(t *testing.T) {
+	prev := time.Local
+	time.Local = time.FixedZone("ICT", 7*3600)
+	defer func() { time.Local = prev }()
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	if got := clock(at, "15:04"); got != "10:04 UTC+7" {
+		t.Fatalf("clock = %q, want 10:04 UTC+7", got)
 	}
 }
 
