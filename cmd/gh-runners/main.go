@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -39,6 +41,16 @@ func main() {
 	flag.BoolVar(&selectMode, "s", false, "pick a job in fzf and open it in the browser")
 	flag.CommandLine.Parse(args)
 
+	if !selectMode && term.IsTerminal(int(os.Stdout.Fd())) && term.IsTerminal(int(os.Stdin.Fd())) {
+		if exe, err := os.Executable(); err == nil {
+			if tui, ok := tuiBinary(exe); ok {
+				err := syscall.Exec(tui, append([]string{"gh-runner"}, os.Args[1:]...), os.Environ())
+				fmt.Fprintln(os.Stderr, "gh-runners:", err)
+				os.Exit(1)
+			}
+		}
+	}
+
 	if org == "" {
 		fmt.Fprintln(os.Stderr, "gh-runners: "+noOrgHint())
 		os.Exit(1)
@@ -66,6 +78,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "gh-runners: warning:", scanErr)
 		os.Exit(2)
 	}
+}
+
+func tuiBinary(exe string) (string, bool) {
+	if p, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = p
+	}
+	tui := filepath.Join(filepath.Dir(exe), "gh-runner")
+	info, err := os.Stat(tui)
+	if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+		return "", false
+	}
+	return tui, true
 }
 
 func splitOrg(argv []string, fallback string) (string, []string) {
