@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 
 	"gh-runners/internal/config"
@@ -90,18 +92,27 @@ func TestRowCountsAndOrder(t *testing.T) {
 	}
 }
 
-func TestTabMovesFocus(t *testing.T) {
-	m := newTestModel(t)
-	if m.focus != 0 {
-		t.Fatalf("initial focus = %d, want 0", m.focus)
+func TestHLMoveFocus(t *testing.T) {
+	for _, k := range []string{"h", "l"} {
+		m := newTestModel(t)
+		if m.focus != 0 {
+			t.Fatalf("initial focus = %d, want 0", m.focus)
+		}
+		m = send(m, key(k))
+		if m.focus != 1 {
+			t.Errorf("focus after %s = %d, want 1", k, m.focus)
+		}
+		m = send(m, key(k))
+		if m.focus != 0 {
+			t.Errorf("focus after second %s = %d, want 0", k, m.focus)
+		}
 	}
-	m = send(m, key("tab"))
-	if m.focus != 1 {
-		t.Errorf("focus after tab = %d, want 1", m.focus)
-	}
-	m = send(m, key("tab"))
+}
+
+func TestTabNoLongerMovesFocus(t *testing.T) {
+	m := send(newTestModel(t), key("tab"))
 	if m.focus != 0 {
-		t.Errorf("focus after second tab = %d, want 0", m.focus)
+		t.Errorf("focus after tab = %d, want 0", m.focus)
 	}
 }
 
@@ -261,8 +272,8 @@ func TestOrgOverlayChangeWhileRunning(t *testing.T) {
 	if len(m.jobs) != 0 {
 		t.Errorf("jobs = %d after org change, want 0", len(m.jobs))
 	}
-	if !strings.Contains(m.headerView(), "org-b") {
-		t.Error("header does not show the new org")
+	if !strings.Contains(m.statusView(), "org-b") {
+		t.Error("key bar does not show the new org")
 	}
 }
 
@@ -282,7 +293,7 @@ func TestOrgOverlayViewReplacesBody(t *testing.T) {
 func TestViewContents(t *testing.T) {
 	m := newTestModel(t)
 	view := m.View()
-	for _, want := range []string{"Running (2)", "Queued (1)", "<q> quit"} {
+	for _, want := range []string{"[1] Running (2)", "[2] Queued (1)", "q: quit"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("view missing %q", want)
 		}
@@ -910,7 +921,7 @@ func scrollModel(t *testing.T, n int) model {
 	m := newModel(options{org: "org-c", interval: 30})
 	m.jobs = manyJobs(n)
 	m.refresh()
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 42})
 	return next.(model)
 }
 
@@ -1058,7 +1069,7 @@ func TestCancelConfirmThenYesSendsOnce(t *testing.T) {
 	if cmd != nil || !m.confirming {
 		t.Fatalf("c: confirming=%v cmd=%v, want prompt and no cmd", m.confirming, cmd)
 	}
-	if view := m.View(); !strings.Contains(view, "cancel run wf1 (repo)? stops every job in this run · y/n") {
+	if view := m.View(); !strings.Contains(view, "Cancel run #1001 of repo › wf1?") {
 		t.Fatalf("prompt missing from view:\n%s", view)
 	}
 	if len(*calls) != 0 {
@@ -1219,7 +1230,7 @@ func TestCancelWorksFromQueuedPanel(t *testing.T) {
 	m := newModel(options{org: "org-c", interval: 30})
 	m.jobs = []scan.Job{{Owner: "org-a", RunID: 55, Status: "queued", Repo: "web", Workflow: "deploy", Name: "j", Labels: "x", CreatedAt: time.Now().UTC()}}
 	m.refresh()
-	m = send(m, key("tab"))
+	m = send(m, key("l"))
 	m = send(m, key("c"))
 	m, cmd := sendCmd(m, key("y"))
 	if cmd == nil {
@@ -1283,7 +1294,7 @@ func TestSingleGDoesNotJump(t *testing.T) {
 		{"g then j", []tea.KeyMsg{key("G"), key("k"), key("g"), key("j")}, 29},
 		{"g then k", []tea.KeyMsg{key("G"), key("g"), key("k")}, 28},
 		{"g then j then g", []tea.KeyMsg{key("G"), key("g"), key("j"), key("g")}, 29},
-		{"g then tab then g", []tea.KeyMsg{key("G"), key("g"), key("tab"), key("tab"), key("g")}, 29},
+		{"g then l then g", []tea.KeyMsg{key("G"), key("g"), key("l"), key("l"), key("g")}, 29},
 		{"lone g", []tea.KeyMsg{key("G"), key("g")}, 29},
 	}
 	for _, tc := range cases {
@@ -1389,7 +1400,7 @@ func TestUsageOverlayIgnoresTableKeys(t *testing.T) {
 	m := send(newTestModel(t), key("u"))
 	cursor := m.runTable.Cursor()
 	focus := m.focus
-	for _, k := range []string{"j", "k", "G", "g", "tab", "2", "c", "/", "O", "r", "enter"} {
+	for _, k := range []string{"j", "k", "G", "g", "h", "l", "2", "c", "/", "O", "r", "enter"} {
 		m = send(m, key(k))
 	}
 	if !m.usageActive || m.runTable.Cursor() != cursor || m.focus != focus || m.confirming || m.filterActive || m.orgActive {
@@ -1532,7 +1543,7 @@ func TestSelectedRowKeepsHighlightAcrossCells(t *testing.T) {
 		for step := 0; step < 3; step++ {
 			m = send(m, key("j"))
 			tbl := m.focusedTable()
-			lines := strings.Split(tbl.View(), "\n")
+			lines := m.tableLines(m.focus)
 			selected := lines[2+tbl.Cursor()]
 			if n := strings.Count(selected, "\x1b[0m"); n != 1 || !strings.HasSuffix(selected, "\x1b[0m") {
 				t.Fatalf("panel %s cursor %d: selected row has %d resets, want 1 at the end: %q", focus, tbl.Cursor(), n, selected)
@@ -1542,5 +1553,171 @@ func TestSelectedRowKeepsHighlightAcrossCells(t *testing.T) {
 				t.Fatalf("panel %s cursor %d: row above lost its own styling: %q", focus, tbl.Cursor(), above)
 			}
 		}
+	}
+}
+
+func TestStyledCellsKeepEscapesWhole(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	t.Cleanup(func() { lipgloss.SetColorProfile(prev) })
+
+	now := time.Now().UTC()
+	m := layoutModel(t, 213, 41)
+	m.jobs = []scan.Job{
+		{Status: "in_progress", Owner: "org-c", Repo: "service-alpha-api", Name: "Build and Push Docker Image", Runner: "runner-arm64-long-0-0", RunID: 1, StartedAt: now.Add(-80 * time.Second)},
+		{Status: "in_progress", Owner: "org-c", Repo: "infra-portal-core", Name: "check-pinned-versions", Runner: "runner-arm64-long-0-1", RunID: 2, StartedAt: now.Add(-24 * time.Second)},
+		{Status: "queued", Owner: "org-c", Repo: "repo-panel", Name: "update_release_draft", Labels: "self-hosted,ARM64", RunID: 3, CreatedAt: now.Add(-127 * time.Minute)},
+		{Status: "queued", Owner: "org-c", Repo: "customer-portal-web", Name: "build", Labels: "self-hosted,ARM64", RunID: 4, CreatedAt: now.Add(-109 * time.Minute)},
+		{Status: "queued", Owner: "org-c", Repo: "frontend-console", Name: "pr-labeler", Labels: "self-hosted,ARM64", RunID: 5, CreatedAt: now.Add(-34 * time.Minute)},
+		{Status: "queued", Owner: "org-c", Repo: "external-gateway-api", Name: "Build & Release", Labels: "self-hosted,ARM64", RunID: 6, CreatedAt: now.Add(-8 * time.Minute)},
+	}
+	m.refresh()
+
+	sgr := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	for _, focus := range []string{"1", "2"} {
+		m = send(m, key(focus))
+		for step := 0; step < 4; step++ {
+			for i, line := range strings.Split(m.View(), "\n") {
+				if whole, all := len(sgr.FindAllString(line, -1)), strings.Count(line, "\x1b["); whole != all {
+					t.Fatalf("panel %s step %d line %d: %d of %d escapes cut: %q", focus, step, i, all-whole, all, line)
+				}
+			}
+			m = send(m, key("j"))
+		}
+	}
+}
+
+func layoutJobs() []scan.Job {
+	now := time.Now().UTC()
+	return []scan.Job{
+		{Status: "in_progress", Owner: "org-c", Repo: "api", Workflow: "ci", Branch: "main", Name: "test", Runner: "runner-1", Labels: "self-hosted,Linux,x64", RunID: 1, StartedAt: now.Add(-2 * time.Minute)},
+		{Status: "in_progress", Owner: "org-c", Repo: "api", Workflow: "ci", Branch: "main", Name: "lint", Runner: "runner-2", Labels: "self-hosted,macos", RunID: 2, StartedAt: now.Add(-time.Minute)},
+		{Status: "in_progress", Owner: "org-c", Repo: "web", Workflow: "build", Branch: "dev", Name: "build", Runner: "runner-3", Labels: "self-hosted, linux", RunID: 3, StartedAt: now.Add(-time.Minute)},
+		{Status: "queued", Owner: "org-c", Repo: "web", Workflow: "e2e", Branch: "feat/x", Name: "playwright", Labels: "self-hosted,linux", RunID: 4, CreatedAt: now.Add(-47 * time.Minute), URL: "https://github.com/org-c/web/actions/runs/4"},
+		{Status: "queued", Owner: "org-c", Repo: "docs", Workflow: "pages", Branch: "main", Name: "publish", Labels: "self-hosted,windows", RunID: 5, CreatedAt: now.Add(-2 * time.Minute)},
+	}
+}
+
+func layoutModel(t *testing.T, w, h int) model {
+	t.Helper()
+	m := newModel(options{org: "org-c", interval: 30})
+	m.scanning = false
+	m.jobs = layoutJobs()
+	m.refresh()
+	next, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
+	return next.(model)
+}
+
+func TestRepoCounts(t *testing.T) {
+	m := layoutModel(t, 140, 40)
+	want := []repoCount{{"api", 2, 0}, {"web", 1, 1}, {"docs", 0, 1}}
+	if !reflect.DeepEqual(m.repos, want) {
+		t.Fatalf("repos = %+v, want %+v", m.repos, want)
+	}
+	view := m.View()
+	for _, s := range []string{"2 running", "1 queued", "3 active"} {
+		if !strings.Contains(view, s) {
+			t.Errorf("view lacks %q", s)
+		}
+	}
+}
+
+func TestRepoPanelCapsRows(t *testing.T) {
+	var jobs []scan.Job
+	for i := 0; i < maxRepoRows+3; i++ {
+		jobs = append(jobs, scan.Job{Status: "queued", Repo: "repo-" + strconv.Itoa(i), Name: "j"})
+	}
+	m := layoutModel(t, 140, 40)
+	m.jobs = jobs
+	m.refresh()
+	lines := m.repoLines(60)
+	if len(lines) != maxRepoRows {
+		t.Fatalf("repo lines = %d, want %d", len(lines), maxRepoRows)
+	}
+	if !strings.Contains(lines[len(lines)-1], "+4 more") {
+		t.Fatalf("last repo line = %q, want +4 more", lines[len(lines)-1])
+	}
+}
+
+func TestBusyRunners(t *testing.T) {
+	jobs := layoutJobs()
+	running, queued := scan.SplitJobs(jobs)
+	cases := []struct {
+		name string
+		q    scan.Job
+		want []string
+	}{
+		{"subset matches across case and spaces", queued[0], []string{"runner-1", "runner-3"}},
+		{"no runner has the labels", queued[1], nil},
+		{"no labels", scan.Job{Status: "queued"}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []string
+			for _, r := range busyRunners(tc.q, running) {
+				got = append(got, r.Runner)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("busy = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDetailPanelFollowsSelection(t *testing.T) {
+	m := layoutModel(t, 140, 40)
+	view := m.View()
+	for _, s := range []string{"api › ci › test", "Runner", "runner-1", "Elapsed", "running"} {
+		if !strings.Contains(view, s) {
+			t.Errorf("running detail lacks %q", s)
+		}
+	}
+	if strings.Contains(view, "Busy runners") {
+		t.Error("running job shows the busy runners section")
+	}
+
+	m = send(m, key("2"))
+	view = m.View()
+	for _, s := range []string{"web › e2e › playwright", "Waiting", "47m", "self-hosted, linux", "#4", "github.com/org-c/web/actions/runs/4", "Busy runners with these labels", "runner-3"} {
+		if !strings.Contains(view, s) {
+			t.Errorf("queued detail lacks %q", s)
+		}
+	}
+
+	m = send(m, key("j"))
+	if view = m.View(); !strings.Contains(view, "no running job uses all of these labels") {
+		t.Error("queued job without matching runners lacks the empty message")
+	}
+}
+
+func TestLayoutFillsTerminal(t *testing.T) {
+	for _, size := range [][2]int{{160, 40}, {140, 40}, {120, 40}, {100, 30}, {90, 30}, {80, 24}} {
+		for _, confirm := range []bool{false, true} {
+			m := layoutModel(t, size[0], size[1])
+			if confirm {
+				m = send(m, key("c"))
+				if !m.confirming {
+					t.Fatal("c did not open the cancel prompt")
+				}
+			}
+			lines := strings.Split(m.View(), "\n")
+			if len(lines) != size[1] {
+				t.Fatalf("%dx%d confirm=%v: %d lines, want %d", size[0], size[1], confirm, len(lines), size[1])
+			}
+			for i, l := range lines {
+				if w := ansi.StringWidth(l); w != size[0] {
+					t.Fatalf("%dx%d confirm=%v: line %d width %d, want %d: %q", size[0], size[1], confirm, i, w, size[0], ansi.Strip(l))
+				}
+			}
+		}
+	}
+}
+
+func TestNarrowTerminalHidesDetail(t *testing.T) {
+	if strings.Contains(layoutModel(t, 80, 24).View(), "╭─Job") {
+		t.Error("detail panel shown at 80 columns")
+	}
+	if !strings.Contains(layoutModel(t, 100, 30).View(), "╭─Job") {
+		t.Error("detail panel missing at 100 columns")
 	}
 }

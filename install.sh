@@ -3,14 +3,16 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 dest="${GH_RUNNERS_BIN_DIR:-$HOME/.local/bin}"
-names=(gh-runners gh-runners-tui)
+names=(gh-runners gh-runner)
+pkgs=(gh-runners gh-runners-tui)
 
 mkdir -p "$repo/bin" "$dest"
 cd "$repo"
 
-for n in "${names[@]}"; do
+for i in "${!names[@]}"; do
+  n="${names[$i]}"
   tmp="$(mktemp "$repo/bin/.$n.XXXXXX")"
-  if ! go build -o "$tmp" "./cmd/$n"; then
+  if ! go build -o "$tmp" "./cmd/${pkgs[$i]}"; then
     rm -f "$tmp"
     echo "build failed: $n" >&2
     exit 1
@@ -30,6 +32,12 @@ for n in "${names[@]}"; do
     ln -sfn "$target" "$link"
   fi
 done
+
+old="$dest/gh-runners-tui"
+if [ "$(readlink "$old" 2>/dev/null || true)" = "$repo/bin/gh-runners-tui" ]; then
+  rm -f "$old"
+fi
+rm -f "$repo/bin/gh-runners-tui"
 
 version="$(git -C "$repo" describe --always --dirty 2>/dev/null || echo unknown)"
 for n in "${names[@]}"; do

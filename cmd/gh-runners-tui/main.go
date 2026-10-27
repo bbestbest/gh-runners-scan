@@ -20,7 +20,7 @@ func main() {
 	org, args := splitOrg(os.Args[1:], envOrg(cfg))
 
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: gh-runners-tui [org] [flags]")
+		fmt.Fprintln(os.Stderr, "usage: gh-runner [org] [flags]")
 		flag.PrintDefaults()
 	}
 	label := flag.String("label", "", "filter jobs by runner label substring")
@@ -34,7 +34,7 @@ func main() {
 
 	if *once {
 		if org == "" {
-			fmt.Fprintln(os.Stderr, "gh-runners-tui: "+noOrgHint())
+			fmt.Fprintln(os.Stderr, "gh-runner: "+noOrgHint())
 			os.Exit(1)
 		}
 		printOnce(opts)
@@ -42,7 +42,7 @@ func main() {
 	}
 
 	if err := Run(opts); err != nil {
-		fmt.Fprintln(os.Stderr, "gh-runners-tui:", err)
+		fmt.Fprintln(os.Stderr, "gh-runner:", err)
 		os.Exit(1)
 	}
 }
@@ -146,7 +146,7 @@ func printOnce(opts options) {
 	w.Flush()
 
 	if scanErr != nil {
-		fmt.Fprintln(os.Stderr, "gh-runners-tui: warning:", scanErr)
+		fmt.Fprintln(os.Stderr, "gh-runner: warning:", scanErr)
 	}
 }
 

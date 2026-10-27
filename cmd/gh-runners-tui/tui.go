@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"gh-runners/internal/config"
 	"gh-runners/internal/scan"
@@ -38,15 +40,29 @@ var (
 	hlStyle     = lipgloss.NewStyle().Bold(true).Foreground(colorCyan)
 )
 
-var hints = [4][4]string{
-	{"<↑↓/jk>", "move", "</>", "filter"},
-	{"<tab/1/2>", "panel", "<r>", "rescan"},
-	{"<enter/o>", "open", "<c>", "cancel run"},
-	{"<O>", "org", "<q>", "quit"},
+var keyHints = [][2]string{
+	{"enter", "open"},
+	{"c", "cancel run"},
+	{"/", "filter"},
+	{"h/l", "panel"},
+	{"r", "rescan"},
+	{"O", "org"},
+	{"u", "usage"},
+	{"q", "quit"},
 }
 
 var runningCols = []string{"Runner", "Repo", "Workflow", "Branch", "Job", "Elapsed"}
 var queuedCols = []string{"Waiting", "Repo", "Workflow", "Branch", "Job", "Labels"}
+
+var runningPanelCols = []string{"Runner", "Repo", "Job", "Elapsed"}
+
+var queuedPanelCols = []string{"Wait", "Repo", "Job", "Labels"}
+
+type repoCount struct {
+	name    string
+	running int
+	queued  int
+}
 
 type progressMsg struct {
 	done  int
@@ -87,10 +103,13 @@ type model struct {
 	jobs    []scan.Job
 	running []scan.Job
 	queued  []scan.Job
+	repos   []repoCount
 
-	runTable table.Model
-	qTable   table.Model
-	focus    int
+	runTable  table.Model
+	qTable    table.Model
+	runStyles [][]lipgloss.Style
+	qStyles   [][]lipgloss.Style
+	focus     int
 
 	filterInput  textinput.Model
 	filterActive bool
@@ -141,8 +160,8 @@ func newModel(opts options) model {
 		cancels:   map[int64]bool{},
 	}
 
-	m.runTable = newTable(runningCols)
-	m.qTable = newTable(queuedCols)
+	m.runTable = newTable(runningPanelCols)
+	m.qTable = newTable(queuedPanelCols)
 
 	in := textinput.New()
 	in.Placeholder = "filter"
@@ -172,11 +191,15 @@ func newTable(cols []string) table.Model {
 		columns[i] = table.Column{Title: c, Width: 10}
 	}
 	t := table.New(table.WithColumns(columns), table.WithFocused(true))
+	t.SetStyles(tableStyles())
+	return t
+}
+
+func tableStyles() table.Styles {
 	st := table.DefaultStyles()
 	st.Header = st.Header.BorderStyle(lipgloss.NormalBorder()).BorderBottom(true).Bold(true).Foreground(colorDim)
 	st.Selected = st.Selected.Bold(true).Foreground(colorAccent).Background(lipgloss.Color("0"))
-	t.SetStyles(st)
-	return t
+	return st
 }
 
 func (m model) Init() tea.Cmd {
@@ -482,7 +505,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		m.nextIn = m.opts.interval
 		return m, m.startScan()
-	case "tab":
+	case "h", "l":
 		m.focus = 1 - m.focus
 		return m, nil
 	case "1":
@@ -698,10 +721,12 @@ func (m *model) refresh() {
 	qCursor := m.qTable.Cursor()
 
 	m.running, m.queued = scan.SplitJobs(scan.FilterJobs(m.jobs, m.filter))
+	m.repos = repoCounts(m.running, m.queued)
 
 	now := time.Now().UTC()
 	cols := m.runTable.Columns()
 	runRows := make([]table.Row, 0, len(m.running))
+	runStyles := make([][]lipgloss.Style, 0, len(m.running))
 	runSel := clamp(runCursor, len(m.running))
 	for i, j := range m.running {
 		elapsed := "-"
@@ -719,17 +744,17 @@ func (m *model) refresh() {
 			runnerStyle, rest, elapsedStyle = lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle()
 		}
 		runRows = append(runRows, table.Row{
-			cell(j.Runner, runnerStyle, cols, 0),
-			cell(j.Repo, rest, cols, 1),
-			cell(j.Workflow, rest, cols, 2),
-			cell(j.Branch, rest, cols, 3),
-			cell(j.Name, rest, cols, 4),
-			cell(elapsed, elapsedStyle, cols, 5),
+			cell(j.Runner, cols, 0),
+			cell(j.Repo, cols, 1),
+			cell(j.Name, cols, 2),
+			cell(elapsed, cols, 3),
 		})
+		runStyles = append(runStyles, []lipgloss.Style{runnerStyle, rest, rest, elapsedStyle})
 	}
 
 	qcols := m.qTable.Columns()
 	qRows := make([]table.Row, 0, len(m.queued))
+	qStyles := make([][]lipgloss.Style, 0, len(m.queued))
 	qSel := clamp(qCursor, len(m.queued))
 	for i, j := range m.queued {
 		wait := "-"
@@ -737,11 +762,7 @@ func (m *model) refresh() {
 		if !j.CreatedAt.IsZero() {
 			mins := int(now.Sub(j.CreatedAt).Minutes())
 			wait = fmt.Sprintf("%dm", mins)
-			if mins >= 60 {
-				waitStyle = redStyle
-			} else if mins >= 30 {
-				waitStyle = yellowStyle
-			}
+			waitStyle = waitColor(mins, waitStyle)
 		}
 		if m.cancelling(j) {
 			wait = "cancelling"
@@ -752,18 +773,94 @@ func (m *model) refresh() {
 			waitStyle, rest = lipgloss.NewStyle(), lipgloss.NewStyle()
 		}
 		qRows = append(qRows, table.Row{
-			cell(wait, waitStyle, qcols, 0),
-			cell(j.Repo, rest, qcols, 1),
-			cell(j.Workflow, rest, qcols, 2),
-			cell(j.Branch, rest, qcols, 3),
-			cell(j.Name, rest, qcols, 4),
-			cell(j.Labels, rest, qcols, 5),
+			cell(wait, qcols, 0),
+			cell(j.Repo, qcols, 1),
+			cell(j.Name, qcols, 2),
+			cell(j.Labels, qcols, 3),
 		})
+		qStyles = append(qStyles, []lipgloss.Style{waitStyle, rest, rest, rest})
 	}
 
+	m.runStyles, m.qStyles = runStyles, qStyles
 	setRows(&m.runTable, runRows, runCursor)
 	setRows(&m.qTable, qRows, qCursor)
 	m.layout()
+}
+
+func waitColor(mins int, base lipgloss.Style) lipgloss.Style {
+	if mins >= 60 {
+		return redStyle
+	}
+	if mins >= 30 {
+		return yellowStyle
+	}
+	return base
+}
+
+func repoCounts(running, queued []scan.Job) []repoCount {
+	idx := map[string]int{}
+	var out []repoCount
+	add := func(repo string, isRunning bool) {
+		i, ok := idx[repo]
+		if !ok {
+			i = len(out)
+			idx[repo] = i
+			out = append(out, repoCount{name: repo})
+		}
+		if isRunning {
+			out[i].running++
+		} else {
+			out[i].queued++
+		}
+	}
+	for _, j := range running {
+		add(j.Repo, true)
+	}
+	for _, j := range queued {
+		add(j.Repo, false)
+	}
+	sort.SliceStable(out, func(a, b int) bool {
+		if out[a].running != out[b].running {
+			return out[a].running > out[b].running
+		}
+		if out[a].queued != out[b].queued {
+			return out[a].queued > out[b].queued
+		}
+		return out[a].name < out[b].name
+	})
+	return out
+}
+
+func busyRunners(q scan.Job, running []scan.Job) []scan.Job {
+	want := labelSet(q.Labels)
+	if len(want) == 0 {
+		return nil
+	}
+	var out []scan.Job
+	for _, r := range running {
+		have := labelSet(r.Labels)
+		match := true
+		for l := range want {
+			if !have[l] {
+				match = false
+				break
+			}
+		}
+		if match {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func labelSet(labels string) map[string]bool {
+	set := map[string]bool{}
+	for _, l := range strings.Split(labels, ",") {
+		if l = strings.ToLower(strings.TrimSpace(l)); l != "" {
+			set[l] = true
+		}
+	}
+	return set
 }
 
 func setRows(t *table.Model, rows []table.Row, cursor int) {
@@ -797,11 +894,49 @@ func (m model) rowStyle(repo string) lipgloss.Style {
 	return lipgloss.NewStyle()
 }
 
-func cell(text string, style lipgloss.Style, cols []table.Column, i int) string {
+func cell(text string, cols []table.Column, i int) string {
 	if i < len(cols) {
 		text = truncate(text, cols[i].Width)
 	}
-	return style.Render(text)
+	return text
+}
+
+func (m model) tableLines(focus int) []string {
+	if focus == 1 {
+		return tableView(m.qTable, m.qStyles)
+	}
+	return tableView(m.runTable, m.runStyles)
+}
+
+func tableView(t table.Model, styles [][]lipgloss.Style) []string {
+	lines := strings.Split(t.View(), "\n")
+	first, last := visibleRows(t)
+	head := len(lines) - t.Height()
+	if first < 0 || head < 0 {
+		return lines
+	}
+	st := tableStyles()
+	cols := t.Columns()
+	rows := t.Rows()
+	for r := first; r <= last && head+r-first < len(lines); r++ {
+		cells := make([]string, 0, len(cols))
+		for i, c := range cols {
+			if c.Width <= 0 || i >= len(rows[r]) {
+				continue
+			}
+			text := truncate(rows[r][i], c.Width)
+			if r < len(styles) && i < len(styles[r]) {
+				text = styles[r][i].Render(text)
+			}
+			cells = append(cells, st.Cell.Render(lipgloss.NewStyle().Width(c.Width).MaxWidth(c.Width).Inline(true).Render(text)))
+		}
+		row := lipgloss.JoinHorizontal(lipgloss.Top, cells...)
+		if r == t.Cursor() {
+			row = st.Selected.Render(row)
+		}
+		lines[head+r-first] = row
+	}
+	return lines
 }
 
 func truncate(s string, width int) string {
@@ -840,29 +975,61 @@ func fmtElapsed(d time.Duration) string {
 }
 
 func (m *model) layout() {
-	inner := m.width - 2
-	if inner < 20 {
-		inner = 20
-	}
+	left, _ := m.columns()
+	inner := left - 2
 
-	m.runTable.SetColumns(columnWidths(runningCols, inner))
-	m.qTable.SetColumns(columnWidths(queuedCols, inner))
+	m.runTable.SetColumns(columnWidths(runningPanelCols, inner))
+	m.qTable.SetColumns(columnWidths(queuedPanelCols, inner))
 
-	chrome := headerHeight + 1
-	if m.filterActive {
-		chrome++
-	}
-	body := m.height - chrome
-	if body < 10 {
-		body = 10
-	}
-	runBox := body / 2
-	qBox := body - runBox
-
+	runBox, qBox := m.listHeights()
 	setHeight(&m.runTable, tableHeight(runBox))
 	setHeight(&m.qTable, tableHeight(qBox))
 	m.runTable.SetWidth(inner)
 	m.qTable.SetWidth(inner)
+}
+
+func (m model) columns() (int, int) {
+	left := m.width * 40 / 100
+	if left < minListWidth {
+		left = minListWidth
+	}
+	right := m.width - left
+	if right < minDetailWidth {
+		return m.width, 0
+	}
+	return left, right
+}
+
+func (m model) bodyHeight() int {
+	h := m.height - keybarHeight
+	if h < minBodyHeight {
+		h = minBodyHeight
+	}
+	return h
+}
+
+func (m model) reposHeight() int {
+	n := len(m.repos)
+	if n < 1 {
+		n = 1
+	}
+	if n > maxRepoRows {
+		n = maxRepoRows
+	}
+	return n + 2
+}
+
+func (m model) listHeights() (int, int) {
+	rest := m.bodyHeight() - statusPanelHeight - m.reposHeight()
+	run := rest / 2
+	queued := rest - run
+	if run < minListBox {
+		run = minListBox
+	}
+	if queued < minListBox {
+		queued = minListBox
+	}
+	return run, queued
 }
 
 func setHeight(t *table.Model, h int) {
@@ -894,13 +1061,13 @@ func columnWidths(cols []string, inner int) []table.Column {
 	used := 0
 	for i, c := range cols {
 		w := avail * colUnits(c) / units
-		if w < 5 {
-			w = 5
+		if w < colMin(c) {
+			w = colMin(c)
 		}
 		if i == len(cols)-1 {
 			w = avail - used
-			if w < 5 {
-				w = 5
+			if w < colMin(c) {
+				w = colMin(c)
 			}
 		}
 		used += w
@@ -909,57 +1076,303 @@ func columnWidths(cols []string, inner int) []table.Column {
 	return widths
 }
 
+func colMin(name string) int {
+	if name == "Elapsed" || name == "Wait" {
+		return len("cancelling")
+	}
+	return 5
+}
+
 func colUnits(name string) int {
-	if name == "Branch" || name == "Job" {
+	switch name {
+	case "Branch", "Job", "Labels":
 		return 3
+	case "Runner", "Repo", "Elapsed":
+		return 2
 	}
 	return 1
 }
 
-const headerHeight = 4
+const keybarHeight = 1
 
-const hintColWidth = 18
+const statusPanelHeight = 4
+
+const maxRepoRows = 6
+
+const minListWidth = 50
+
+const minDetailWidth = 40
+
+const minBodyHeight = 16
+
+const minListBox = 5
 
 const maxOrgRows = 8
 
 const orgInputWidth = 20
 
 func (m model) View() string {
-	var b strings.Builder
-	b.WriteString(m.headerView())
-	b.WriteString("\n")
+	return m.bodyView() + "\n" + m.statusView()
+}
 
+func (m model) bodyView() string {
 	if m.usageActive {
-		b.WriteString(m.usageOverlayView())
-		b.WriteString("\n")
-		b.WriteString(m.statusView())
-		return b.String()
+		return m.usageOverlayView()
 	}
-
-	inner := m.width - 2
-	if inner < 20 {
-		inner = 20
-	}
-
 	if m.orgActive {
-		b.WriteString(m.orgOverlayView())
-		b.WriteString("\n")
-		b.WriteString(m.statusView())
-		return b.String()
+		return m.orgOverlayView()
 	}
 
-	b.WriteString(m.panelView(fmt.Sprintf("Running (%d)", len(m.running)), m.focus == 0, inner, m.runTable))
-	b.WriteString("\n")
-	b.WriteString(m.panelView(fmt.Sprintf("Queued (%d)", len(m.queued)), m.focus == 1, inner, m.qTable))
-	b.WriteString("\n")
+	left, right := m.columns()
+	runH, qH := m.listHeights()
+	col := lipgloss.JoinVertical(lipgloss.Left,
+		panel("Status", "", false, left, statusPanelHeight, m.statusPanelLines()),
+		panel("Repos", m.reposFooter(), false, left, m.reposHeight(), m.repoLines(left-2)),
+		panel(fmt.Sprintf("[1] Running (%d)", len(m.running)), countFooter(m.runTable), m.focus == 0, left, runH, m.tableLines(0)),
+		panel(fmt.Sprintf("[2] Queued (%d)", len(m.queued)), countFooter(m.qTable), m.focus == 1, left, qH, m.tableLines(1)),
+	)
+	body := col
+	if right > 0 {
+		body = lipgloss.JoinHorizontal(lipgloss.Top, col, m.detailPanel(right, m.bodyHeight()))
+	}
+	if m.confirming {
+		body = overlay(body, m.cancelPopup(), m.width)
+	}
+	return body
+}
 
-	if m.filterActive {
-		b.WriteString(m.filterInput.View())
-		b.WriteString("\n")
+func panel(title, footer string, focused bool, w, h int, body []string) string {
+	b := lipgloss.RoundedBorder()
+	bs, ts := dimStyle, boldStyle
+	if focused {
+		bs, ts = greenStyle, greenStyle.Bold(true)
+	}
+	inner := w - 2
+
+	label := ansi.Truncate(title, inner-1, "…")
+	fill := inner - 1 - ansi.StringWidth(label)
+	if fill < 0 {
+		fill = 0
+	}
+	rows := []string{bs.Render(b.TopLeft+b.Top) + ts.Render(label) + bs.Render(strings.Repeat(b.Top, fill)+b.TopRight)}
+
+	for i := 0; i < h-2; i++ {
+		line := ""
+		if i < len(body) {
+			line = ansi.Truncate(body[i], inner, "")
+		}
+		pad := inner - ansi.StringWidth(line)
+		if pad < 0 {
+			pad = 0
+		}
+		rows = append(rows, bs.Render(b.Left)+line+"\x1b[0m"+strings.Repeat(" ", pad)+bs.Render(b.Right))
 	}
 
-	b.WriteString(m.statusView())
-	return b.String()
+	foot := ""
+	if footer != "" && ansi.StringWidth(footer)+4 <= inner {
+		foot = " " + footer + " "
+	}
+	rows = append(rows, bs.Render(b.BottomLeft+strings.Repeat(b.Bottom, inner-1-ansi.StringWidth(foot))+foot+b.Bottom+b.BottomRight))
+	return strings.Join(rows, "\n")
+}
+
+func countFooter(t table.Model) string {
+	if len(t.Rows()) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d of %d", t.Cursor()+1, len(t.Rows()))
+}
+
+func (m model) statusPanelLines() []string {
+	first := " " + hlStyle.Render(m.orgLabel()) + dimStyle.Render(" · "+m.repoCountLabel()+" · scanned "+m.lastScanLabel()+" UTC")
+	second := " " + dimStyle.Render("no scan yet")
+	switch {
+	case m.scanning && m.progress.total < 0:
+		second = " " + m.spin.View() + dimStyle.Render(" listing repos…")
+	case m.scanning:
+		second = " " + m.spin.View() + dimStyle.Render(fmt.Sprintf(" scanning %d/%d repos", m.progress.done, m.progress.total))
+	case m.lastCost != nil:
+		second = " " + dimStyle.Render(fmt.Sprintf("last scan %d req, %d free (304)", m.lastCost.requests, m.lastCost.free))
+	}
+	return []string{first, second}
+}
+
+func (m model) reposFooter() string {
+	if len(m.repos) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d active", len(m.repos))
+}
+
+func (m model) repoLines(inner int) []string {
+	if len(m.repos) == 0 {
+		return []string{" " + dimStyle.Render("no active repos")}
+	}
+	repos := m.repos
+	more := 0
+	if len(repos) > maxRepoRows {
+		more = len(repos) - maxRepoRows + 1
+		repos = repos[:maxRepoRows-1]
+	}
+	nameW := 0
+	for _, r := range repos {
+		if w := ansi.StringWidth(r.name); w > nameW {
+			nameW = w
+		}
+	}
+	if limit := inner - 24; nameW > limit {
+		nameW = limit
+	}
+	if nameW < 4 {
+		nameW = 4
+	}
+
+	var lines []string
+	for _, r := range repos {
+		name := ansi.Truncate(r.name, nameW, "…")
+		runStyle, qStyle := dimStyle, dimStyle
+		if r.running > 0 {
+			runStyle = greenStyle
+		}
+		if r.queued > 0 {
+			qStyle = yellowStyle
+		}
+		lines = append(lines, " "+hlStyle.Render(name)+strings.Repeat(" ", nameW-ansi.StringWidth(name)+3)+
+			runStyle.Render(fmt.Sprintf("%d running", r.running))+"   "+qStyle.Render(fmt.Sprintf("%d queued", r.queued)))
+	}
+	if more > 0 {
+		lines = append(lines, " "+dimStyle.Render(fmt.Sprintf("+%d more", more)))
+	}
+	return lines
+}
+
+func (m model) detailPanel(w, h int) string {
+	j, ok := m.selected()
+	if !ok {
+		return panel("Job", "", false, w, h, []string{"", " " + dimStyle.Render("no job selected")})
+	}
+
+	now := time.Now().UTC()
+	isRunning := j.Status == "in_progress"
+	status, statusStyle := "queued", yellowStyle.Bold(true)
+	if isRunning {
+		status, statusStyle = "running", greenStyle.Bold(true)
+	}
+	if m.cancelling(j) {
+		status, statusStyle = "cancelling", yellowStyle.Bold(true)
+	}
+
+	kv := func(k, v string) string {
+		return " " + dimStyle.Render(fmt.Sprintf("%-10s", k)) + " " + v
+	}
+	labels := strings.ReplaceAll(j.Labels, ",", ", ")
+	if labels == "" {
+		labels = "-"
+	}
+
+	lines := []string{
+		"",
+		" " + hlStyle.Render(j.Repo) + dimStyle.Render(" › "+j.Workflow+" › ") + boldStyle.Render(j.Name),
+		"",
+		kv("Status", statusStyle.Render(status)),
+	}
+	if isRunning {
+		lines = append(lines, kv("Runner", greenStyle.Render(j.Runner)))
+		if !j.StartedAt.IsZero() {
+			lines = append(lines, kv("Elapsed", fmtElapsed(now.Sub(j.StartedAt))+dimStyle.Render("  (since "+j.StartedAt.UTC().Format("15:04")+" UTC)")))
+		}
+	} else if !j.CreatedAt.IsZero() {
+		mins := int(now.Sub(j.CreatedAt).Minutes())
+		lines = append(lines, kv("Waiting", waitColor(mins, lipgloss.NewStyle()).Render(fmt.Sprintf("%dm", mins))+dimStyle.Render("  (since "+j.CreatedAt.UTC().Format("15:04")+" UTC)")))
+	}
+	lines = append(lines,
+		kv("Branch", j.Branch),
+		kv("Labels", labels),
+		kv("Run", "#"+strconv.FormatInt(j.RunID, 10)),
+		kv("URL", accentStyle.Render(strings.TrimPrefix(j.URL, "https://"))),
+	)
+
+	if !isRunning {
+		inner := w - 4
+		rule := inner
+		if rule > 44 {
+			rule = 44
+		}
+		lines = append(lines, "", " "+dimStyle.Bold(true).Render("Busy runners with these labels"), " "+dimStyle.Render(strings.Repeat("─", rule)))
+		busy := busyRunners(j, m.running)
+		if len(busy) == 0 {
+			lines = append(lines, " "+dimStyle.Render("no running job uses all of these labels"))
+		}
+		for _, r := range busy {
+			elapsed := "-"
+			if !r.StartedAt.IsZero() {
+				elapsed = fmtElapsed(now.Sub(r.StartedAt))
+			}
+			runner := fmt.Sprintf("%-10s", r.Runner)
+			what := ansi.Truncate(r.Repo+" › "+r.Name, inner-ansi.StringWidth(runner)-1-len(elapsed)-2, "…")
+			gap := inner - ansi.StringWidth(runner) - 1 - ansi.StringWidth(what) - len(elapsed)
+			if gap < 1 {
+				gap = 1
+			}
+			lines = append(lines, " "+greenStyle.Render(runner)+" "+what+strings.Repeat(" ", gap)+dimStyle.Render(elapsed))
+		}
+	}
+
+	content := h - 2
+	if len(lines) > content-1 {
+		lines = lines[:content-1]
+	}
+	for len(lines) < content-1 {
+		lines = append(lines, "")
+	}
+	lines = append(lines, " "+hlStyle.Render("enter")+dimStyle.Render(" open in browser    ")+hlStyle.Render("c")+dimStyle.Render(" cancel whole run"))
+	return panel("Job", status, false, w, h, lines)
+}
+
+func (m model) cancelPopup() string {
+	j := m.confirmJob
+	body := []string{
+		"",
+		"  Cancel run #" + strconv.FormatInt(j.RunID, 10) + " of " + hlStyle.Render(j.Repo+" › "+j.Workflow) + "?",
+		"  " + dimStyle.Render("GitHub cancels the whole run, not one job."),
+		"",
+		"  " + hlStyle.Render("y") + dimStyle.Render(" cancel run      ") + hlStyle.Render("any other key") + dimStyle.Render(" keep it"),
+		"",
+	}
+	w := 0
+	for _, l := range body {
+		if lw := ansi.StringWidth(l); lw > w {
+			w = lw
+		}
+	}
+	w += 4
+	if w > m.width {
+		w = m.width
+	}
+	return panel("Cancel run", "", true, w, len(body)+2, body)
+}
+
+func overlay(bg, fg string, width int) string {
+	bgLines := strings.Split(bg, "\n")
+	fgLines := strings.Split(fg, "\n")
+	fw := ansi.StringWidth(fgLines[0])
+	x := (width - fw) / 2
+	if x < 0 {
+		x = 0
+	}
+	y := (len(bgLines) - len(fgLines)) / 2
+	if y < 0 {
+		y = 0
+	}
+	for i, l := range fgLines {
+		row := y + i
+		if row >= len(bgLines) {
+			break
+		}
+		under := bgLines[row]
+		bgLines[row] = ansi.Truncate(under, x, "") + "\x1b[0m" + l + "\x1b[0m" + ansi.TruncateLeft(under, x+fw, "")
+	}
+	return strings.Join(bgLines, "\n")
 }
 
 func (m model) orgOverlayView() string {
@@ -979,7 +1392,7 @@ func (m model) orgOverlayView() string {
 		Padding(1, 2).
 		Render(body + "\n\n" + dimStyle.Render(hint))
 
-	area := m.height - headerHeight - 2
+	area := m.bodyHeight()
 	if area < lipgloss.Height(box) {
 		area = lipgloss.Height(box)
 	}
@@ -1036,7 +1449,7 @@ func (m model) usageOverlayView() string {
 		Padding(1, 2).
 		Render(strings.Join(lines, "\n") + "\n\n" + dimStyle.Render("esc/u/q close"))
 
-	area := m.height - headerHeight - 2
+	area := m.bodyHeight()
 	if area < lipgloss.Height(box) {
 		area = lipgloss.Height(box)
 	}
@@ -1104,7 +1517,7 @@ func (m model) orgListView() string {
 }
 
 func (m model) orgListLimit() int {
-	limit := m.height - headerHeight - 10
+	limit := m.height - keybarHeight - 13
 	if limit < 1 {
 		limit = 1
 	}
@@ -1112,44 +1525,6 @@ func (m model) orgListLimit() int {
 		limit = maxOrgRows
 	}
 	return limit
-}
-
-func (m model) headerView() string {
-	labels := []string{"Org:", "Scanned:", "Last:", "Next:"}
-	values := []string{
-		m.orgLabel(),
-		m.repoCountLabel(),
-		m.lastScanLabel() + " UTC",
-		fmt.Sprintf("%ds", m.nextIn),
-	}
-
-	leftW := 0
-	for i := range labels {
-		if w := lipgloss.Width(labels[i] + " " + values[i]); w > leftW {
-			leftW = w
-		}
-	}
-
-	var lines []string
-	for i := range labels {
-		l := dimStyle.Render(labels[i]) + " " + values[i]
-		l = lipgloss.NewStyle().Width(leftW + 2).Render(l)
-
-		h := hints[i]
-		first := ""
-		if h[0] != "" {
-			first = accentStyle.Render(h[0]) + " " + dimStyle.Render(h[1])
-		}
-		hint := lipgloss.NewStyle().Width(hintColWidth).MaxWidth(hintColWidth).Render(first) +
-			accentStyle.Render(h[2]) + " " + dimStyle.Render(h[3])
-
-		gap := m.width - lipgloss.Width(l) - lipgloss.Width(hint)
-		if gap < 1 {
-			gap = 1
-		}
-		lines = append(lines, l+strings.Repeat(" ", gap)+hint)
-	}
-	return strings.Join(lines, "\n")
 }
 
 func (m model) orgLabel() string {
@@ -1173,87 +1548,49 @@ func (m model) lastScanLabel() string {
 	return m.lastScan
 }
 
-func (m model) panelView(title string, focused bool, inner int, t table.Model) string {
-	border := lipgloss.RoundedBorder()
-	bs := dimStyle
-	ts := dimStyle.Bold(true)
-	if focused {
-		bs = accentStyle
-		ts = accentStyle.Bold(true)
-	}
-
-	label := border.Top + " " + title + " "
-	fill := inner - lipgloss.Width(label)
-	if fill < 0 {
-		fill = 0
-	}
-	top := bs.Render(border.TopLeft) + bs.Render(border.Top+" ") + ts.Render(title) + bs.Render(" ") +
-		bs.Render(strings.Repeat(border.Top, fill)) + bs.Render(border.TopRight)
-
-	lines := strings.Split(t.View(), "\n")
-	side := bs.Render(border.Left)
-	right := bs.Render(border.Right)
-
-	var rows []string
-	rows = append(rows, top)
-	for _, l := range lines {
-		rows = append(rows, side+lipgloss.NewStyle().Width(inner).MaxWidth(inner).Render(l)+right)
-	}
-	rows = append(rows, bs.Render(border.BottomLeft+strings.Repeat(border.Bottom, inner)+border.BottomRight))
-	return strings.Join(rows, "\n")
-}
-
 func (m model) statusView() string {
-	panel := "running"
-	if m.focus == 1 {
-		panel = "queued"
-	}
-	left := boldStyle.Render(m.orgLabel() + " › " + panel)
-	if m.filter != "" {
-		left += dimStyle.Render("   filter: " + m.filter)
+	if m.filterActive {
+		return ansi.Truncate(m.filterInput.View(), m.width, "")
 	}
 
-	var right string
-	if m.scanning {
-		if m.progress.total < 0 {
-			right = m.spin.View() + " listing repos…"
-		} else {
-			right = m.spin.View() + " " + fmt.Sprintf("scanning %d/%d repos", m.progress.done, m.progress.total)
-		}
-	} else {
-		right = fmt.Sprintf("%d running · %d queued", len(m.running), len(m.queued))
-	}
-
-	if !m.scanning && m.scanErr != nil {
-		right = redStyle.Render("rate limited · incomplete") + dimStyle.Render("   "+right)
-	} else {
-		right = dimStyle.Render(right)
-	}
-
-	if m.saveErr != nil {
-		right = yellowStyle.Render("org not saved") + dimStyle.Render("   ") + right
-	}
-
+	var parts []string
 	if m.notice != "" {
 		style := greenStyle
 		if m.noticeErr {
 			style = yellowStyle
 		}
-		right = style.Render(m.notice) + dimStyle.Render("   ") + right
+		parts = append(parts, style.Render(m.notice))
+	}
+	if m.saveErr != nil {
+		parts = append(parts, yellowStyle.Render("org not saved"))
+	}
+	if !m.scanning && m.scanErr != nil {
+		parts = append(parts, redStyle.Render("rate limited · incomplete"))
+	}
+	if m.filter != "" {
+		parts = append(parts, dimStyle.Render("filter: "+m.filter))
+	}
+	parts = append(parts, hlStyle.Render(m.orgLabel())+dimStyle.Render(fmt.Sprintf(" · next %ds", m.nextIn)), m.usageIndicator())
+	right := strings.Join(parts, dimStyle.Render(" · ")) + " "
+
+	budget := m.width - ansi.StringWidth(right) - 1
+	left := " "
+	for i, k := range keyHints {
+		part := hlStyle.Render(k[0]) + dimStyle.Render(": "+k[1])
+		if i > 0 {
+			part = dimStyle.Render(" | ") + part
+		}
+		if ansi.StringWidth(left+part) > budget {
+			break
+		}
+		left += part
 	}
 
-	right += dimStyle.Render("   ") + m.usageIndicator()
-
-	if m.confirming {
-		prompt := "cancel run " + m.confirmJob.Workflow + " (" + m.confirmJob.Repo + ")? stops every job in this run · y/n"
-		return yellowStyle.Render(prompt)
-	}
-
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
+	gap := m.width - ansi.StringWidth(left) - ansi.StringWidth(right)
 	if gap < 1 {
 		gap = 1
 	}
-	return left + strings.Repeat(" ", gap) + right
+	return ansi.Truncate(left+strings.Repeat(" ", gap)+right, m.width, "")
 }
 
 func Run(opts options) error {
