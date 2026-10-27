@@ -7,15 +7,16 @@ GitHub shows runner status per repository. When a job queues because a runner is
 ## Install
 
 ```sh
-go build -o bin/gh-runners     ./cmd/gh-runners
-go build -o bin/gh-runners-tui ./cmd/gh-runners-tui
+go build -o bin/gh-runners ./cmd/gh-runners
+go build -o bin/gh-runner  ./cmd/gh-runners-tui
 ```
 
 ## Usage
 
 ```sh
-gh-runners-tui <org>              # live table, rescans on a timer
-gh-runners <org>                  # one-shot, tab-separated
+gh-runner <org>                   # live table, rescans on a timer
+gh-runners <org>                  # same TUI in a terminal; tab-separated when piped
+gh-runners <org> | cat            # one-shot, tab-separated
 gh-runners <org> --label ARM64    # filter by runner label
 gh-runners <org> --select         # pick a job in fzf, open it in the browser
 gh-runners <org> --repo web       # scan one repo, not the whole org
@@ -57,7 +58,7 @@ Both commands resolve each value in this order, first hit wins:
 
 The file is optional. A missing file, an unreadable one, or a `days` that is not a number is ignored silently.
 
-`gh-runners-tui` writes it. Accepting an org in the `<O>` overlay saves `org = <value>` and moves that org to the front of `orgs`, creating the file and its directory if needed, so the next run starts in that org with no prompt — set it once, like `git remote add`. Every accept saves, including a later switch to a different org. The history is capped at 10, dropping the least recently used. A file that has `org` but no `orgs` line reads as a one-entry history. Only the `org` and `orgs` lines change: `days`, comments, blank lines, unknown keys and their order are preserved, and the write is atomic, so an interrupt cannot truncate the file. A save that fails is not fatal — the org still applies for that session and the status line shows `org not saved`.
+`gh-runner` writes it. Accepting an org in the `<O>` overlay saves `org = <value>` and moves that org to the front of `orgs`, creating the file and its directory if needed, so the next run starts in that org with no prompt — set it once, like `git remote add`. Every accept saves, including a later switch to a different org. The history is capped at 10, dropping the least recently used. A file that has `org` but no `orgs` line reads as a one-entry history. Only the `org` and `orgs` lines change: `days`, comments, blank lines, unknown keys and their order are preserved, and the write is atomic, so an interrupt cannot truncate the file. A save that fails is not fatal — the org still applies for that session and the status line shows `org not saved`.
 
 The overlay lists the orgs from `orgs` under the input, marking the saved one:
 
@@ -90,7 +91,7 @@ The field itself always opens **empty**, showing the `organisation` placeholder,
 | `pgup` / `pgdown`, `ctrl+b` / `ctrl+f` | move one page |
 | `ctrl+u` / `ctrl+d` | move half a page |
 | `H` / `M` / `L` | jump to the top, middle or bottom row of the visible window |
-| `tab`, `1`, `2` | switch between Running and Queued |
+| `h` / `l`, `1`, `2` | switch between Running and Queued |
 | `/`, `esc` | filter, clear the filter |
 | `enter` / `o` | open the job in the browser |
 | `r` | rescan now |
@@ -136,7 +137,7 @@ When a scan is rate-limited it says so on stderr and exits 2, rather than printi
 
 ### ETag cache on disk
 
-`gh-runners` and `gh-runners-tui` share one cache file: `$XDG_CACHE_HOME/gh-runners/etags.json`, or `~/.cache/gh-runners/etags.json` when `XDG_CACHE_HOME` is unset. The directory is created `0700` and the file `0600`. It is written after every finished scan and when the TUI quits, and only holds the URLs the last run actually used.
+`gh-runners` and `gh-runner` share one cache file: `$XDG_CACHE_HOME/gh-runners/etags.json`, or `~/.cache/gh-runners/etags.json` when `XDG_CACHE_HOME` is unset. The directory is created `0700` and the file `0600`. It is written after every finished scan and when the TUI quits, and only holds the URLs the last run actually used.
 
 The file holds each response reduced to the fields the tool reads: repo names, run ids, job, workflow, branch and runner names, labels, times and URLs. It holds no emails, commit messages, logins or descriptions. It is keyed by a SHA-256 of the token, never the token itself, so switching `GH_TOKEN` starts cold. A missing, corrupt or old-version file is ignored.
 
@@ -161,6 +162,17 @@ curl -s -D- -o /dev/null -H "Authorization: token $(gh auth token)" \
 ```
 
 `x-ratelimit-remaining: 0` is the hourly quota. A 403 with quota still remaining is the secondary limit — reduce concurrency.
+
+## Web version
+
+`web/` is a read-only browser version of the TUI, deployed to GitHub Pages by `.github/workflows/pages.yml` on every push to `main` that touches `web/`. It has no build step and no third-party code.
+
+- Paste an organisation and a token. The token lives only in the tab's memory: it is never written to storage or the URL, and a reload or closing the tab drops it. A `401` clears it and returns to the form.
+- Use a fine-grained token with **Actions: read** on the organisation's repositories. The page never cancels or changes anything.
+- A Content-Security-Policy limits the page to its own files and lets it connect only to `https://api.github.com`. API text is inserted as plain text, and only job links starting with `https://github.com/` are opened.
+- The org and days go in the URL hash (`#org=<org>&days=7`), so a bookmark skips typing them.
+- Same scan and costs as the CLI: 6 parallel requests, ETag cache (304s are free), repo list cached 12 minutes, rescan 15s after each scan. Keys: `j`/`k`, `g`/`G`, `h`/`l`/`1`/`2`, `enter`/`o`, `/`, `esc`, `r`.
+- All your Pages sites share the `<user>.github.io` origin. That is why the token is never stored.
 
 ## Limitations
 
