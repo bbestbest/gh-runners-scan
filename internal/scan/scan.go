@@ -174,6 +174,7 @@ func listRepos(ctx context.Context, limited *atomic.Bool, org string, days int) 
 		if !ok {
 			return nil
 		}
+		older := false
 		for _, e := range entries {
 			if e.Archived {
 				continue
@@ -182,9 +183,18 @@ func listRepos(ctx context.Context, limited *atomic.Bool, org string, days int) 
 				names = append(names, e.Name)
 				continue
 			}
-			if ts := parseTime(e.PushedAt); !ts.IsZero() && ts.After(cutoff) {
-				names = append(names, e.Name)
+			ts := parseTime(e.PushedAt)
+			if ts.IsZero() {
+				continue
 			}
+			if !ts.After(cutoff) {
+				older = true
+				break
+			}
+			names = append(names, e.Name)
+		}
+		if older {
+			break
 		}
 		next = nextPageURL(link)
 	}

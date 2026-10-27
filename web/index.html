@@ -23,6 +23,7 @@
   <div class="keybar"><span id="hints"></span><input id="filter" placeholder="/ filter" spellcheck="false"><span id="info"></span></div>
   <form id="login" class="connect" autocomplete="off">
     <h2 id="connectTitle">Connect · 1/2 token</h2>
+    <input id="pmUser" class="sr-only" name="username" autocomplete="username" value="gh-runner" readonly tabindex="-1" aria-hidden="true">
     <div id="stepToken" class="step">
       <label>Token <input id="token" name="token" type="password" spellcheck="false" autocomplete="off"></label>
       <div class="perms">
@@ -42,7 +43,18 @@
         </ul>
         <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">Create a fine-grained token ↗</a>
       </div>
-      <p class="dim">Kept in this tab's memory only and sent only to api.github.com.</p>
+      <label class="check"><input id="remember" type="checkbox"> Remember on this device, locked by a passphrase</label>
+      <div id="rememberFields" hidden>
+        <label>Passphrase <input id="newPass" name="password" type="password" spellcheck="false" autocomplete="new-password" minlength="8"></label>
+        <p class="hint">At least 8 characters, or <button type="button" id="suggestPass" class="link">suggest a strong one</button>. Your browser can save it as "gh-runner" and fill it in when you unlock. The token is encrypted with it (AES-GCM) before it is stored; this page never stores the passphrase.</p>
+        <p id="passNote" class="yellow"></p>
+      </div>
+      <p class="dim">Sent only to api.github.com. Without "Remember" it stays in this tab's memory only.</p>
+    </div>
+    <div id="stepUnlock" class="step" hidden>
+      <div class="who"><span id="savedFor" class="dim"></span><button type="button" id="forgetToken" class="link">forget token</button></div>
+      <label>Passphrase <input id="unlockPass" name="password" type="password" spellcheck="false" autocomplete="current-password"></label>
+      <p class="hint">Unlocks the token saved on this device. Forgot it? Press "forget token" and paste the token again.</p>
     </div>
     <div id="stepConfig" class="step" hidden>
       <div class="who"><span id="whoami" class="dim"></span><button type="button" id="changeToken" class="link">change token</button></div>
@@ -50,10 +62,10 @@
       <datalist id="orgList"></datalist>
       <label>Repo <select id="repo" name="repo"><option value="">All repositories</option></select></label>
       <p id="repoNote" class="dim"></p>
-      <div class="pair">
-        <label>Days <input id="days" name="days" type="number" min="0" value="7"></label>
-        <label>Refresh (s) <input id="interval" name="interval" type="number" min="5" value="15"></label>
-      </div>
+      <label>Pushed within <span class="unit"><input id="days" name="days" type="number" min="0" value="7"> days</span></label>
+      <p class="hint">Only scan repositories pushed in the last N days; 0 scans every repository. Ignored when one repo is picked.</p>
+      <label>Rescan every <span class="unit"><input id="interval" name="interval" type="number" min="5" value="15"> seconds</span></label>
+      <p class="hint">Wait between scans, at least 5. Shorter uses API quota faster.</p>
     </div>
     <p id="loginError" class="red"></p>
     <button type="submit" id="submit">enter: continue</button>

@@ -47,11 +47,11 @@ func TestListReposFollowsPagination(t *testing.T) {
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
 		if r.URL.Query().Get("page") == "2" {
-			fmt.Fprintf(w, `[{"name":"gamma","pushed_at":%q,"archived":false}]`, now)
+			fmt.Fprintf(w, `[{"name":"gamma","pushed_at":%q,"archived":false},{"name":"stale","pushed_at":"2020-01-01T00:00:00Z","archived":false}]`, now)
 			return
 		}
 		w.Header().Set("Link", fmt.Sprintf(`<%s/orgs/org-a/repos?page=2>; rel="next"`, srv.URL))
-		fmt.Fprintf(w, `[{"name":"alpha","pushed_at":%q,"archived":false},{"name":"stale","pushed_at":"2020-01-01T00:00:00Z","archived":false},{"name":"old","pushed_at":%q,"archived":true}]`, now, now)
+		fmt.Fprintf(w, `[{"name":"alpha","pushed_at":%q,"archived":false},{"name":"old","pushed_at":%q,"archived":true}]`, now, now)
 	}))
 	defer srv.Close()
 	withClient(t, srv.URL)
@@ -69,6 +69,42 @@ func TestListReposFollowsPagination(t *testing.T) {
 	}
 	if limited.Load() {
 		t.Fatal("should not be rate limited")
+	}
+}
+
+func TestListReposStopsAtFirstRepoOutsideDays(t *testing.T) {
+	for _, tc := range []struct {
+		days      int
+		want      []string
+		wantPages int32
+	}{
+		{days: 7, want: []string{"alpha", "beta"}, wantPages: 1},
+		{days: 0, want: []string{"alpha", "empty", "beta", "stale", "gamma"}, wantPages: 2},
+	} {
+		resetRepoCache(t)
+		var pages atomic.Int32
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			pages.Add(1)
+			if r.URL.Query().Get("page") == "2" {
+				fmt.Fprint(w, `[{"name":"gamma","pushed_at":"2019-01-01T00:00:00Z","archived":false}]`)
+				return
+			}
+			now := time.Now().UTC().Format(time.RFC3339)
+			w.Header().Set("Link", fmt.Sprintf(`<%s/orgs/org-a/repos?page=2>; rel="next"`, srv.URL))
+			fmt.Fprintf(w, `[{"name":"alpha","pushed_at":%q,"archived":false},{"name":"empty","pushed_at":null,"archived":false},{"name":"beta","pushed_at":%q,"archived":false},{"name":"stale","pushed_at":"2020-01-01T00:00:00Z","archived":false}]`, now, now)
+		}))
+		withClient(t, srv.URL)
+
+		var limited atomic.Bool
+		names := listRepos(context.Background(), &limited, "org-a", tc.days)
+		srv.Close()
+		if !reflect.DeepEqual(names, tc.want) {
+			t.Fatalf("days=%d: names = %v, want %v", tc.days, names, tc.want)
+		}
+		if got := pages.Load(); got != tc.wantPages {
+			t.Fatalf("days=%d: fetched %d pages, want %d", tc.days, got, tc.wantPages)
+		}
 	}
 }
 

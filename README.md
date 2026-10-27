@@ -169,13 +169,13 @@ curl -s -D- -o /dev/null -H "Authorization: token $(gh auth token)" \
 
 - A floating Connect box over the dashboard works in two steps. Step 1 asks only for the token and lists the permissions it needs; the page checks it with `GET /user`. Step 2 lists the organisations it can see (`/user/orgs`, plus your own account) and that organisation's repositories, with days and refresh settings. Pick a repository to scan only that one, or keep "All repositories". `O` reopens the box with the token kept, "change token" goes back to step 1, `esc` closes it.
 - Permissions: a fine-grained token whose resource owner is the organisation, with repository permission **Actions: Read-only** (Metadata is added automatically). A classic token needs `repo`, plus `read:org` to list organisations; the page warns when a classic token has no `repo` scope.
-- The token lives only in the tab's memory: it is never written to storage or the URL, and a reload or closing the tab drops it. A `401` clears it and reopens the box.
+- By default the token lives only in the tab's memory and a reload drops it. Tick "Remember on this device" to store it encrypted: a key is derived from your passphrase (PBKDF2-SHA-256, 600,000 iterations, random 16-byte salt) and the token is sealed with AES-GCM-256 (random 12-byte IV) in `localStorage` under `gh-runner:token`. The page never stores the passphrase; each visit asks for it to unlock. "suggest a strong one" fills in 18 random bytes (24 characters), and the form names it `gh-runner` with `autocomplete="new-password"`/`"current-password"`, so the browser's password manager can save it and fill it in on unlock. "forget token" deletes the saved copy, and a `401` deletes it too. The token is never written to the URL.
 - Use a fine-grained token with **Actions: read** on the organisation's repositories. The page never cancels or changes anything.
 - A Content-Security-Policy limits the page to its own files and lets it connect only to `https://api.github.com`. API text is inserted as plain text, and only job links starting with `https://github.com/` are opened.
 - The organisation and repo fields start empty on every load; neither is written to the URL or stored.
-- Days and the refresh interval (seconds, minimum 5, default 15) are remembered in `localStorage` under `gh-runner:settings`. The org and token are never stored.
+- Days and the refresh interval (seconds, minimum 5, default 15) are remembered in `localStorage` under `gh-runner:settings`. The org is never stored; the token only encrypted, as above.
 - Same scan and costs as the CLI: 6 parallel requests, ETag cache (304s are free), repo list cached 12 minutes, rescan the chosen interval after each scan. Keys: `j`/`k`, `g`/`G`, `h`/`l`/`1`/`2`, `enter`/`o`, `/`, `esc`, `r`, `O`.
-- All your Pages sites share the `<user>.github.io` origin. That is why the token is never stored.
+- All your Pages sites share the `<user>.github.io` origin and could read `localStorage`. That is why the saved token is encrypted; its safety rests on the passphrase, since anyone holding the stored blob can try passphrases offline.
 
 ## Limitations
 

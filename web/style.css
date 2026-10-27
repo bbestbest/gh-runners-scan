@@ -57,7 +57,7 @@ b, .bold { font-weight: 700; }
   color: var(--green);
 }
 
-.connect label { display: grid; grid-template-columns: 7.5em minmax(0, 1fr); align-items: center; gap: 8px; color: var(--dim); }
+.connect label { display: grid; grid-template-columns: 9.5em minmax(0, 1fr); align-items: center; gap: 8px; color: var(--dim); }
 .connect input, .connect select { width: 100%; min-width: 0; }
 .connect .step { display: grid; gap: 8px; min-width: 0; }
 .connect .perms { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; display: grid; gap: 4px; }
@@ -66,8 +66,16 @@ b, .bold { font-weight: 700; }
 .connect .who { display: flex; justify-content: space-between; gap: 8px; }
 .connect button.link { background: none; border: none; padding: 0; color: var(--blue); font-weight: 400; text-decoration: underline; }
 select { font: inherit; color: var(--fg); background: #161b22; border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; }
-.connect .pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
-.connect .pair label { grid-template-columns: auto minmax(0, 1fr); white-space: nowrap; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; pointer-events: none; overflow: hidden; }
+.connect label.check { display: flex; align-items: center; gap: 8px; color: var(--fg); }
+.connect label.check input { width: auto; }
+.connect .unit { display: flex; align-items: center; gap: 8px; color: var(--dim); min-width: 0; }
+.connect .unit input { width: 6em; flex: none; }
+.connect .hint { margin: -4px 0 2px 9.5em; padding-left: 8px; color: var(--dim); font-size: 12px; }
+@media (max-width: 520px) {
+  .connect label { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .connect .hint { margin-left: 0; padding-left: 0; }
+}
 .connect p { margin: 0; }
 .connect p:empty { display: none; }
 
@@ -79,6 +87,10 @@ input, button {
   border-radius: 4px;
   padding: 6px 8px;
 }
+
+button.busy { opacity: 0.7; cursor: progress; }
+
+input:disabled, select:disabled { opacity: 0.6; cursor: progress; }
 
 button { cursor: pointer; color: var(--bg); background: var(--green); border-color: var(--green); font-weight: 700; }
 

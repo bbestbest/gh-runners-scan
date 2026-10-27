@@ -10,6 +10,10 @@ const MIN_INTERVAL = 5
 
 const SETTINGS_KEY = 'gh-runner:settings'
 
+const TOKEN_KEY = 'gh-runner:token'
+
+const KDF_ITERATIONS = 600000
+
 const REPO_TTL = 12 * 60 * 1000
 
 const RUNS_PER_STATUS = 20
@@ -50,6 +54,10 @@ let token = ''
 let account = {}
 
 let repoSeq = 0
+
+let reposFor = ''
+
+let orgTimer = 0
 
 const etags = new Map()
 
@@ -147,11 +155,21 @@ async function listRepos(org, days, cost, scan) {
   while (next) {
     const page = await getJSON(next, cost, scan)
     if (!page) throw new Error(`cannot list repos of ${org}: ${cost.message}`)
+    let older = false
     for (const r of page.data) {
       if (r.archived) continue
-      if (days <= 0 || (r.pushed_at && Date.parse(r.pushed_at) > cutoff)) names.push(r.name)
+      if (days <= 0) {
+        names.push(r.name)
+        continue
+      }
+      if (!r.pushed_at) continue
+      if (Date.parse(r.pushed_at) <= cutoff) {
+        older = true
+        break
+      }
+      names.push(r.name)
     }
-    next = page.next
+    next = older ? '' : page.next
   }
   repoCache.set(key, { names, expires: Date.now() + REPO_TTL })
   return names
@@ -245,6 +263,7 @@ function logout(message) {
   state.scanId++
   state.scanning = false
   account = {}
+  forgetToken()
   openConnect(message)
 }
 
@@ -252,13 +271,29 @@ function openConnect(message) {
   $('login').hidden = false
   $('loginError').textContent = message || ''
   if (token) showConfig()
+  else if (savedToken()) showUnlock()
   else showTokenStep()
   renderHints()
 }
 
+function showUnlock() {
+  const saved = savedToken()
+  $('stepUnlock').hidden = false
+  $('stepToken').hidden = true
+  $('stepConfig').hidden = true
+  $('connectTitle').textContent = 'Connect · unlock saved token'
+  $('submit').textContent = 'enter: unlock'
+  $('savedFor').textContent = `token saved for ${saved && saved.login ? saved.login : 'this device'}`
+  $('unlockPass').value = ''
+  $('unlockPass').focus()
+}
+
 function showTokenStep() {
+  $('stepUnlock').hidden = true
   $('stepToken').hidden = false
   $('stepConfig').hidden = true
+  $('remember').checked = !!savedToken()
+  $('rememberFields').hidden = !$('remember').checked
   $('connectTitle').textContent = 'Connect · 1/2 token'
   $('submit').textContent = 'enter: continue'
   $('token').value = ''
@@ -266,6 +301,7 @@ function showTokenStep() {
 }
 
 function showConfig() {
+  $('stepUnlock').hidden = true
   $('stepToken').hidden = true
   $('stepConfig').hidden = false
   $('connectTitle').textContent = 'Connect · 2/2 organisation and settings'
@@ -274,7 +310,7 @@ function showConfig() {
   $('whoami').className = account.scopes && !account.scopes.split(/,\s*/).includes('repo') ? 'yellow' : 'dim'
   if ($('whoami').className === 'yellow') $('whoami').textContent += ' · no repo scope: private repos stay hidden'
   $('org').value = state.org
-  if (state.org) loadRepos(state.org, state.repo)
+  loadRepos(state.org, state.repo)
   $('org').focus()
 }
 
@@ -290,6 +326,9 @@ async function connectGet(url) {
     cache: 'no-store',
     credentials: 'omit',
     referrerPolicy: 'no-referrer',
+    signal: AbortSignal.timeout(15000),
+  }).catch(err => {
+    throw new Error(err.name === 'TimeoutError' ? 'GitHub did not answer within 15s' : 'cannot reach api.github.com')
   })
   recordUsage(res)
   if (res.status === 401) throw new AuthError('token rejected (401): check it was copied whole and has not expired')
@@ -297,56 +336,203 @@ async function connectGet(url) {
   return { res, data: await res.json(), next: nextLink(res.headers.get('link')) }
 }
 
-async function verifyToken() {
-  const value = $('token').value.trim()
-  if (!value) return
+function setBusy(label) {
+  const button = $('submit')
+  button.disabled = !!label
+  button.classList.toggle('busy', !!label)
+  button.textContent = label || (!$('stepUnlock').hidden ? 'enter: unlock' : $('stepConfig').hidden ? 'enter: continue' : 'enter: start')
+}
+
+async function verifyToken(value) {
   token = value
-  $('token').value = ''
   $('loginError').textContent = ''
-  $('submit').disabled = true
+  setBusy('checking token…')
   try {
     const { res, data } = await connectGet(`${API}/user`)
     account = { login: data.login, scopes: res.headers.get('x-oauth-scopes') || '' }
+    setBusy('loading organisations…')
     const orgs = new Set([data.login])
     try {
       const { data: list } = await connectGet(`${API}/user/orgs?per_page=100`)
       for (const o of list) orgs.add(o.login)
     } catch {}
     $('orgList').replaceChildren(...[...orgs].map(o => Object.assign(document.createElement('option'), { value: o })))
-    showConfig()
+    return 'ok'
   } catch (err) {
     token = ''
     account = {}
     $('loginError').textContent = err.message
-    $('token').focus()
+    return err instanceof AuthError ? 'rejected' : 'error'
+  } finally {
+    setBusy('')
   }
-  $('submit').disabled = false
+}
+
+async function submitToken() {
+  const value = $('token').value.trim()
+  const remember = $('remember').checked
+  const pass = $('newPass').value
+  if (!value) {
+    $('loginError').textContent = 'paste a token first'
+    return $('token').focus()
+  }
+  if (remember && pass.length < 8) {
+    $('loginError').textContent = 'the passphrase needs at least 8 characters'
+    return $('newPass').focus()
+  }
+  $('token').disabled = true
+  $('newPass').disabled = true
+  const ok = await verifyToken(value) === 'ok'
+  if (ok && !remember) forgetToken()
+  if (ok && remember) {
+    setBusy('encrypting token…')
+    try {
+      await saveToken(value, pass, account.login)
+    } catch (err) {
+      $('loginError').textContent = `token works but could not be saved: ${err.message}`
+    }
+    setBusy('')
+  }
+  $('token').disabled = false
+  $('newPass').disabled = false
+  if (!ok) return $('token').focus()
+  $('token').value = ''
+  $('newPass').value = ''
+  $('newPass').type = 'password'
+  $('passNote').textContent = ''
+  showConfig()
+}
+
+async function submitUnlock() {
+  const saved = savedToken()
+  const pass = $('unlockPass').value
+  if (!saved) return showTokenStep()
+  if (!pass) {
+    $('loginError').textContent = 'type the passphrase'
+    return $('unlockPass').focus()
+  }
+  $('unlockPass').disabled = true
+  setBusy('unlocking…')
+  let value = ''
+  try {
+    value = await openToken(saved, pass)
+  } catch {
+    $('loginError').textContent = 'wrong passphrase'
+  }
+  setBusy('')
+  $('unlockPass').disabled = false
+  if (!value) {
+    $('unlockPass').select()
+    return
+  }
+  $('unlockPass').value = ''
+  const result = await verifyToken(value)
+  if (result === 'ok') return showConfig()
+  if (result === 'rejected') {
+    forgetToken()
+    showTokenStep()
+    $('loginError').textContent = 'the saved token was rejected (401) and has been forgotten; paste a new one'
+  }
+}
+
+const b64 = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes)))
+
+const unb64 = text => Uint8Array.from(atob(text), c => c.charCodeAt(0))
+
+async function deriveKey(passphrase, salt) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey'])
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: KDF_ITERATIONS, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'])
+}
+
+async function saveToken(value, passphrase, login) {
+  const salt = crypto.getRandomValues(new Uint8Array(16))
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const key = await deriveKey(passphrase, salt)
+  const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(value))
+  localStorage.setItem(TOKEN_KEY, JSON.stringify({ v: 1, login, salt: b64(salt), iv: b64(iv), data: b64(data) }))
+}
+
+async function openToken(saved, passphrase) {
+  const key = await deriveKey(passphrase, unb64(saved.salt))
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(saved.iv) }, key, unb64(saved.data))
+  return new TextDecoder().decode(plain)
+}
+
+function savedToken() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(TOKEN_KEY) || 'null')
+    return saved && saved.v === 1 && saved.salt && saved.iv && saved.data ? saved : null
+  } catch {
+    return null
+  }
+}
+
+async function suggestPassphrase() {
+  const pass = b64(crypto.getRandomValues(new Uint8Array(18))).replace(/\+/g, '-').replace(/\//g, '_')
+  const field = $('newPass')
+  field.value = pass
+  field.type = 'text'
+  field.focus()
+  field.select()
+  $('passNote').textContent = 'shown above; save it in your password manager before you continue'
+  try {
+    await navigator.clipboard.writeText(pass)
+    $('passNote').textContent = 'copied; save it in your password manager before you continue'
+  } catch {}
+}
+
+function forgetToken() {
+  try {
+    localStorage.removeItem(TOKEN_KEY)
+  } catch {}
 }
 
 async function loadRepos(org, keep) {
   const select = $('repo')
+  const note = $('repoNote')
   const seq = ++repoSeq
-  select.replaceChildren(new Option('All repositories', ''))
-  $('repoNote').textContent = org ? 'loading repositories…' : ''
-  if (!org) return
+  reposFor = ''
+  note.className = 'dim'
+  if (!org) {
+    select.replaceChildren(new Option('All repositories', ''))
+    select.disabled = false
+    note.textContent = ''
+    setBusy('')
+    return
+  }
+  select.replaceChildren(new Option('loading repositories…', ''))
+  select.disabled = true
+  note.textContent = `loading repositories of ${org}…`
+  setBusy('loading repositories…')
   const names = []
+  let failure = ''
   try {
-    let next = `${API}/orgs/${encodeURIComponent(org)}/repos?per_page=100&sort=pushed&direction=desc`
-    if (org === account.login) next = `${API}/user/repos?per_page=100&sort=pushed&affiliation=owner`
+    let next = org === account.login
+      ? `${API}/user/repos?per_page=100&sort=pushed&affiliation=owner`
+      : `${API}/orgs/${encodeURIComponent(org)}/repos?per_page=100&sort=pushed&direction=desc`
     while (next) {
       const page = await connectGet(next)
       if (seq !== repoSeq) return
       for (const r of page.data) if (!r.archived) names.push(r.name)
+      note.textContent = `loading repositories of ${org}… ${names.length}`
       next = page.next
     }
   } catch (err) {
     if (seq !== repoSeq) return
-    $('repoNote').textContent = `cannot list repositories: ${err.message}`
-    return
+    failure = err.message
   }
-  select.append(...names.map(n => new Option(n, n)))
+  select.replaceChildren(new Option('All repositories', ''), ...names.map(n => new Option(n, n)))
   if (keep && names.includes(keep)) select.value = keep
-  $('repoNote').textContent = names.length ? `${names.length} repositories visible to this token` : 'this token sees no repositories here; check the token\'s resource owner'
+  select.disabled = false
+  reposFor = org
+  setBusy('')
+  if (failure) {
+    note.className = 'red'
+    note.textContent = `cannot list repositories of ${org}: ${failure}`
+  } else if (!names.length) {
+    note.className = 'yellow'
+    note.textContent = 'this token sees no repositories here; check the token\'s resource owner'
+  } else note.textContent = `${names.length} ${names.length === 1 ? 'repository' : 'repositories'} visible to this token`
 }
 
 function target() {
@@ -630,7 +816,16 @@ function tick() {
 
 function submitConnect(e) {
   e.preventDefault()
-  if (!$('stepToken').hidden) return verifyToken()
+  if ($('submit').disabled) return
+  if (!$('stepUnlock').hidden) return submitUnlock()
+  if (!$('stepToken').hidden) return submitToken()
+  const org = $('org').value.trim()
+  if (!org) {
+    $('loginError').textContent = 'pick or type an organisation'
+    return $('org').focus()
+  }
+  $('loginError').textContent = ''
+  if (org !== reposFor) return loadRepos(org)
   start()
 }
 
@@ -675,7 +870,23 @@ function init() {
   renderHints()
   $('login').addEventListener('submit', submitConnect)
   $('changeToken').addEventListener('click', showTokenStep)
-  $('org').addEventListener('change', () => loadRepos($('org').value.trim()))
+  $('forgetToken').addEventListener('click', () => {
+    forgetToken()
+    $('loginError').textContent = ''
+    showTokenStep()
+  })
+  $('suggestPass').addEventListener('click', suggestPassphrase)
+  $('remember').addEventListener('change', () => {
+    $('rememberFields').hidden = !$('remember').checked
+    if ($('remember').checked) $('newPass').focus()
+  })
+  $('org').addEventListener('input', () => {
+    clearTimeout(orgTimer)
+    orgTimer = setTimeout(() => {
+      const org = $('org').value.trim()
+      if (org && org !== reposFor) loadRepos(org)
+    }, 500)
+  })
   $('filter').addEventListener('input', () => {
     state.filter = $('filter').value
     refresh()
