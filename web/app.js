@@ -16,6 +16,8 @@ const SESSION_KEY = 'gh-runner:session'
 
 const PM_USER = 'gh-runner'
 
+const VIEW_KEY = 'gh-runner:view'
+
 const KDF_ITERATIONS = 600000
 
 const REPO_TTL = 12 * 60 * 1000
@@ -530,7 +532,28 @@ function sessionToken() {
 function dropSession() {
   try {
     sessionStorage.removeItem(SESSION_KEY)
+    sessionStorage.removeItem(VIEW_KEY)
   } catch {}
+}
+
+function keepView() {
+  try {
+    sessionStorage.setItem(VIEW_KEY, JSON.stringify({ org: state.org, repo: state.repo, days: state.days, interval: state.interval }))
+  } catch {}
+}
+
+function restoreView() {
+  let view = null
+  try {
+    view = JSON.parse(sessionStorage.getItem(VIEW_KEY) || 'null')
+  } catch {}
+  if (!view || typeof view.org !== 'string' || !view.org) return false
+  $('org').value = view.org
+  $('repo').replaceChildren(new Option(view.repo || 'All repositories', typeof view.repo === 'string' ? view.repo : ''))
+  if (Number.isInteger(view.days) && view.days >= 0) $('days').value = view.days
+  if (Number.isInteger(view.interval) && view.interval >= MIN_INTERVAL) $('interval').value = view.interval
+  start()
+  return true
 }
 
 async function resumeSession() {
@@ -544,7 +567,7 @@ async function resumeSession() {
   setBusy('restoring session…')
   const result = await verifyToken(value)
   $('unlockPass').disabled = false
-  if (result === 'ok') return openConnect()
+  if (result === 'ok') return restoreView() || openConnect()
   if (result === 'rejected') {
     forgetToken()
     dropSession()
@@ -936,6 +959,7 @@ function start() {
   state.interval = Math.max(MIN_INTERVAL, parseInt($('interval').value, 10) || INTERVAL)
   state.nextIn = state.interval
   saveSettings()
+  if (sessionToken()) keepView()
   state.jobs = []
   state.cost = null
   state.lastScan = ''

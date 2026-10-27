@@ -46,7 +46,7 @@
       <label class="check"><input id="remember" type="checkbox"> Remember on this device, locked by a passphrase</label>
       <div id="rememberFields" hidden>
         <label>Passphrase <input id="newPass" name="password" type="password" spellcheck="false" autocomplete="new-password" minlength="8"></label>
-        <p class="hint">At least 8 characters, or <button type="button" id="suggestPass" class="link">suggest a strong one</button>. Your browser can save it as "gh-runner" and fill it in when you unlock. The token is encrypted with it (AES-GCM) before it is stored; this page never stores the passphrase.</p>
+        <p class="hint">At least 8 characters, or <button type="button" id="suggestPass" class="link">suggest a strong one</button>. It encrypts the token (AES-GCM); this page never stores it. Chrome can save it as "gh-runner" and fill it in when you unlock.</p>
         <p id="passNote" class="yellow"></p>
       </div>
       <p class="dim">Sent only to api.github.com. Without "Remember" it stays in this tab's memory only.</p>
