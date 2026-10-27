@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src https://api.github.com; img-src 'self'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src https://api.github.com; img-src 'none'; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types 'none'">
 <meta name="referrer" content="no-referrer">
 <title>gh-runner</title>
 <link rel="stylesheet" href="style.css?v=dev">
@@ -21,7 +21,7 @@
     <section class="panel right" id="detailPanel"><h2>Job</h2><div class="body" id="detail"></div></section>
   </div>
   <div class="keybar"><span id="hints"></span><input id="filter" placeholder="/ filter" spellcheck="false"><span id="info"></span><button type="button" id="configBtn" class="kbtn">⚙ config</button></div>
-  <form id="login" class="connect" autocomplete="off">
+  <form id="login" class="connect" autocomplete="off" hidden>
     <h2 id="connectTitle">Connect · 1/2 token</h2>
     <input id="pmUser" class="sr-only" name="username" autocomplete="username" value="gh-runner" readonly tabindex="-1" aria-hidden="true">
     <div id="stepToken" class="step">

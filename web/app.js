@@ -59,6 +59,8 @@ let token = ''
 
 let account = {}
 
+let vault = null
+
 let repoSeq = 0
 
 let reposFor = ''
@@ -293,7 +295,6 @@ function showUnlock() {
   $('savedFor').textContent = `token saved for ${saved && saved.login ? saved.login : 'this device'}`
   $('unlockPass').value = ''
   $('unlockPass').focus()
-  fillFromPasswordManager()
 }
 
 function showTokenStep() {
@@ -432,23 +433,23 @@ async function submitUnlock() {
   }
   $('unlockPass').disabled = true
   setBusy('unlocking…')
-  let value = ''
+  let opened = null
   try {
-    value = await openToken(saved, pass)
+    opened = await openToken(saved, pass)
   } catch {
     $('loginError').textContent = 'wrong passphrase'
   }
   setBusy('')
   $('unlockPass').disabled = false
-  if (!value) {
+  if (!opened) {
     $('unlockPass').select()
     return
   }
   $('unlockPass').value = ''
-  const result = await verifyToken(value)
+  const result = await verifyToken(opened.token)
   if (result === 'ok') {
-    keepSession(value)
-    return showConfig()
+    keepSession(opened.token)
+    return applyView(opened.view) || showConfig()
   }
   if (result === 'rejected') {
     forgetToken()
@@ -469,22 +470,30 @@ async function deriveKey(passphrase, salt) {
 
 async function saveToken(value, passphrase, login) {
   const salt = crypto.getRandomValues(new Uint8Array(16))
+  vault = { key: await deriveKey(passphrase, salt), salt: b64(salt), login }
+  await sealVault(value, null)
+}
+
+async function sealVault(value, view) {
+  if (!vault) return
   const iv = crypto.getRandomValues(new Uint8Array(12))
-  const key = await deriveKey(passphrase, salt)
-  const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(value))
-  localStorage.setItem(TOKEN_KEY, JSON.stringify({ v: 1, login, salt: b64(salt), iv: b64(iv), data: b64(data) }))
+  const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, vault.key, new TextEncoder().encode(JSON.stringify({ token: value, view })))
+  localStorage.setItem(TOKEN_KEY, JSON.stringify({ v: 2, login: vault.login, salt: vault.salt, iv: b64(iv), data: b64(data) }))
 }
 
 async function openToken(saved, passphrase) {
   const key = await deriveKey(passphrase, unb64(saved.salt))
-  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(saved.iv) }, key, unb64(saved.data))
-  return new TextDecoder().decode(plain)
+  const plain = new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(saved.iv) }, key, unb64(saved.data)))
+  vault = { key, salt: saved.salt, login: saved.login }
+  if (saved.v === 1) return { token: plain, view: null }
+  const payload = JSON.parse(plain)
+  return { token: payload.token, view: payload.view || null }
 }
 
 function savedToken() {
   try {
     const saved = JSON.parse(localStorage.getItem(TOKEN_KEY) || 'null')
-    return saved && saved.v === 1 && saved.salt && saved.iv && saved.data ? saved : null
+    return saved && (saved.v === 1 || saved.v === 2) && saved.salt && saved.iv && saved.data ? saved : null
   } catch {
     return null
   }
@@ -511,14 +520,14 @@ async function offerToPasswordManager(pass) {
   } catch {}
 }
 
-async function fillFromPasswordManager() {
-  if (!window.PasswordCredential || !navigator.credentials || sessionToken()) return
+async function passwordFromManager() {
+  if (!window.PasswordCredential || !navigator.credentials) return ''
   try {
     const cred = await navigator.credentials.get({ password: true, mediation: 'optional' })
-    if (!cred || !cred.password || $('stepUnlock').hidden || $('unlockPass').value) return
-    $('unlockPass').value = cred.password
-    submitUnlock()
-  } catch {}
+    return cred && cred.password ? cred.password : ''
+  } catch {
+    return ''
+  }
 }
 
 function keepSession(value) {
@@ -553,6 +562,10 @@ function restoreView() {
   try {
     view = JSON.parse(sessionStorage.getItem(VIEW_KEY) || 'null')
   } catch {}
+  return applyView(view)
+}
+
+function applyView(view) {
   if (!view || typeof view.org !== 'string' || !view.org) return false
   $('org').value = view.org
   $('repo').replaceChildren(new Option(view.repo || 'All repositories', typeof view.repo === 'string' ? view.repo : ''))
@@ -562,18 +575,34 @@ function restoreView() {
   return true
 }
 
+function statusNote(text) {
+  $('status').replaceChildren(el('div', 'dim', text))
+}
+
 async function resumeSession() {
-  const value = sessionToken()
-  if (!value || !savedToken()) {
+  const saved = savedToken()
+  if (!saved) {
     dropSession()
     return openConnect()
   }
-  openConnect()
-  $('unlockPass').disabled = true
-  setBusy('restoring session…')
-  const result = await verifyToken(value)
-  $('unlockPass').disabled = false
-  if (result === 'ok') return restoreView() || openConnect()
+  const kept = sessionToken()
+  let opened = kept ? { token: kept, view: null } : null
+  if (!opened) {
+    const pass = await passwordFromManager()
+    if (!pass) return openConnect()
+    statusNote('unlocking with the saved passphrase…')
+    try {
+      opened = await openToken(saved, pass)
+    } catch {
+      return openConnect('the saved passphrase did not unlock the token; type it')
+    }
+  }
+  statusNote('checking token…')
+  const result = await verifyToken(opened.token)
+  if (result === 'ok') {
+    keepSession(opened.token)
+    return (kept ? restoreView() : applyView(opened.view)) || openConnect()
+  }
   if (result === 'rejected') {
     forgetToken()
     dropSession()
@@ -591,6 +620,7 @@ function repoKey(org) {
 }
 
 function forgetToken() {
+  vault = null
   try {
     localStorage.removeItem(TOKEN_KEY)
   } catch {}
@@ -970,6 +1000,7 @@ function start() {
   state.nextIn = state.interval
   saveSettings()
   if (sessionToken()) keepView()
+  sealVault(token, { org: state.org, repo: state.repo, days: state.days, interval: state.interval }).catch(() => {})
   state.jobs = []
   state.cost = null
   state.lastScan = ''
@@ -995,6 +1026,10 @@ function saveSettings() {
 }
 
 function init() {
+  if (window.top !== window.self) {
+    document.body.replaceChildren(el('p', 'red', 'gh-runner refuses to run inside a frame.'))
+    return
+  }
   loadSettings()
   renderHints()
   $('login').addEventListener('submit', submitConnect)
