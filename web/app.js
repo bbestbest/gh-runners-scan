@@ -102,11 +102,25 @@ async function getJSON(url, cost, scan) {
     }
     if (res.status === 401) throw new AuthError('token rejected (401)')
     const limited = res.status === 429 || (res.status === 403 && (res.headers.get('x-ratelimit-remaining') === '0' || res.headers.get('retry-after')))
-    if (!limited) return null
+    if (!limited) {
+      cost.failed[res.status] = (cost.failed[res.status] || 0) + 1
+      if (!cost.message) cost.message = await refusal(res)
+      return null
+    }
     if (attempt >= RATE_ATTEMPTS - 1) throw new RateLimited('rate limited; results are incomplete')
     const wait = Number(res.headers.get('retry-after')) * 1000
     await sleep(wait > 0 && wait <= RATE_ATTEMPTS * RATE_BACKOFF ? wait : (attempt + 1) * RATE_BACKOFF)
   }
+}
+
+async function refusal(res) {
+  if (res.headers.get('x-github-sso'))
+    return 'the organisation requires SSO: authorise this token for it in GitHub token settings'
+  try {
+    const body = await res.json()
+    if (body && typeof body.message === 'string') return body.message
+  } catch {}
+  return `HTTP ${res.status}`
 }
 
 async function listRepos(org, days, cost, scan) {
@@ -118,7 +132,7 @@ async function listRepos(org, days, cost, scan) {
   let next = `${API}/orgs/${encodeURIComponent(org)}/repos?per_page=100&sort=pushed&direction=desc`
   while (next) {
     const page = await getJSON(next, cost, scan)
-    if (!page) throw new Error(`cannot list repos of ${org} (missing org, or token lacks access)`)
+    if (!page) throw new Error(`cannot list repos of ${org}: ${cost.message}`)
     for (const r of page.data) {
       if (r.archived) continue
       if (days <= 0 || (r.pushed_at && Date.parse(r.pushed_at) > cutoff)) names.push(r.name)
@@ -164,7 +178,7 @@ async function scanRepo(org, repo, cost, scan) {
 }
 
 async function scanOrg(org, days, scan) {
-  const cost = { requests: 0, free: 0 }
+  const cost = { requests: 0, free: 0, failed: {}, message: '' }
   state.progress = { done: 0, total: -1 }
   render()
   const repos = await listRepos(org, days, cost, scan)
@@ -302,6 +316,13 @@ function renderStatus() {
   else second = el('div', 'dim', 'no scan yet')
   s.append(first, second)
   if (state.error) s.append(el('div', 'red', state.error))
+  const failed = state.cost ? Object.entries(state.cost.failed) : []
+  if (failed.length) {
+    const counts = failed.map(([status, n]) => `${status} ×${n}`).join(', ')
+    s.append(el('div', 'red', `${failed.reduce((t, [, n]) => t + n, 0)} requests refused (${counts}): ${state.cost.message}`))
+  }
+  if (!state.scanning && state.cost && state.progress.total === 0)
+    s.append(el('div', 'yellow', `this token sees no repos in ${state.org} pushed in the last ${state.days} days; check the token's resource owner is the organisation`))
   renderInfo()
 }
 
@@ -491,6 +512,8 @@ function start(e) {
   state.org = org
   state.days = Math.max(0, parseInt($('days').value, 10) || 0)
   state.jobs = []
+  state.cost = null
+  state.lastScan = ''
   state.error = ''
   state.usage = { limit: 0, remaining: 0, reset: 0 }
   $('login').hidden = true
