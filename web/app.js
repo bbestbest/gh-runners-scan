@@ -32,13 +32,12 @@ const RATE_BACKOFF = 3000
 
 const MAX_REPO_ROWS = 6
 
-const HINTS = [['enter', 'open'], ['/', 'filter'], ['h/l', 'panel'], ['r', 'rescan'], ['j/k', 'move'], ['O', 'config']]
+const HINTS = [['enter', 'open'], ['/', 'filter'], ['h/l', 'panel'], ['r', 'rescan'], ['j/k', 'move'], ['O', 'choose']]
 
-const CONNECT_HINTS = [['enter', 'start'], ['tab', 'next field']]
+const CONNECT_HINTS = [['enter', 'start'], ['space', 'tick'], ['tab', 'next field']]
 
 const state = {
-  org: '',
-  repo: '',
+  targets: [],
   days: 7,
   interval: INTERVAL,
   jobs: [],
@@ -65,9 +64,15 @@ let vault = null
 
 let repoSeq = 0
 
-let reposFor = ''
+let accounts = []
 
-let orgTimer = 0
+const picks = new Map()
+
+const repoChoices = new Map()
+
+let openOwner = ''
+
+let daysTimer = 0
 
 const etags = new Map()
 
@@ -213,6 +218,7 @@ async function scanRepo(org, repo, cost, scan) {
           jobs.push({
             runId: j.run_id,
             status: j.status,
+            owner: org,
             repo,
             workflow: j.workflow_name || '',
             branch: j.head_branch || '',
@@ -231,21 +237,25 @@ async function scanRepo(org, repo, cost, scan) {
   return jobs
 }
 
-async function scanOrg(org, days, scan) {
+async function scanTargets(targets, days, scan) {
   const cost = { requests: 0, free: 0, failed: {}, message: '' }
   state.progress = { done: 0, total: -1 }
   render()
-  const repos = state.repo ? [state.repo] : await listRepos(org, days, cost, scan)
-  state.progress = { done: 0, total: repos.length }
+  const pairs = []
+  for (const t of targets) {
+    const names = t.all ? await listRepos(t.owner, days, cost, scan) : t.repos
+    for (const repo of names) pairs.push([t.owner, repo])
+  }
+  state.progress = { done: 0, total: pairs.length }
   render()
   const results = []
   let index = 0
   let limited = null
   const worker = async () => {
-    while (index < repos.length) {
-      const repo = repos[index++]
+    while (index < pairs.length) {
+      const [owner, repo] = pairs[index++]
       try {
-        results.push(...await scanRepo(org, repo, cost, scan))
+        results.push(...await scanRepo(owner, repo, cost, scan))
       } catch (err) {
         if (!(err instanceof RateLimited)) throw err
         limited = err
@@ -264,7 +274,7 @@ async function startScan() {
   state.scanning = true
   const scan = ++state.scanId
   try {
-    const { jobs, cost, limited } = await scanOrg(state.org, state.days, scan)
+    const { jobs, cost, limited } = await scanTargets(state.targets, state.days, scan)
     if (scan !== state.scanId) return
     state.jobs = jobs
     state.cost = cost
@@ -327,14 +337,16 @@ function showConfig() {
   $('stepUnlock').hidden = true
   $('stepToken').hidden = true
   $('stepConfig').hidden = false
-  $('connectTitle').textContent = 'Connect · 2/2 owner and settings'
+  $('connectTitle').textContent = 'Connect · 2/2 what to scan'
   $('submit').textContent = 'enter: start'
   $('whoami').textContent = account.login ? `signed in as ${account.login}${account.scopes ? ` · scopes: ${account.scopes}` : ''}` : ''
   $('whoami').className = account.scopes && !account.scopes.split(/,\s*/).includes('repo') ? 'yellow' : 'dim'
   if ($('whoami').className === 'yellow') $('whoami').textContent += ' · no repo scope: private repos stay hidden'
-  $('org').value = state.org
-  loadRepos(state.org, state.repo)
-  $('org').focus()
+  $('org').value = ''
+  setPicks(state.targets)
+  renderAccounts()
+  const first = $('accounts').querySelector('input')
+  ;(first || $('org')).focus()
   renderHints()
 }
 
@@ -380,12 +392,11 @@ async function verifyToken(value) {
     const { res, data } = await connectGet(`${API}/user`)
     account = { login: data.login, scopes: res.headers.get('x-oauth-scopes') || '' }
     setBusy('loading accounts…')
-    const orgs = new Set([data.login])
+    accounts = [{ login: data.login, kind: 'you' }]
     try {
       const { data: list } = await connectGet(`${API}/user/orgs?per_page=100`)
-      for (const o of list) orgs.add(o.login)
+      for (const o of list) accounts.push({ login: o.login, kind: 'org' })
     } catch {}
-    $('orgList').replaceChildren(...[...orgs].map(o => Object.assign(document.createElement('option'), { value: o })))
     return 'ok'
   } catch (err) {
     token = ''
@@ -567,7 +578,7 @@ async function sessionKey() {
 }
 
 function currentView() {
-  return { org: state.org, repo: state.repo, days: state.days, interval: state.interval }
+  return { targets: state.targets, days: state.days, interval: state.interval }
 }
 
 async function keepSession(value, view) {
@@ -607,10 +618,21 @@ function dropSession() {
   } catch {}
 }
 
+function viewTargets(view) {
+  if (!view) return []
+  const name = v => typeof v === 'string' && v !== ''
+  if (Array.isArray(view.targets))
+    return view.targets
+      .filter(t => t && name(t.owner) && (t.all === true || (Array.isArray(t.repos) && t.repos.length && t.repos.every(name))))
+      .map(t => ({ owner: t.owner, all: t.all === true, repos: t.all === true ? [] : [...t.repos] }))
+  if (name(view.org)) return [{ owner: view.org, all: !name(view.repo), repos: name(view.repo) ? [view.repo] : [] }]
+  return []
+}
+
 function applyView(view) {
-  if (!view || typeof view.org !== 'string' || !view.org) return false
-  $('org').value = view.org
-  $('repo').replaceChildren(new Option(view.repo || 'All repositories', typeof view.repo === 'string' ? view.repo : ''))
+  const targets = viewTargets(view)
+  if (!targets.length) return false
+  setPicks(targets)
   if (Number.isInteger(view.days) && view.days >= 0) $('days').value = view.days
   if (Number.isInteger(view.interval) && view.interval >= MIN_INTERVAL) $('interval').value = view.interval
   start()
@@ -657,10 +679,6 @@ function formDays() {
   return Math.max(0, parseInt($('days').value, 10) || 0)
 }
 
-function repoKey(org) {
-  return org + '\u0000' + formDays()
-}
-
 function forgetToken() {
   vault = null
   try {
@@ -668,30 +686,133 @@ function forgetToken() {
   } catch {}
 }
 
-async function loadRepos(org, keep) {
-  const select = $('repo')
-  const note = $('repoNote')
+function setPicks(targets) {
+  picks.clear()
+  for (const t of targets) picks.set(t.owner.toLowerCase(), { owner: t.owner, all: t.all, repos: new Set(t.repos) })
+}
+
+function selection() {
+  const out = []
+  for (const p of picks.values()) {
+    if (p.all) out.push({ owner: p.owner, all: true, repos: [] })
+    else if (p.repos.size) out.push({ owner: p.owner, all: false, repos: [...p.repos].sort() })
+  }
+  return out
+}
+
+function pickRows() {
+  const rows = [...accounts]
+  const seen = new Set(rows.map(a => a.login.toLowerCase()))
+  for (const [key, p] of picks)
+    if (!seen.has(key)) {
+      rows.push({ login: p.owner, kind: 'saved' })
+      seen.add(key)
+    }
+  return rows
+}
+
+function plural(n, word) {
+  return `${n} ${word}${n === 1 ? '' : 's'}`
+}
+
+function tickRow(text, checked, id, onChange) {
+  const label = el('label', 'check')
+  const tick = el('input')
+  tick.type = 'checkbox'
+  tick.checked = checked
+  tick.dataset.pick = id
+  tick.addEventListener('change', () => {
+    onChange(tick.checked)
+    renderAccounts()
+  })
+  label.append(tick, el('span', 'name', text))
+  return label
+}
+
+function toggleRepo(owner, name, on, names) {
+  const key = owner.toLowerCase()
+  const p = picks.get(key) || { owner, all: false, repos: new Set() }
+  if (p.all) {
+    p.all = false
+    p.repos = new Set(names)
+  }
+  if (on) p.repos.add(name)
+  else p.repos.delete(name)
+  if (p.repos.size) picks.set(key, p)
+  else picks.delete(key)
+}
+
+function repoList(owner) {
+  const key = owner.toLowerCase()
+  const wrap = el('div', 'repolist')
+  const choice = repoChoices.get(key)
+  const names = (choice && choice.names) || []
+  const p = picks.get(key)
+  const all = !!(p && p.all)
+  wrap.append(tickRow('all repositories', all, 'all:' + key, on => {
+    if (on) picks.set(key, { owner, all: true, repos: new Set() })
+    else picks.delete(key)
+  }))
+  for (const name of names)
+    wrap.append(tickRow(name, all || !!(p && p.repos.has(name)), `r:${key}/${name}`, on => toggleRepo(owner, name, on, names)))
+  if (choice && choice.note) wrap.append(el('div', choice.cls, choice.note))
+  return wrap
+}
+
+function renderAccounts() {
+  const box = $('accounts')
+  const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.pick : ''
+  box.replaceChildren()
+  const rows = pickRows()
+  if (!rows.length) box.append(el('div', 'dim', 'no accounts yet; add an owner below'))
+  for (const a of rows) {
+    const key = a.login.toLowerCase()
+    const p = picks.get(key)
+    const row = el('div', 'acct')
+    const label = tickRow(a.login, !!(p && p.all), 'a:' + key, on => {
+      if (on) picks.set(key, { owner: a.login, all: true, repos: new Set() })
+      else picks.delete(key)
+    })
+    label.querySelector('input').indeterminate = !!(p && !p.all && p.repos.size)
+    const open = el('button', 'link', openOwner === key ? 'repos ▾' : 'repos ▸')
+    open.type = 'button'
+    open.dataset.pick = 'o:' + key
+    open.addEventListener('click', () => toggleRepos(a.login))
+    const count = p ? (p.all ? 'all repos' : plural(p.repos.size, 'repo')) : ''
+    row.append(label, el('span', 'kind dim', a.kind), el('span', 'count dim', count), open)
+    box.append(row)
+    if (openOwner === key) box.append(repoList(a.login))
+  }
+  const targets = selection()
+  $('pickSummary').textContent = targets.length ? `${plural(targets.length, 'account')} ticked` : 'nothing ticked'
+  const again = focused && [...box.querySelectorAll('[data-pick]')].find(e => e.dataset.pick === focused)
+  if (again) again.focus()
+}
+
+function toggleRepos(owner) {
+  const key = owner.toLowerCase()
+  if (openOwner === key) openOwner = ''
+  else {
+    openOwner = key
+    const choice = repoChoices.get(key)
+    if (!choice || !choice.done || choice.days !== formDays()) return loadRepoChoices(owner)
+  }
+  renderAccounts()
+}
+
+async function loadRepoChoices(owner) {
+  const key = owner.toLowerCase()
   const seq = ++repoSeq
   const days = formDays()
   const within = days > 0 ? ` pushed in the last ${days} ${days === 1 ? 'day' : 'days'}` : ''
-  reposFor = ''
-  note.className = 'dim'
-  if (!org) {
-    select.replaceChildren(new Option('All repositories', ''))
-    select.disabled = false
-    note.textContent = ''
-    setBusy('')
-    return
-  }
-  select.replaceChildren(new Option('loading repositories…', ''))
-  select.disabled = true
-  note.textContent = `loading repositories of ${org}${within}…`
-  setBusy('loading repositories…')
+  const choice = { days, names: [], done: false, note: `loading repositories of ${owner}${within}…`, cls: 'dim' }
+  repoChoices.set(key, choice)
+  renderAccounts()
   const cutoff = Date.now() - days * 24 * 3600 * 1000
   const names = []
   let failure = ''
   try {
-    let next = await reposURL(org, async url => (await connectGet(url)).data)
+    let next = await reposURL(owner, async url => (await connectGet(url)).data)
     while (next) {
       const page = await connectGet(next)
       if (seq !== repoSeq) return
@@ -705,38 +826,73 @@ async function loadRepos(org, keep) {
         }
         names.push(r.name)
       }
-      note.textContent = `loading repositories of ${org}${within}… ${names.length}`
+      choice.note = `loading repositories of ${owner}${within}… ${names.length}`
+      renderAccounts()
       next = older ? '' : page.next
     }
   } catch (err) {
     if (seq !== repoSeq) return
     failure = err.message
   }
-  if (!failure) repoCache.set(org + '\u0000' + days, { names, expires: Date.now() + REPO_TTL })
-  select.replaceChildren(new Option('All repositories', ''), ...names.map(n => new Option(n, n)))
-  if (keep && names.includes(keep)) select.value = keep
-  select.disabled = false
-  reposFor = org + '\u0000' + days
-  setBusy('')
+  if (!failure) repoCache.set(owner + '\u0000' + days, { names, expires: Date.now() + REPO_TTL })
+  choice.names = names
+  choice.done = !failure
   if (failure) {
-    note.className = 'red'
-    note.textContent = `cannot list repositories of ${org}: ${failure}`
+    choice.cls = 'red'
+    choice.note = `cannot list repositories of ${owner}: ${failure}`
   } else if (!names.length) {
-    note.className = 'yellow'
-    note.textContent = days > 0
+    choice.cls = 'yellow'
+    choice.note = days > 0
       ? `no repositories${within}; raise "Pushed within" or set it to 0`
       : 'this token sees no repositories here; check the token\'s resource owner'
-  } else note.textContent = `${names.length} ${names.length === 1 ? 'repository' : 'repositories'}${within}`
+  } else {
+    choice.cls = 'dim'
+    choice.note = `${names.length} ${names.length === 1 ? 'repository' : 'repositories'}${within}`
+  }
+  renderAccounts()
 }
 
-function target() {
-  return state.repo ? `${state.org}/${state.repo}` : state.org
+async function addOwner() {
+  let name = $('org').value.trim()
+  if (!name) return $('org').focus()
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(name)) {
+    $('loginError').textContent = 'not a GitHub user or organisation name'
+    return $('org').focus()
+  }
+  $('loginError').textContent = ''
+  const known = pickRows().find(a => a.login.toLowerCase() === name.toLowerCase())
+  if (known) name = known.login
+  else {
+    setBusy('checking owner…')
+    try {
+      const { data } = await connectGet(`${API}/users/${encodeURIComponent(name)}`)
+      name = data.login
+      accounts.push({ login: name, kind: data.type === 'Organization' ? 'org' : 'user' })
+    } catch (err) {
+      $('loginError').textContent = `cannot find ${name}: ${err.message}`
+      return $('org').focus()
+    } finally {
+      setBusy('')
+    }
+  }
+  const key = name.toLowerCase()
+  if (!picks.has(key)) picks.set(key, { owner: name, all: true, repos: new Set() })
+  $('org').value = ''
+  renderAccounts()
+}
+
+function targetLabel(targets) {
+  return targets.map(t => t.all ? t.owner : t.repos.length === 1 ? `${t.owner}/${t.repos[0]}` : `${t.owner} (${t.repos.length} repos)`).join(', ')
+}
+
+function repoName(j) {
+  return state.targets.length > 1 ? `${j.owner}/${j.repo}` : j.repo
 }
 
 function filterJobs(jobs, needle) {
   if (!needle) return jobs
   const n = needle.toLowerCase()
-  return jobs.filter(j => [j.repo, j.workflow, j.branch, j.name, j.runner, j.labels].some(f => f.toLowerCase().includes(n)))
+  return jobs.filter(j => [repoName(j), j.workflow, j.branch, j.name, j.runner, j.labels].some(f => f.toLowerCase().includes(n)))
 }
 
 function splitJobs(jobs) {
@@ -751,8 +907,8 @@ function repoCounts(running, queued) {
     if (!map.has(repo)) map.set(repo, { name: repo, running: 0, queued: 0 })
     map.get(repo)[key]++
   }
-  running.forEach(j => add(j.repo, 'running'))
-  queued.forEach(j => add(j.repo, 'queued'))
+  running.forEach(j => add(repoName(j), 'running'))
+  queued.forEach(j => add(repoName(j), 'queued'))
   return [...map.values()].sort((a, b) => b.running - a.running || b.queued - a.queued || a.name.localeCompare(b.name))
 }
 
@@ -803,18 +959,19 @@ function selected() {
 function renderStatus() {
   const s = $('status')
   s.replaceChildren()
-  if (!state.org) {
+  if (!state.targets.length) {
     s.append(el('div', 'dim', 'not connected'))
     return renderInfo()
   }
-  const first = el('div')
-  first.append(el('span', 'cyan bold', target()), el('span', 'dim', ` · ${state.progress.total >= 0 ? state.progress.total + ' repos' : '…'} · scanned ${state.lastScan || '-'} UTC`))
+  const owners = el('div', 'line cyan bold', targetLabel(state.targets))
+  owners.title = targetLabel(state.targets)
+  const first = el('div', 'line dim', `${state.progress.total >= 0 ? state.progress.total + ' repos' : '…'} · scanned ${state.lastScan || '-'} UTC`)
   let second
-  if (state.scanning && state.progress.total < 0) second = el('div', 'dim', 'listing repos…')
-  else if (state.scanning) second = el('div', 'dim', `scanning ${state.progress.done}/${state.progress.total} repos`)
-  else if (state.cost) second = el('div', 'dim', `last scan ${state.cost.requests} req, ${state.cost.free} free (304)`)
-  else second = el('div', 'dim', 'no scan yet')
-  s.append(first, second)
+  if (state.scanning && state.progress.total < 0) second = el('div', 'line dim', 'listing repos…')
+  else if (state.scanning) second = el('div', 'line dim', `scanning ${state.progress.done}/${state.progress.total} repos`)
+  else if (state.cost) second = el('div', 'line dim', `last scan ${state.cost.requests} req, ${state.cost.free} free (304)`)
+  else second = el('div', 'line dim', 'no scan yet')
+  s.append(owners, first, second)
   if (state.error) s.append(el('div', 'red', state.error))
   const failed = state.cost ? Object.entries(state.cost.failed) : []
   if (failed.length) {
@@ -822,7 +979,7 @@ function renderStatus() {
     s.append(el('div', 'red', `${failed.reduce((t, [, n]) => t + n, 0)} requests refused (${counts}): ${state.cost.message}`))
   }
   if (!state.scanning && state.cost && state.progress.total === 0)
-    s.append(el('div', 'yellow', `this token sees no repos in ${state.org} pushed in the last ${state.days} days; check the token's resource owner`))
+    s.append(el('div', 'yellow', `this token sees no repos in ${targetLabel(state.targets)} pushed in the last ${state.days} days; check the token's resource owner`))
   renderInfo()
 }
 
@@ -830,8 +987,8 @@ function renderInfo() {
   const info = $('info')
   info.replaceChildren()
   const u = state.usage
-  if (!state.org) return
-  const parts = [el('span', 'cyan bold', target()), el('span', '', ` · next ${state.scanning ? '…' : state.nextIn + 's'}`)]
+  if (!state.targets.length) return
+  const parts = [el('span', 'cyan bold', targetLabel(state.targets)), el('span', '', ` · next ${state.scanning ? '…' : state.nextIn + 's'}`)]
   if (u.limit) {
     const cls = u.remaining < u.limit * 0.1 ? 'red' : u.remaining < u.limit * 0.3 ? 'yellow' : 'green'
     parts.push(el('span', '', ' · '), el('span', cls, `api ${u.remaining}/${u.limit}`), el('span', '', ` · resets ${new Date(u.reset * 1000).toISOString().slice(11, 16)} UTC`))
@@ -888,11 +1045,11 @@ function renderLists() {
   $('runFoot').textContent = state.running.length ? `${state.cursor[0] + 1} of ${state.running.length}` : ''
   $('qFoot').textContent = state.queued.length ? `${state.cursor[1] + 1} of ${state.queued.length}` : ''
   renderTable('runTable', 0, [['Runner', '28%'], ['Repo', '26%'], ['Job', '32%'], ['Elapsed', '14%']], j => [
-    [j.runner, 'green'], [j.repo, ''], [j.name, ''], [j.startedAt ? fmtElapsed(now - j.startedAt) : '-', ''],
+    [j.runner, 'green'], [repoName(j), ''], [j.name, ''], [j.startedAt ? fmtElapsed(now - j.startedAt) : '-', ''],
   ])
   renderTable('qTable', 1, [['Wait', '12%'], ['Repo', '26%'], ['Job', '32%'], ['Labels', '30%']], j => {
     const mins = j.createdAt ? Math.floor((now - j.createdAt) / 60000) : -1
-    return [[mins >= 0 ? mins + 'm' : '-', waitClass(mins)], [j.repo, ''], [j.name, ''], [j.labels, '']]
+    return [[mins >= 0 ? mins + 'm' : '-', waitClass(mins)], [repoName(j), ''], [j.name, ''], [j.labels, '']]
   })
 }
 
@@ -909,7 +1066,7 @@ function renderDetail() {
   $('detailPanel').querySelector('h2').textContent = j ? `Job · ${j.status === 'in_progress' ? 'running' : 'queued'}` : 'Job'
   if (!j) return box.append(el('div', 'dim', 'no job selected'))
   const now = Date.now()
-  box.append(el('div', 'title', `${j.repo} › ${j.workflow} › ${j.name}`))
+  box.append(el('div', 'title', `${repoName(j)} › ${j.workflow} › ${j.name}`))
   const rows = [['Status', j.status === 'in_progress' ? 'running' : j.status, j.status === 'in_progress' ? 'green bold' : 'yellow bold']]
   if (j.status === 'in_progress') {
     rows.push(['Runner', j.runner || '-', 'green'])
@@ -926,7 +1083,7 @@ function renderDetail() {
     wrap.append(el('div', 'dim', busy.length ? 'Busy runners with these labels' : 'No running job shares these labels: runners may be offline'))
     for (const r of busy) {
       const row = el('div', 'row')
-      row.append(el('span', 'green', r.runner), el('span', '', `${r.repo} › ${r.name}`), el('span', '', r.startedAt ? fmtElapsed(now - r.startedAt) : '-'))
+      row.append(el('span', 'green', r.runner), el('span', '', `${repoName(r)} › ${r.name}`), el('span', '', r.startedAt ? fmtElapsed(now - r.startedAt) : '-'))
       wrap.append(row)
     }
     box.append(wrap)
@@ -1017,30 +1174,27 @@ function submitConnect(e) {
   if ($('submit').disabled) return
   if (!$('stepUnlock').hidden) return submitUnlock()
   if (!$('stepToken').hidden) return submitToken()
-  const org = $('org').value.trim()
-  if (!org) {
-    $('loginError').textContent = 'pick or type an owner'
-    return $('org').focus()
+  if ($('org').value.trim()) return addOwner()
+  if (!selection().length) {
+    $('loginError').textContent = 'tick at least one account or repository'
+    return ($('accounts').querySelector('input') || $('org')).focus()
   }
   $('loginError').textContent = ''
-  if (repoKey(org) !== reposFor) return loadRepos(org, $('repo').value)
   start()
 }
 
 function start() {
-  const org = $('org').value.trim()
-  const repo = $('repo').value
-  if (!org || !token) return
+  const targets = selection()
+  if (!targets.length || !token) return
   state.scanId++
   state.scanning = false
-  state.org = org
-  state.repo = repo
+  state.targets = targets
   state.days = Math.max(0, parseInt($('days').value, 10) || 0)
   state.interval = Math.max(MIN_INTERVAL, parseInt($('interval').value, 10) || INTERVAL)
   state.nextIn = state.interval
   saveSettings()
   if (hasSession()) keepSession(token, currentView())
-  sealVault(token, { org: state.org, repo: state.repo, days: state.days, interval: state.interval }).catch(() => {})
+  sealVault(token, currentView()).catch(() => {})
   state.jobs = []
   state.cost = null
   state.lastScan = ''
@@ -1089,15 +1243,14 @@ function init() {
     $('rememberFields').hidden = !$('remember').checked
     if ($('remember').checked) $('newPass').focus()
   })
-  const reloadRepos = () => {
-    clearTimeout(orgTimer)
-    orgTimer = setTimeout(() => {
-      const org = $('org').value.trim()
-      if (org && repoKey(org) !== reposFor) loadRepos(org, $('repo').value)
+  $('addOwner').addEventListener('click', addOwner)
+  $('days').addEventListener('input', () => {
+    clearTimeout(daysTimer)
+    daysTimer = setTimeout(() => {
+      const owner = pickRows().find(a => a.login.toLowerCase() === openOwner)
+      if (owner) loadRepoChoices(owner.login)
     }, 500)
-  }
-  $('org').addEventListener('input', reloadRepos)
-  $('days').addEventListener('input', reloadRepos)
+  })
   $('filter').addEventListener('input', () => {
     state.filter = $('filter').value
     refresh()

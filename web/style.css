@@ -73,6 +73,17 @@ select { font: inherit; color: var(--fg); background: #161b22; border: 1px solid
 .connect .unit input { width: 6em; flex: none; }
 .connect .hint { margin: 0 0 2px calc(9.5em + 8px); color: var(--dim); font-size: 12px; }
 #rememberFields:not([hidden]) { display: grid; gap: 8px; }
+.connect .pick-head { display: flex; justify-content: space-between; gap: 8px; }
+.connect .accounts { border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; display: grid; gap: 4px; max-height: 40vh; overflow-y: auto; }
+.connect .acct { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.connect .acct label.check { flex: 1; min-width: 0; }
+.connect .acct .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connect .acct .kind { width: 3.5em; flex: none; }
+.connect .acct .count { flex: none; }
+.connect .repolist { display: grid; gap: 2px; padding: 2px 0 6px 26px; }
+.connect .unit #org { width: auto; flex: 1; }
+.connect .unit .kbtn { flex: none; padding: 4px 10px; background: transparent; color: var(--cyan); border: 1px solid var(--border); font-weight: 400; }
+#status .line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 520px) {
   .connect label { grid-template-columns: minmax(0, 1fr); gap: 4px; }
   .connect .hint { margin-left: 0; }

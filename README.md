@@ -38,7 +38,7 @@ Queued and running jobs with the same labels: runners are **busy**. Queued with 
 ## Web version
 
 1. Open the [page](https://bbestbest.github.io/gh-runners-scan/) and paste a fine-grained token: resource owner = the account that owns the repos, **Actions: Read-only**, with an expiry date.
-2. Pick the owner, optionally a repo, and the settings.
+2. Choose what to scan, same as `O` in the TUI: tick accounts (all their repos) or open "repos" to tick single ones; "Add owner" adds any other user or organisation. Several owners show repos as `owner/repo`.
 3. Optional: tick "Remember". The token is stored encrypted under a passphrase that is never stored. Let Chrome save the passphrase, and later visits open straight to the dashboard. Within a tab, the unlocked token and view are kept encrypted too (AES-GCM under a random, non-exportable key in IndexedDB), so nothing readable is ever written to browser storage.
 
 The page talks only to `api.github.com` and never changes anything. It's free to host on a public repo.
