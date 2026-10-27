@@ -16,7 +16,9 @@ const SESSION_KEY = 'gh-runner:session'
 
 const PM_USER = 'gh-runner'
 
-const VIEW_KEY = 'gh-runner:view'
+const LEGACY_VIEW_KEY = 'gh-runner:view'
+
+const KEY_DB = 'gh-runner'
 
 const KDF_ITERATIONS = 600000
 
@@ -418,7 +420,7 @@ async function submitToken() {
     setBusy('encrypting token…')
     try {
       await saveToken(value, pass, account.login)
-      keepSession(value)
+      await keepSession(value)
       await offerToPasswordManager(pass)
     } catch (err) {
       $('loginError').textContent = `token works but could not be saved: ${err.message}`
@@ -460,7 +462,7 @@ async function submitUnlock() {
   $('unlockPass').value = ''
   const result = await verifyToken(opened.token)
   if (result === 'ok') {
-    keepSession(opened.token)
+    await keepSession(opened.token, opened.view)
     return applyView(opened.view) || showConfig()
   }
   if (result === 'rejected') {
@@ -542,39 +544,67 @@ async function passwordFromManager() {
   }
 }
 
-function keepSession(value) {
+function keyStore(mode, run) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open(KEY_DB, 1)
+    open.onupgradeneeded = () => open.result.createObjectStore('keys')
+    open.onerror = () => reject(open.error)
+    open.onsuccess = () => {
+      const tx = open.result.transaction('keys', mode)
+      const req = run(tx.objectStore('keys'))
+      tx.oncomplete = () => resolve(req.result)
+      tx.onerror = () => reject(tx.error)
+    }
+  })
+}
+
+async function sessionKey() {
+  const existing = await keyStore('readonly', store => store.get('session'))
+  if (existing) return existing
+  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'])
+  await keyStore('readwrite', store => store.put(key, 'session'))
+  return key
+}
+
+function currentView() {
+  return { org: state.org, repo: state.repo, days: state.days, interval: state.interval }
+}
+
+async function keepSession(value, view) {
   try {
-    sessionStorage.setItem(SESSION_KEY, value)
+    const key = await sessionKey()
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify({ token: value, view: view || null })))
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify({ iv: b64(iv), data: b64(data) }))
   } catch {}
 }
 
-function sessionToken() {
+async function readSession() {
   try {
-    return sessionStorage.getItem(SESSION_KEY) || ''
+    const raw = JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null')
+    if (!raw || !raw.iv || !raw.data) return null
+    const key = await sessionKey()
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(raw.iv) }, key, unb64(raw.data))
+    const payload = JSON.parse(new TextDecoder().decode(plain))
+    return typeof payload.token === 'string' && payload.token ? payload : null
   } catch {
-    return ''
+    return null
+  }
+}
+
+function hasSession() {
+  try {
+    return sessionStorage.getItem(SESSION_KEY) !== null
+  } catch {
+    return false
   }
 }
 
 function dropSession() {
   try {
     sessionStorage.removeItem(SESSION_KEY)
-    sessionStorage.removeItem(VIEW_KEY)
+    sessionStorage.removeItem(LEGACY_VIEW_KEY)
   } catch {}
-}
-
-function keepView() {
-  try {
-    sessionStorage.setItem(VIEW_KEY, JSON.stringify({ org: state.org, repo: state.repo, days: state.days, interval: state.interval }))
-  } catch {}
-}
-
-function restoreView() {
-  let view = null
-  try {
-    view = JSON.parse(sessionStorage.getItem(VIEW_KEY) || 'null')
-  } catch {}
-  return applyView(view)
 }
 
 function applyView(view) {
@@ -597,9 +627,9 @@ async function resumeSession() {
     dropSession()
     return openConnect()
   }
-  const kept = sessionToken()
-  let opened = kept ? { token: kept, view: null } : null
+  let opened = await readSession()
   if (!opened) {
+    dropSession()
     const pass = await passwordFromManager()
     if (!pass) return openConnect()
     statusNote('unlocking with the saved passphrase…')
@@ -612,8 +642,8 @@ async function resumeSession() {
   statusNote('checking token…')
   const result = await verifyToken(opened.token)
   if (result === 'ok') {
-    keepSession(opened.token)
-    return (kept ? restoreView() : applyView(opened.view)) || openConnect()
+    await keepSession(opened.token, opened.view)
+    return applyView(opened.view) || openConnect()
   }
   if (result === 'rejected') {
     forgetToken()
@@ -1009,7 +1039,7 @@ function start() {
   state.interval = Math.max(MIN_INTERVAL, parseInt($('interval').value, 10) || INTERVAL)
   state.nextIn = state.interval
   saveSettings()
-  if (sessionToken()) keepView()
+  if (hasSession()) keepSession(token, currentView())
   sealVault(token, { org: state.org, repo: state.repo, days: state.days, interval: state.interval }).catch(() => {})
   state.jobs = []
   state.cost = null
