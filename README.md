@@ -170,7 +170,7 @@ curl -s -D- -o /dev/null -H "Authorization: token $(gh auth token)" \
 - Paste an organisation and a token. The token lives only in the tab's memory: it is never written to storage or the URL, and a reload or closing the tab drops it. A `401` clears it and returns to the form.
 - Use a fine-grained token with **Actions: read** on the organisation's repositories. The page never cancels or changes anything.
 - A Content-Security-Policy limits the page to its own files and lets it connect only to `https://api.github.com`. API text is inserted as plain text, and only job links starting with `https://github.com/` are opened.
-- The org and days go in the URL hash (`#org=<org>&days=7`), so a bookmark skips typing them.
+- The organisation field starts empty on every load; the org is never written to the URL.
 - Same scan and costs as the CLI: 6 parallel requests, ETag cache (304s are free), repo list cached 12 minutes, rescan 15s after each scan. Keys: `j`/`k`, `g`/`G`, `h`/`l`/`1`/`2`, `enter`/`o`, `/`, `esc`, `r`.
 - All your Pages sites share the `<user>.github.io` origin. That is why the token is never stored.
 

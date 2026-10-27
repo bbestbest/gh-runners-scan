@@ -481,11 +481,6 @@ function tick() {
   renderDetail()
 }
 
-function readHash() {
-  const params = new URLSearchParams(location.hash.slice(1))
-  return { org: params.get('org') || '', days: params.get('days') }
-}
-
 function start(e) {
   e.preventDefault()
   const org = $('org').value.trim()
@@ -498,7 +493,6 @@ function start(e) {
   state.jobs = []
   state.error = ''
   state.usage = { limit: 0, remaining: 0, reset: 0 }
-  history.replaceState(null, '', `#org=${encodeURIComponent(org)}&days=${state.days}`)
   $('login').hidden = true
   $('app').hidden = false
   $('loginError').textContent = ''
@@ -507,9 +501,6 @@ function start(e) {
 }
 
 function init() {
-  const { org, days } = readHash()
-  if (org) $('org').value = org
-  if (days !== null && days !== '') $('days').value = days
   renderHints()
   $('login').addEventListener('submit', start)
   $('filter').addEventListener('input', () => {
@@ -518,7 +509,7 @@ function init() {
   })
   document.addEventListener('keydown', onKey)
   setInterval(tick, 1000)
-  ;(org ? $('token') : $('org')).focus()
+  $('org').focus()
 }
 
 init()
