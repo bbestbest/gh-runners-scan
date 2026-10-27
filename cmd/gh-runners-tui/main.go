@@ -17,10 +17,10 @@ import (
 func main() {
 	cfg := config.Load()
 
-	org, args := splitOrg(os.Args[1:], envOrg(cfg))
+	org, args := splitOrg(os.Args[1:], cfg.Org)
 
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: gh-runner [org] [flags]")
+		fmt.Fprintln(os.Stderr, "usage: gh-runner [owner] [flags]")
 		flag.PrintDefaults()
 	}
 	label := flag.String("label", "", "filter jobs by runner label substring")
@@ -30,11 +30,12 @@ func main() {
 	once := flag.Bool("once", false, "print tables once and exit")
 	flag.CommandLine.Parse(args)
 
-	opts := options{org: org, label: *label, days: *days, interval: *interval, repo: *repo}
+	owner, ownerErr := resolveOwner(org)
+	opts := options{org: owner, label: *label, days: *days, interval: *interval, repo: *repo}
 
 	if *once {
-		if org == "" {
-			fmt.Fprintln(os.Stderr, "gh-runner: "+noOrgHint())
+		if ownerErr != nil {
+			fmt.Fprintln(os.Stderr, "gh-runner: "+noOwnerHint(ownerErr))
 			os.Exit(1)
 		}
 		printOnce(opts)
@@ -47,18 +48,19 @@ func main() {
 	}
 }
 
-func noOrgHint() string {
+func noOwnerHint(err error) string {
+	hint := "no owner given and " + err.Error() + ". Pass a user or organisation as the first argument"
 	if path := config.Path(); path != "" {
-		return "no org given; pass one as the first argument, set GH_RUNNERS_ORG, or set org in " + path
+		hint += ", or set org in " + path
 	}
-	return "no org given; pass one as the first argument or set GH_RUNNERS_ORG"
+	return hint
 }
 
-func envOrg(cfg config.Config) string {
-	if v := os.Getenv("GH_RUNNERS_ORG"); v != "" {
-		return v
+func resolveOwner(owner string) (string, error) {
+	if owner != "" {
+		return owner, nil
 	}
-	return cfg.Org
+	return scan.Login(context.Background())
 }
 
 func envDays(cfg config.Config) int {

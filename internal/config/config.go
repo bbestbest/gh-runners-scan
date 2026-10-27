@@ -120,32 +120,6 @@ func SetOrg(org string) error {
 	return writeFileAtomic(path, text)
 }
 
-func RemoveOrg(org string) error {
-	path := Path()
-	if path == "" {
-		return errors.New("config: no path for the config file")
-	}
-	existing, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	text := string(existing)
-	orgs := parse(text).Orgs
-	kept := make([]string, 0, len(orgs))
-	for _, o := range orgs {
-		if o != org {
-			kept = append(kept, o)
-		}
-	}
-	if len(kept) == len(orgs) {
-		return nil
-	}
-	return writeFileAtomic(path, replaceKey(text, "orgs", strings.Join(kept, ", ")))
-}
-
 func replaceKey(text, key, value string) string {
 	line := key + " = " + value + "\n"
 	if strings.TrimSpace(text) == "" {

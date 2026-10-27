@@ -5,7 +5,6 @@ import (
 	"errors"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -157,139 +156,6 @@ func typeRunes(m model, s string) model {
 	return m
 }
 
-func TestOrgOverlayStartupState(t *testing.T) {
-	tests := []struct {
-		name string
-		org  string
-		want bool
-	}{
-		{"empty org opens overlay", "", true},
-		{"supplied org skips overlay", "org-a", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			m := newModel(options{org: tt.org, interval: 30})
-			if m.orgActive != tt.want {
-				t.Errorf("orgActive = %v, want %v", m.orgActive, tt.want)
-			}
-			if m.scanning == (tt.org == "") {
-				t.Errorf("scanning = %v for org %q", m.scanning, tt.org)
-			}
-		})
-	}
-}
-
-func TestOrgOverlayEnterStartsScan(t *testing.T) {
-	m := newModel(options{interval: 30})
-	m = typeRunes(m, "org-a")
-
-	next, cmd := m.Update(key("enter"))
-	m = next.(model)
-
-	if m.opts.org != "org-a" {
-		t.Fatalf("org = %q, want org-a", m.opts.org)
-	}
-	if m.orgActive {
-		t.Error("overlay still active after enter")
-	}
-	if cmd == nil {
-		t.Error("enter with valid org did not trigger a scan")
-	}
-	if !m.scanning {
-		t.Error("scanning = false after accepting an org")
-	}
-}
-
-func TestOrgOverlayRejectsBlank(t *testing.T) {
-	for _, in := range []string{"", "   "} {
-		m := newModel(options{interval: 30})
-		m = typeRunes(m, in)
-
-		next, cmd := m.Update(key("enter"))
-		m = next.(model)
-
-		if !m.orgActive {
-			t.Errorf("overlay closed on blank input %q", in)
-		}
-		if m.opts.org != "" {
-			t.Errorf("org = %q after blank input %q", m.opts.org, in)
-		}
-		if cmd != nil {
-			t.Errorf("blank input %q returned a command", in)
-		}
-		if m.scanning {
-			t.Errorf("scanning started on blank input %q", in)
-		}
-	}
-}
-
-func TestOrgOverlayEscape(t *testing.T) {
-	m := newModel(options{interval: 30})
-	_, cmd := m.Update(key("esc"))
-	if cmd == nil {
-		t.Fatal("esc with no org set did not quit")
-	}
-	if msg := cmd(); msg != tea.Quit() {
-		t.Errorf("esc with no org sent %T, want quit", msg)
-	}
-
-	withOrg := newTestModel(t)
-	withOrg = send(withOrg, key("O"))
-	if !withOrg.orgActive {
-		t.Fatal("O did not open the overlay")
-	}
-	if got := withOrg.orgInput.Value(); got != "" {
-		t.Errorf("overlay value = %q, want an empty field", got)
-	}
-
-	next, cmd := withOrg.Update(key("esc"))
-	withOrg = next.(model)
-	if withOrg.orgActive {
-		t.Error("overlay still active after esc with an org set")
-	}
-	if withOrg.opts.org != "org-c" {
-		t.Errorf("org = %q after esc, want org-c", withOrg.opts.org)
-	}
-	if cmd != nil {
-		t.Error("esc with an org set returned a command")
-	}
-}
-
-func TestOrgOverlayChangeWhileRunning(t *testing.T) {
-	m := newTestModel(t)
-	m = send(m, key("O"))
-	m = typeRunes(m, "org-b")
-
-	next, cmd := m.Update(key("enter"))
-	m = next.(model)
-
-	if m.opts.org != "org-b" {
-		t.Fatalf("org = %q, want org-b", m.opts.org)
-	}
-	if cmd == nil {
-		t.Error("changing org did not trigger a rescan")
-	}
-	if len(m.jobs) != 0 {
-		t.Errorf("jobs = %d after org change, want 0", len(m.jobs))
-	}
-	if !strings.Contains(m.statusView(), "org-b") {
-		t.Error("key bar does not show the new org")
-	}
-}
-
-func TestOrgOverlayViewReplacesBody(t *testing.T) {
-	m := newModel(options{interval: 30})
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
-	view := next.(model).View()
-
-	if !strings.Contains(view, "org:") {
-		t.Error("overlay view missing the org prompt")
-	}
-	if strings.Contains(view, "Running (") {
-		t.Error("panels rendered while the overlay is active")
-	}
-}
-
 func TestViewContents(t *testing.T) {
 	m := newTestModel(t)
 	view := m.View()
@@ -297,603 +163,6 @@ func TestViewContents(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Errorf("view missing %q", want)
 		}
-	}
-}
-
-func TestOrgOverlayPersistsOrg(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-
-	m := newModel(options{interval: 30})
-	m = typeRunes(m, "org-a")
-	next, _ := m.Update(key("enter"))
-	m = next.(model)
-
-	if m.saveErr != nil {
-		t.Fatalf("saveErr = %v, want nil", m.saveErr)
-	}
-	if got := config.Load().Org; got != "org-a" {
-		t.Errorf("persisted org = %q, want org-a", got)
-	}
-}
-
-func TestOrgOverlaySwitchPersistsOrg(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	if err := config.SetOrg("org-c"); err != nil {
-		t.Fatal(err)
-	}
-
-	m := newTestModel(t)
-	m = send(m, key("O"))
-	m = typeRunes(m, "org-b")
-	next, _ := m.Update(key("enter"))
-	m = next.(model)
-
-	if got := config.Load().Org; got != "org-b" {
-		t.Errorf("persisted org = %q, want org-b", got)
-	}
-}
-
-func TestOrgOverlayReconfirmPersistsOrg(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-
-	m := newTestModel(t)
-	m = send(m, key("O"))
-	m = typeRunes(m, "org-c")
-	next, _ := m.Update(key("enter"))
-	m = next.(model)
-
-	if m.opts.org != "org-c" {
-		t.Fatalf("org = %q, want org-c", m.opts.org)
-	}
-	if got := config.Load().Org; got != "org-c" {
-		t.Errorf("persisted org = %q, want org-c", got)
-	}
-}
-
-func TestOrgOverlayEmptyEnterKeepsOrgWithoutSaving(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-
-	m := newTestModel(t)
-	m = send(m, key("O"))
-	next, cmd := m.Update(key("enter"))
-	m = next.(model)
-
-	if m.opts.org != "org-c" {
-		t.Errorf("org = %q, want org-c kept in session", m.opts.org)
-	}
-	if m.orgActive {
-		t.Error("overlay still active after an empty enter")
-	}
-	if cmd != nil {
-		t.Error("an empty enter triggered a rescan")
-	}
-	if got := config.Load().Org; got != "" {
-		t.Errorf("persisted org = %q, want empty: an empty enter is a cancel", got)
-	}
-}
-
-func TestOrgOverlaySaveFailureKeepsSessionUsable(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir)
-	if err := os.WriteFile(filepath.Join(dir, "gh-runners"), []byte("not a dir"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	m := newModel(options{interval: 30})
-	m = typeRunes(m, "org-a")
-	next, cmd := m.Update(key("enter"))
-	m = next.(model)
-
-	if m.saveErr == nil {
-		t.Fatal("saveErr = nil, want an error")
-	}
-	if m.opts.org != "org-a" {
-		t.Errorf("org = %q, want org-a applied in-session despite the save failure", m.opts.org)
-	}
-	if m.orgActive {
-		t.Error("overlay still active after a failed save")
-	}
-	if !m.scanning {
-		t.Error("scanning = false after a failed save")
-	}
-	if cmd == nil {
-		t.Error("a failed save suppressed the scan")
-	}
-	if !strings.Contains(m.statusView(), "org not saved") {
-		t.Error("status line does not surface the save failure")
-	}
-}
-
-func TestOrgOverlayBlankDoesNotPersist(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-
-	m := newModel(options{interval: 30})
-	m = typeRunes(m, "   ")
-	next, _ := m.Update(key("enter"))
-	m = next.(model)
-
-	if got := config.Load().Org; got != "" {
-		t.Errorf("persisted org = %q, want empty", got)
-	}
-	if !m.orgActive {
-		t.Error("overlay closed on blank input")
-	}
-}
-
-func TestOrgOverlayEscDoesNotPersist(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-
-	m := newTestModel(t)
-	m = send(m, key("O"))
-	m = typeRunes(m, "org-b")
-	next, _ := m.Update(key("esc"))
-	m = next.(model)
-
-	if got := config.Load().Org; got != "" {
-		t.Errorf("persisted org = %q, want empty after esc", got)
-	}
-	if m.opts.org != "org-c" {
-		t.Errorf("org = %q, want org-c", m.opts.org)
-	}
-}
-
-func orgModel(t *testing.T, org string, history ...string) model {
-	t.Helper()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	for i := len(history) - 1; i >= 0; i-- {
-		if err := config.SetOrg(history[i]); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if org != "" {
-		if err := config.SetOrg(org); err != nil {
-			t.Fatal(err)
-		}
-	}
-	m := newModel(options{org: org, interval: 30})
-	if org != "" {
-		m = send(m, key("O"))
-	}
-	return m
-}
-
-func TestOrgOverlayCursorWalksHistory(t *testing.T) {
-	m := orgModel(t, "one", "two", "three")
-
-	if want := []string{"one", "two", "three"}; !reflect.DeepEqual(m.orgs, want) {
-		t.Fatalf("orgs = %v, want %v", m.orgs, want)
-	}
-	if m.orgCursor != -1 {
-		t.Fatalf("initial cursor = %d, want -1", m.orgCursor)
-	}
-
-	steps := []struct {
-		key    string
-		cursor int
-		value  string
-	}{
-		{"down", 0, "one"},
-		{"down", 1, "two"},
-		{"down", 2, "three"},
-		{"down", 2, "three"},
-		{"up", 1, "two"},
-		{"up", 0, "one"},
-		{"up", -1, ""},
-	}
-	for _, s := range steps {
-		m = send(m, key(s.key))
-		if m.orgCursor != s.cursor {
-			t.Errorf("after %s cursor = %d, want %d", s.key, m.orgCursor, s.cursor)
-		}
-		if got := m.orgInput.Value(); got != s.value {
-			t.Errorf("after %s value = %q, want %q", s.key, got, s.value)
-		}
-	}
-}
-
-func TestOrgOverlayEnterAcceptsHighlightedRow(t *testing.T) {
-	m := orgModel(t, "one", "two", "three")
-	m = send(m, key("down"))
-	m = send(m, key("down"))
-
-	next, cmd := m.Update(key("enter"))
-	m = next.(model)
-
-	if m.opts.org != "two" {
-		t.Fatalf("org = %q, want two", m.opts.org)
-	}
-	if cmd == nil {
-		t.Error("picking a different org did not trigger a rescan")
-	}
-	if got := config.Load().Org; got != "two" {
-		t.Errorf("persisted org = %q, want two", got)
-	}
-	if m.orgCursor != -1 {
-		t.Errorf("cursor = %d after accepting, want -1", m.orgCursor)
-	}
-	if want := []string{"two", "one", "three"}; !reflect.DeepEqual(m.orgs, want) {
-		t.Errorf("orgs = %v, want %v", m.orgs, want)
-	}
-}
-
-func TestOrgOverlayTypingBeatsHighlightedRow(t *testing.T) {
-	m := orgModel(t, "one", "two", "three")
-	m = send(m, key("down"))
-	m = send(m, key("down"))
-	if m.orgCursor != 1 {
-		t.Fatalf("cursor = %d, want 1", m.orgCursor)
-	}
-
-	for range "two" {
-		m = send(m, tea.KeyMsg{Type: tea.KeyBackspace})
-	}
-	m = typeRunes(m, "typed")
-	if m.orgCursor != -1 {
-		t.Fatalf("cursor = %d after typing, want -1", m.orgCursor)
-	}
-
-	next, _ := m.Update(key("enter"))
-	m = next.(model)
-
-	if m.opts.org != "typed" {
-		t.Errorf("org = %q, want typed", m.opts.org)
-	}
-}
-
-func TestOrgOverlayArrowsDoNotBreakTyping(t *testing.T) {
-	m := orgModel(t, "one", "two")
-	m = typeRunes(m, "jk")
-
-	if got := m.orgInput.Value(); got != "jk" {
-		t.Errorf("value = %q, want jk typed literally", got)
-	}
-	if m.orgCursor != -1 {
-		t.Errorf("cursor = %d, want -1 after typing", m.orgCursor)
-	}
-}
-
-func TestOrgOverlayEmptyHistoryRendersCleanly(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-
-	m := newModel(options{interval: 30})
-	if len(m.orgs) != 0 {
-		t.Fatalf("orgs = %v, want empty", m.orgs)
-	}
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
-	m = next.(model)
-
-	if got := m.orgListView(); got != "" {
-		t.Errorf("org list = %q, want empty", got)
-	}
-	overlay := m.orgOverlayView()
-	if !strings.Contains(overlay, "org:") {
-		t.Error("overlay missing the org prompt")
-	}
-	if strings.Contains(overlay, "> ") {
-		t.Error("empty history rendered a cursor row")
-	}
-	if strings.Contains(overlay, "(saved)") {
-		t.Error("empty history rendered a saved marker")
-	}
-
-	m = send(m, key("down"))
-	if m.orgCursor != -1 {
-		t.Errorf("cursor = %d on empty history, want -1", m.orgCursor)
-	}
-}
-
-func TestOrgOverlayListMarksSavedAndCursor(t *testing.T) {
-	m := orgModel(t, "one", "two")
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
-	m = next.(model)
-
-	list := m.orgListView()
-	if !strings.Contains(list, "(saved)") {
-		t.Errorf("list does not mark the saved org: %q", list)
-	}
-	if strings.Contains(list, ">") {
-		t.Errorf("list shows a cursor before navigating: %q", list)
-	}
-
-	m = send(m, key("down"))
-	if got := m.orgListView(); !strings.Contains(got, "> one") {
-		t.Errorf("list does not mark the cursor row: %q", got)
-	}
-}
-
-func TestOrgOverlayListCapsRenderedRows(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	for i := 12; i >= 1; i-- {
-		if err := config.SetOrg("org" + strconv.Itoa(i)); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	m := newModel(options{org: "org1", interval: 30})
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
-	m = next.(model)
-	m = send(m, key("O"))
-
-	if len(m.orgs) != 10 {
-		t.Fatalf("orgs = %d, want 10", len(m.orgs))
-	}
-	rows := strings.Count(m.orgListView(), "\n") + 1
-	if rows > maxOrgRows {
-		t.Errorf("rendered rows = %d, want at most %d", rows, maxOrgRows)
-	}
-
-	for i := 0; i < 10; i++ {
-		m = send(m, key("down"))
-	}
-	if !strings.Contains(m.orgListView(), "> "+m.orgs[len(m.orgs)-1]) {
-		t.Errorf("last org not visible after scrolling: %q", m.orgListView())
-	}
-}
-
-func TestOrgOverlayShortTerminalStillRendersOneRow(t *testing.T) {
-	m := orgModel(t, "one", "two", "three")
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
-	m = next.(model)
-
-	rows := strings.Count(m.orgListView(), "\n") + 1
-	if rows < 1 {
-		t.Errorf("rendered rows = %d, want at least 1", rows)
-	}
-	if rows > maxOrgRows {
-		t.Errorf("rendered rows = %d, want at most %d", rows, maxOrgRows)
-	}
-}
-
-func TestOrgOverlayDeleteRemovesHighlightedRow(t *testing.T) {
-	m := orgModel(t, "one", "two", "three")
-	m = send(m, key("down"))
-	m = send(m, key("down"))
-	if m.orgCursor != 1 {
-		t.Fatalf("cursor = %d, want 1", m.orgCursor)
-	}
-
-	next, cmd := m.Update(key("x"))
-	m = next.(model)
-
-	if cmd != nil {
-		t.Error("deleting an org returned a command")
-	}
-	if want := []string{"one", "three"}; !reflect.DeepEqual(m.orgs, want) {
-		t.Fatalf("orgs = %v, want %v", m.orgs, want)
-	}
-	if m.saveErr != nil {
-		t.Errorf("saveErr = %v, want nil", m.saveErr)
-	}
-	if got := config.Load().Orgs; !reflect.DeepEqual(got, []string{"one", "three"}) {
-		t.Errorf("persisted orgs = %v, want [one three]", got)
-	}
-}
-
-func TestOrgOverlayDeleteWithNoHighlightTypesTheCharacter(t *testing.T) {
-	m := orgModel(t, "one", "two", "three")
-	if m.orgCursor != -1 {
-		t.Fatalf("cursor = %d, want -1", m.orgCursor)
-	}
-	before := append([]string(nil), m.orgs...)
-
-	m = send(m, key("x"))
-
-	if got := m.orgInput.Value(); !strings.Contains(got, "x") {
-		t.Errorf("input = %q, want it to contain a literal x", got)
-	}
-	if !reflect.DeepEqual(m.orgs, before) {
-		t.Errorf("orgs = %v, want unchanged %v", m.orgs, before)
-	}
-	if m.orgCursor != -1 {
-		t.Errorf("cursor = %d, want -1", m.orgCursor)
-	}
-	if got := config.Load().Orgs; !reflect.DeepEqual(got, before) {
-		t.Errorf("persisted orgs = %v, want unchanged %v", got, before)
-	}
-}
-
-func TestOrgOverlayDeleteSavedOrgKeepsSession(t *testing.T) {
-	m := orgModel(t, "one", "two")
-	m = send(m, key("down"))
-	if m.orgs[m.orgCursor] != "one" {
-		t.Fatalf("cursor row = %q, want one", m.orgs[m.orgCursor])
-	}
-
-	next, cmd := m.Update(key("x"))
-	m = next.(model)
-
-	if cmd != nil {
-		t.Error("deleting the saved org triggered a command")
-	}
-	if m.opts.org != "one" {
-		t.Errorf("opts.org = %q, want one unchanged", m.opts.org)
-	}
-	if want := []string{"two"}; !reflect.DeepEqual(m.orgs, want) {
-		t.Errorf("orgs = %v, want %v", m.orgs, want)
-	}
-	if got := config.Load().Org; got != "one" {
-		t.Errorf("persisted org = %q, want one unchanged", got)
-	}
-	if !m.orgActive {
-		t.Error("overlay closed after a delete")
-	}
-}
-
-func TestOrgOverlayDeleteClampsCursor(t *testing.T) {
-	m := orgModel(t, "one", "two", "three")
-	for i := 0; i < 3; i++ {
-		m = send(m, key("down"))
-	}
-	if m.orgCursor != 2 {
-		t.Fatalf("cursor = %d, want 2", m.orgCursor)
-	}
-
-	m = send(m, key("x"))
-
-	if m.orgCursor != 1 {
-		t.Errorf("cursor = %d, want 1 clamped into range", m.orgCursor)
-	}
-	if m.orgCursor >= len(m.orgs) {
-		t.Fatalf("cursor %d out of range for %v", m.orgCursor, m.orgs)
-	}
-	if got := m.orgInput.Value(); got != m.orgs[m.orgCursor] {
-		t.Errorf("input = %q, want the new cursor row %q", got, m.orgs[m.orgCursor])
-	}
-	if got := m.orgListView(); strings.Contains(got, "three") {
-		t.Errorf("list still shows the deleted org: %q", got)
-	}
-}
-
-func TestOrgOverlayDeleteToEmptyRendersCleanly(t *testing.T) {
-	m := orgModel(t, "one", "two")
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
-	m = next.(model)
-
-	for len(m.orgs) > 0 {
-		m = send(m, key("down"))
-		m = send(m, key("x"))
-	}
-
-	if m.orgCursor != -1 {
-		t.Errorf("cursor = %d on an empty list, want -1", m.orgCursor)
-	}
-	if got := m.orgListView(); got != "" {
-		t.Errorf("list = %q, want empty", got)
-	}
-	if got := m.orgInput.Value(); got != "" {
-		t.Errorf("input = %q, want an empty field", got)
-	}
-	overlay := m.orgOverlayView()
-	if !strings.Contains(overlay, "org:") {
-		t.Error("overlay missing the org prompt after emptying the list")
-	}
-	if strings.Contains(overlay, "> ") {
-		t.Error("empty list rendered a cursor row")
-	}
-	if m.opts.org != "one" {
-		t.Errorf("opts.org = %q, want one unchanged", m.opts.org)
-	}
-}
-
-func TestOrgOverlayDeleteHintIsShown(t *testing.T) {
-	m := orgModel(t, "one", "two")
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
-	m = next.(model)
-	if !strings.Contains(m.orgOverlayView(), "x delete") {
-		t.Error("overlay hint does not mention x delete")
-	}
-}
-
-func TestOrgOverlayOpensWithAnEmptyField(t *testing.T) {
-	t.Run("at startup with no org", func(t *testing.T) {
-		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-		m := newModel(options{interval: 30})
-		if got := m.orgInput.Value(); got != "" {
-			t.Errorf("value = %q, want empty", got)
-		}
-	})
-
-	t.Run("at startup with a saved org", func(t *testing.T) {
-		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-		m := newModel(options{org: "org-c", interval: 30})
-		if got := m.orgInput.Value(); got != "" {
-			t.Errorf("value = %q, want empty even though org is set", got)
-		}
-	})
-
-	t.Run("reopened with O", func(t *testing.T) {
-		m := orgModel(t, "one", "two")
-		if got := m.orgInput.Value(); got != "" {
-			t.Errorf("value = %q, want empty after O", got)
-		}
-		if !m.orgActive {
-			t.Error("O did not open the overlay")
-		}
-	})
-
-	t.Run("saved org still listed", func(t *testing.T) {
-		m := orgModel(t, "one", "two")
-		next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
-		m = next.(model)
-		list := m.orgListView()
-		if !strings.Contains(list, "one") {
-			t.Errorf("list does not show the saved org: %q", list)
-		}
-		if !strings.Contains(list, "(saved)") {
-			t.Errorf("list does not mark the saved org: %q", list)
-		}
-	})
-
-	t.Run("placeholder visible while empty", func(t *testing.T) {
-		m := orgModel(t, "one", "two")
-		next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
-		m = next.(model)
-		if !strings.Contains(m.orgOverlayView(), "organisation") {
-			t.Error("overlay does not show the organisation placeholder")
-		}
-	})
-
-	t.Run("reopening after a pick is empty again", func(t *testing.T) {
-		m := orgModel(t, "one", "two")
-		m = send(m, key("down"))
-		m = send(m, key("down"))
-		next, _ := m.Update(key("enter"))
-		m = next.(model)
-		if m.opts.org != "two" {
-			t.Fatalf("org = %q, want two", m.opts.org)
-		}
-		m = send(m, key("O"))
-		if got := m.orgInput.Value(); got != "" {
-			t.Errorf("value = %q, want empty on reopen", got)
-		}
-	})
-}
-
-func TestOrgOverlayBlankEnterUnchangedWithEmptyField(t *testing.T) {
-	t.Run("no org set rejects", func(t *testing.T) {
-		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-		m := newModel(options{interval: 30})
-		next, cmd := m.Update(key("enter"))
-		m = next.(model)
-		if !m.orgActive {
-			t.Error("overlay closed on an empty field with no org set")
-		}
-		if cmd != nil {
-			t.Error("empty field with no org set returned a command")
-		}
-		if m.opts.org != "" {
-			t.Errorf("org = %q, want empty", m.opts.org)
-		}
-	})
-
-	t.Run("org set keeps it and closes", func(t *testing.T) {
-		m := orgModel(t, "one", "two")
-		next, cmd := m.Update(key("enter"))
-		m = next.(model)
-		if m.orgActive {
-			t.Error("overlay still active after enter on an empty field")
-		}
-		if m.opts.org != "one" {
-			t.Errorf("org = %q, want one kept", m.opts.org)
-		}
-		if cmd != nil {
-			t.Error("empty-field enter triggered a rescan")
-		}
-	})
-}
-
-func TestOrgOverlayArrowPastTopClearsField(t *testing.T) {
-	m := orgModel(t, "one", "two")
-	m = send(m, key("down"))
-	if got := m.orgInput.Value(); got != "one" {
-		t.Fatalf("value = %q, want one copied in", got)
-	}
-	m = send(m, key("up"))
-	if m.orgCursor != -1 {
-		t.Fatalf("cursor = %d, want -1", m.orgCursor)
-	}
-	if got := m.orgInput.Value(); got != "" {
-		t.Errorf("value = %q, want empty after arrowing past the top", got)
 	}
 }
 
@@ -1197,19 +466,6 @@ func TestCancelKeysIgnoredWhileFilterActive(t *testing.T) {
 	}
 }
 
-func TestCancelKeysIgnoredWhileOrgOverlayActive(t *testing.T) {
-	stubCancel(t, nil)
-	m := scrollModel(t, 3)
-	m = send(m, key("O"))
-	m = typeRunes(m, "cy")
-	if m.confirming || len(m.cancels) != 0 {
-		t.Fatalf("overlay typing triggered cancel: confirming=%v cancels=%v", m.confirming, m.cancels)
-	}
-	if got := m.orgInput.Value(); got != "cy" {
-		t.Fatalf("org input = %q, want cy", got)
-	}
-}
-
 func TestCancelNeedsSelectionWithRunID(t *testing.T) {
 	m := newModel(options{org: "org-c", interval: 30})
 	m = send(m, key("c"))
@@ -1245,34 +501,72 @@ func TestCancelWorksFromQueuedPanel(t *testing.T) {
 	}
 }
 
-func TestOrgChangeWhileScanningCancelsAndIgnoresStaleScan(t *testing.T) {
+func TestPickWhileScanningWaitsForNextScan(t *testing.T) {
 	m := newTestModel(t)
 	stopped := false
 	m.scanning = true
 	m.stopScan = func() { stopped = true }
 	oldID := m.scanID
 
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m = withAccounts(m, []scan.Account{{Login: "me-user"}, {Login: "org-b", Org: true}}, nil)
 	m = send(m, key("O"))
-	m = typeRunes(m, "org-b")
+	m = send(m, key("j"))
+	m = send(m, key("enter"))
+	m = withRepos(m, []string{"api"}, nil)
+	m = send(m, key("G"))
 	m = send(m, key("enter"))
 
-	if !stopped {
-		t.Fatal("previous scan was not cancelled")
+	if stopped || m.scanID != oldID || m.opts.org != "org-c" {
+		t.Fatalf("pick interrupted the running scan: stopped=%v scanID=%d org=%q", stopped, m.scanID, m.opts.org)
 	}
-	if m.scanID == oldID || !m.scanning {
-		t.Fatalf("scanID=%d old=%d scanning=%v", m.scanID, oldID, m.scanning)
+	if m.pending == nil || m.pending.owner != "org-b" || m.pending.repo != "api" {
+		t.Fatalf("pending = %+v, want org-b/api", m.pending)
+	}
+	if !strings.Contains(ansi.Strip(m.statusView()), "next scan: org-b/api") {
+		t.Fatal("key bar does not show the queued change")
 	}
 
 	next, _ := m.Update(scanDoneMsg{id: oldID, jobs: testJobs()})
 	m = next.(model)
-	if !m.scanning || len(m.jobs) != 0 {
-		t.Fatalf("stale scan applied: scanning=%v jobs=%d", m.scanning, len(m.jobs))
+	if len(m.jobs) != 3 || m.opts.org != "org-c" {
+		t.Fatalf("the running scan's results were dropped: jobs=%d org=%q", len(m.jobs), m.opts.org)
 	}
 
-	next, _ = m.Update(scanDoneMsg{id: m.scanID, jobs: testJobs()})
+	m.nextIn = 1
+	next, cmd := m.Update(tickMsg(time.Now()))
 	m = next.(model)
-	if m.scanning || len(m.jobs) != 3 {
-		t.Fatalf("current scan not applied: scanning=%v jobs=%d", m.scanning, len(m.jobs))
+	if cmd == nil || !m.scanning || m.scanID == oldID || m.opts.org != "org-b" || m.opts.repo != "api" || m.pending != nil || len(m.jobs) != 0 {
+		t.Fatalf("next scan did not switch: scanning=%v org=%q repo=%q pending=%v jobs=%d", m.scanning, m.opts.org, m.opts.repo, m.pending, len(m.jobs))
+	}
+}
+
+func TestRescanKeyAppliesQueuedPick(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := withAccounts(newTestModel(t), []scan.Account{{Login: "me-user"}, {Login: "org-c", Org: true}}, nil)
+	m.scanning = false
+	m = send(m, key("O"))
+	m = send(m, key("k"))
+	m = send(m, key("enter"))
+	m = withRepos(m, []string{"dots"}, nil)
+	m = send(m, key("enter"))
+	if m.scanning || m.pending == nil {
+		t.Fatalf("pick started a scan at once: scanning=%v pending=%v", m.scanning, m.pending)
+	}
+	m = send(m, key("r"))
+	if !m.scanning || m.opts.org != "me-user" || m.opts.repo != "" || m.pending != nil {
+		t.Fatalf("r: scanning=%v org=%q repo=%q pending=%v", m.scanning, m.opts.org, m.opts.repo, m.pending)
+	}
+}
+
+func TestFirstPickWithoutOwnerScansAtOnce(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := withAccounts(newModel(options{interval: 30}), []scan.Account{{Login: "me-user"}}, nil)
+	m = send(m, key("enter"))
+	m = withRepos(m, nil, nil)
+	m, cmd := sendCmd(m, key("enter"))
+	if cmd == nil || !m.scanning || m.opts.org != "me-user" || m.pending != nil {
+		t.Fatalf("scanning=%v org=%q pending=%v", m.scanning, m.opts.org, m.pending)
 	}
 }
 
@@ -1324,21 +618,6 @@ func TestVimKeysIgnoredWhileFilterActive(t *testing.T) {
 	}
 	if got := m.runTable.Cursor(); got != 29 {
 		t.Fatalf("cursor moved to %d while the filter was active", got)
-	}
-}
-
-func TestVimKeysIgnoredWhileOrgOverlayActive(t *testing.T) {
-	m := scrollModel(t, 30)
-	m = send(m, key("G"))
-	m = send(m, key("O"))
-	for _, k := range []tea.KeyMsg{key("g"), key("g"), key("H"), key("M"), key("L")} {
-		m = send(m, k)
-	}
-	if got := m.runTable.Cursor(); got != 29 {
-		t.Fatalf("cursor moved to %d while the org overlay was active", got)
-	}
-	if got := m.orgInput.Value(); got != "ggHML" {
-		t.Fatalf("org input = %q, want ggHML", got)
 	}
 }
 
@@ -1403,7 +682,7 @@ func TestUsageOverlayIgnoresTableKeys(t *testing.T) {
 	for _, k := range []string{"j", "k", "G", "g", "h", "l", "2", "c", "/", "O", "r", "enter"} {
 		m = send(m, key(k))
 	}
-	if !m.usageActive || m.runTable.Cursor() != cursor || m.focus != focus || m.confirming || m.filterActive || m.orgActive {
+	if !m.usageActive || m.runTable.Cursor() != cursor || m.focus != focus || m.confirming || m.filterActive || m.picking {
 		t.Fatalf("keys leaked through overlay: %+v", m.usageActive)
 	}
 }
@@ -1690,10 +969,160 @@ func TestDetailPanelFollowsSelection(t *testing.T) {
 	}
 }
 
+func withAccounts(m model, list []scan.Account, err error) model {
+	next, _ := m.Update(accountsMsg{list: list, err: err})
+	return next.(model)
+}
+
+func manyAccounts(n int) []scan.Account {
+	list := []scan.Account{{Login: "me-user"}}
+	for i := 1; i < n; i++ {
+		list = append(list, scan.Account{Login: "org-" + strconv.Itoa(i), Org: true})
+	}
+	return list
+}
+
+func withRepos(m model, names []string, err error) model {
+	next, _ := m.Update(reposMsg{seq: m.repoSeq, owner: m.pickOwner, names: names, err: err})
+	return next.(model)
+}
+
+func popupText(m model) string {
+	return ansi.Strip(m.View())
+}
+
+func TestPickerOpensOnStartWithoutOwner(t *testing.T) {
+	m := newModel(options{interval: 30})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m = next.(model)
+	if !m.picking || m.scanning {
+		t.Fatalf("picking=%v scanning=%v, want the picker open and no scan", m.picking, m.scanning)
+	}
+	if view := popupText(m); !strings.Contains(view, "Pick account") || !strings.Contains(view, "loading accounts") || !strings.Contains(view, "esc quit") {
+		t.Fatal("startup picker missing title, loading line or quit hint")
+	}
+	m = withAccounts(m, []scan.Account{{Login: "me-user"}, {Login: "org-a", Org: true}}, nil)
+	if view := popupText(m); !strings.Contains(view, " > me-user  you") || !strings.Contains(view, "org-a    org") {
+		t.Fatal("accounts not listed with the cursor on the first one")
+	}
+	if _, cmd := sendCmd(m, key("esc")); cmd == nil {
+		t.Fatal("esc with no owner should quit")
+	}
+}
+
+func TestPickerAccountThenRepoScansThatRepo(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	var asked []string
+	prev := listRepoNames
+	listRepoNames = func(_ context.Context, owner string, days int) ([]string, error) {
+		asked = append(asked, owner+"/"+strconv.Itoa(days))
+		return []string{"api", "web"}, nil
+	}
+	t.Cleanup(func() { listRepoNames = prev })
+
+	m := withAccounts(newTestModel(t), []scan.Account{{Login: "me-user"}, {Login: "org-a", Org: true}, {Login: "org-c", Org: true}}, nil)
+	runCursor := m.runTable.Cursor()
+	m = send(m, key("O"))
+	if !m.picking || m.accountCursor != 2 {
+		t.Fatalf("picking=%v cursor=%d, want open on the current owner org-c", m.picking, m.accountCursor)
+	}
+	m = send(m, key("k"))
+	if m.accountCursor != 1 || m.runTable.Cursor() != runCursor {
+		t.Fatalf("k moved account cursor %d and table cursor %d", m.accountCursor, m.runTable.Cursor())
+	}
+	m, cmd := sendCmd(m, key("enter"))
+	if m.pickStep != 1 || m.pickOwner != "org-a" || cmd == nil {
+		t.Fatalf("enter on an account: step=%d owner=%q cmd=%v", m.pickStep, m.pickOwner, cmd != nil)
+	}
+	if view := popupText(m); !strings.Contains(view, "Pick repo · org-a") || !strings.Contains(view, "loading repositories") {
+		t.Fatal("repo step not shown while loading")
+	}
+	next, _ := m.Update(cmd())
+	m = next.(model)
+	if len(asked) != 1 || asked[0] != "org-a/"+strconv.Itoa(m.opts.days) {
+		t.Fatalf("repos requested = %v", asked)
+	}
+	if view := popupText(m); !strings.Contains(view, " > All repositories") || !strings.Contains(view, "   web") {
+		t.Fatal("repo list not shown with All repositories first")
+	}
+	m = send(m, key("G"))
+	m = send(m, key("enter"))
+	if m.picking || m.pending == nil || m.pending.owner != "org-a" || m.pending.repo != "web" {
+		t.Fatalf("pick: picking=%v pending=%+v", m.picking, m.pending)
+	}
+	if got := config.Load().Org; got != "org-a" {
+		t.Fatalf("saved org = %q, want org-a", got)
+	}
+}
+
+func TestPickerAllRepositoriesClearsRepo(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := withAccounts(newTestModel(t), []scan.Account{{Login: "me-user"}, {Login: "org-c", Org: true}}, nil)
+	m = send(m, key("O"))
+	m = send(m, key("enter"))
+	m = withRepos(m, []string{"repo-a"}, nil)
+	m = send(m, key("enter"))
+	if m.picking || m.pending == nil || m.pending.owner != "org-c" || m.pending.repo != "" {
+		t.Fatalf("pending = %+v, want org-c with all repositories", m.pending)
+	}
+}
+
+func TestPickerEscStepsBackThenCloses(t *testing.T) {
+	m := withAccounts(newTestModel(t), []scan.Account{{Login: "me-user"}}, nil)
+	m = send(m, key("O"))
+	m = send(m, key("enter"))
+	m = send(m, key("esc"))
+	if !m.picking || m.pickStep != 0 {
+		t.Fatalf("esc on the repo step: picking=%v step=%d, want back on accounts", m.picking, m.pickStep)
+	}
+	m = send(m, key("esc"))
+	if m.picking || m.opts.org != "org-c" {
+		t.Fatalf("esc on accounts: picking=%v org=%q", m.picking, m.opts.org)
+	}
+}
+
+func TestPickerShowsErrors(t *testing.T) {
+	m := send(newTestModel(t), key("O"))
+	m = withAccounts(m, nil, errors.New("bad credentials"))
+	if !strings.Contains(popupText(m), "cannot list accounts: bad credentials") {
+		t.Fatal("account error not shown")
+	}
+	m = send(m, key("esc"))
+	m, cmd := sendCmd(m, key("O"))
+	if cmd == nil || m.accountsReady || !strings.Contains(popupText(m), "loading accounts") {
+		t.Fatal("reopening after an account error does not retry")
+	}
+	m = withAccounts(m, []scan.Account{{Login: "me-user"}}, nil)
+	m = send(m, key("enter"))
+	m = withRepos(m, nil, errors.New("cannot find me-user"))
+	if !strings.Contains(popupText(m), "cannot list repositories: cannot find me-user") {
+		t.Fatal("repo error not shown")
+	}
+}
+
+func TestStaleRepoListIgnored(t *testing.T) {
+	m := withAccounts(newTestModel(t), []scan.Account{{Login: "me-user"}, {Login: "org-a", Org: true}}, nil)
+	m = send(m, key("O"))
+	m = send(m, key("enter"))
+	stale := m.repoSeq
+	m = send(m, key("esc"))
+	m = send(m, key("j"))
+	m = send(m, key("enter"))
+	next, _ := m.Update(reposMsg{seq: stale, owner: "me-user", names: []string{"wrong"}})
+	m = next.(model)
+	if m.reposReady || len(m.repoChoices) != 0 {
+		t.Fatalf("stale repo list applied: %v", m.repoChoices)
+	}
+}
+
 func TestLayoutFillsTerminal(t *testing.T) {
 	for _, size := range [][2]int{{160, 40}, {140, 40}, {120, 40}, {100, 30}, {90, 30}, {80, 24}} {
 		for _, confirm := range []bool{false, true} {
-			m := layoutModel(t, size[0], size[1])
+			m := withAccounts(layoutModel(t, size[0], size[1]), manyAccounts(12), nil)
+			if !confirm {
+				m = send(m, key("O"))
+				m = send(m, key("G"))
+			}
 			if confirm {
 				m = send(m, key("c"))
 				if !m.confirming {

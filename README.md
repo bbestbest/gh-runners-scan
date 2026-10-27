@@ -23,13 +23,13 @@ Token: `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`.
 
 | flag | env | default |
 |---|---|---|
-| `<owner>` | `GH_RUNNERS_ORG` | from `~/.config/gh-runners/config` |
+| `<owner>` | | `org` in `~/.config/gh-runners/config`, else your own account |
 | `--days N` (repos pushed within N days, 0 = all) | `GH_RUNNERS_DAYS` | 7 |
 | `--label`, `--repo`, `--interval` (TUI), `--select` (fzf) | | |
 
 ## Keys
 
-`j`/`k` move · `h`/`l` switch panel · `/` filter · `enter` open · `c` cancel run · `r` rescan · `O` switch owner · `u` API usage · `q` quit
+`j`/`k` move · `h`/`l` switch panel · `/` filter · `enter` open · `c` cancel run · `r` rescan · `O` pick an account, then a repo or all repos (applies at the next scan; `r` for now) · `u` API usage · `q` quit
 
 ## Reading it
 

@@ -210,6 +210,56 @@ func listRepos(ctx context.Context, limited *atomic.Bool, org string, days int) 
 	return names
 }
 
+func Login(ctx context.Context) (string, error) {
+	var me ownerEntry
+	var limited atomic.Bool
+	if _, ok := getJSON(ctx, &limited, &me, "/user"); !ok || me.Login == "" {
+		if limited.Load() {
+			return "", ErrRateLimited
+		}
+		return "", errors.New("could not read the signed-in account (check the token)")
+	}
+	return me.Login, nil
+}
+
+type Account struct {
+	Login string
+	Org   bool
+}
+
+func Accounts(ctx context.Context) ([]Account, error) {
+	login, err := Login(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := []Account{{Login: login}}
+	var orgs []ownerEntry
+	var limited atomic.Bool
+	if _, ok := getJSON(ctx, &limited, &orgs, "/user/orgs?per_page=100"); ok {
+		for _, o := range orgs {
+			if o.Login != "" {
+				out = append(out, Account{Login: o.Login, Org: true})
+			}
+		}
+	}
+	return out, nil
+}
+
+func Repos(ctx context.Context, owner string, days int) ([]string, error) {
+	var limited atomic.Bool
+	if _, ok := reposPath(ctx, &limited, owner); !ok {
+		if limited.Load() {
+			return nil, ErrRateLimited
+		}
+		return nil, errors.New("cannot find " + owner)
+	}
+	names := listRepos(ctx, &limited, owner, days)
+	if limited.Load() {
+		return names, ErrRateLimited
+	}
+	return names, nil
+}
+
 func reposPath(ctx context.Context, limited *atomic.Bool, owner string) (string, bool) {
 	var o ownerEntry
 	if _, ok := getJSON(ctx, limited, &o, "/users/"+url.PathEscape(owner)); !ok {

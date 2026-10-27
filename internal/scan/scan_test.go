@@ -152,6 +152,88 @@ func TestListReposPicksEndpointForOwnerType(t *testing.T) {
 	}
 }
 
+func TestLoginReadsSignedInAccount(t *testing.T) {
+	for _, tc := range []struct {
+		status  int
+		body    string
+		want    string
+		wantErr bool
+	}{
+		{http.StatusOK, `{"login":"me-user","type":"User"}`, "me-user", false},
+		{http.StatusUnauthorized, `{"message":"Bad credentials"}`, "", true},
+		{http.StatusOK, `{}`, "", true},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/user" {
+				t.Errorf("unexpected path %s", r.URL.Path)
+			}
+			w.WriteHeader(tc.status)
+			fmt.Fprint(w, tc.body)
+		}))
+		withClient(t, srv.URL)
+		got, err := Login(context.Background())
+		srv.Close()
+		if got != tc.want || (err != nil) != tc.wantErr {
+			t.Fatalf("status %d: Login() = %q, %v; want %q, err=%v", tc.status, got, err, tc.want, tc.wantErr)
+		}
+	}
+}
+
+func TestAccountsListsUserThenOrgs(t *testing.T) {
+	for _, tc := range []struct {
+		orgsStatus int
+		want       []Account
+	}{
+		{http.StatusOK, []Account{{Login: "me-user"}, {Login: "org-a", Org: true}, {Login: "org-b", Org: true}}},
+		{http.StatusForbidden, []Account{{Login: "me-user"}}},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/user":
+				fmt.Fprint(w, `{"login":"me-user","type":"User"}`)
+			case "/user/orgs":
+				w.WriteHeader(tc.orgsStatus)
+				fmt.Fprint(w, `[{"login":"org-a"},{"login":"org-b"}]`)
+			default:
+				t.Errorf("unexpected path %s", r.URL.Path)
+			}
+		}))
+		withClient(t, srv.URL)
+		got, err := Accounts(context.Background())
+		srv.Close()
+		if err != nil || !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("orgs %d: Accounts() = %v, %v; want %v", tc.orgsStatus, got, err, tc.want)
+		}
+	}
+}
+
+func TestReposListsOwnerAndReportsUnknown(t *testing.T) {
+	resetRepoCache(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/users/org-a":
+			fmt.Fprint(w, `{"login":"org-a","type":"Organization"}`)
+		case "/orgs/org-a/repos":
+			fmt.Fprintf(w, `[{"name":"api","pushed_at":%q,"archived":false},{"name":"old","pushed_at":"2019-01-01T00:00:00Z","archived":false}]`, time.Now().UTC().Format(time.RFC3339))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	names, err := Repos(context.Background(), "org-a", 7)
+	if err != nil || !reflect.DeepEqual(names, []string{"api"}) {
+		t.Fatalf("Repos(org-a) = %v, %v", names, err)
+	}
+	if cached, ok := cachedRepos("org-a\x007"); !ok || !reflect.DeepEqual(cached, []string{"api"}) {
+		t.Fatalf("repo list not cached for the first scan: %v %v", cached, ok)
+	}
+	if names, err := Repos(context.Background(), "nobody", 7); err == nil || names != nil {
+		t.Fatalf("Repos(nobody) = %v, %v; want an error", names, err)
+	}
+}
+
 func TestListReposUnknownOwnerReturnsNothing(t *testing.T) {
 	resetRepoCache(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -46,7 +46,7 @@ var keyHints = [][2]string{
 	{"/", "filter"},
 	{"h/l", "panel"},
 	{"r", "rescan"},
-	{"O", "org"},
+	{"O", "owner"},
 	{"u", "usage"},
 	{"q", "quit"},
 }
@@ -97,6 +97,11 @@ type options struct {
 	repo     string
 }
 
+type pick struct {
+	owner string
+	repo  string
+}
+
 type model struct {
 	opts options
 
@@ -115,10 +120,20 @@ type model struct {
 	filterActive bool
 	filter       string
 
-	orgInput  textinput.Model
-	orgActive bool
-	orgs      []string
-	orgCursor int
+	accounts      []scan.Account
+	accountCursor int
+	accountsErr   error
+	accountsReady bool
+
+	picking     bool
+	pickStep    int
+	pickOwner   string
+	repoChoices []string
+	repoCursor  int
+	reposReady  bool
+	reposErr    error
+	repoSeq     int
+	pending     *pick
 
 	spin      spinner.Model
 	scanning  bool
@@ -152,13 +167,11 @@ func newModel(opts options) model {
 		width:     120,
 		height:    40,
 		scanning:  opts.org != "",
-		orgActive: opts.org == "",
 		progress:  progressMsg{0, scan.TotalUnknown},
 		repoCount: scan.TotalUnknown,
-		orgs:      config.Load().Orgs,
-		orgCursor: -1,
 		cancels:   map[int64]bool{},
 	}
+	m.picking = opts.org == ""
 
 	m.runTable = newTable(runningPanelCols)
 	m.qTable = newTable(queuedPanelCols)
@@ -167,15 +180,6 @@ func newModel(opts options) model {
 	in.Placeholder = "filter"
 	in.Prompt = "/ "
 	m.filterInput = in
-
-	oi := textinput.New()
-	oi.Placeholder = "organisation"
-	oi.Prompt = "org: "
-	oi.Width = orgInputWidth
-	if m.orgActive {
-		oi.Focus()
-	}
-	m.orgInput = oi
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
@@ -204,9 +208,9 @@ func tableStyles() table.Styles {
 
 func (m model) Init() tea.Cmd {
 	if m.opts.org == "" {
-		return tea.Batch(tickCmd(), m.spin.Tick, textinput.Blink)
+		return tea.Batch(tickCmd(), m.spin.Tick, accountsCmd)
 	}
-	return tea.Batch(scanCmd(context.Background(), m.opts, 0), tickCmd(), m.spin.Tick)
+	return tea.Batch(scanCmd(context.Background(), m.opts, 0), tickCmd(), m.spin.Tick, accountsCmd)
 }
 
 func tickCmd() tea.Cmd {
@@ -216,10 +220,29 @@ func tickCmd() tea.Cmd {
 }
 
 func (m *model) startScan() tea.Cmd {
-	if m.scanning || m.opts.org == "" {
+	if m.scanning {
+		return nil
+	}
+	if m.pending != nil {
+		m.applyPending()
+	}
+	if m.opts.org == "" {
 		return nil
 	}
 	return m.beginScan()
+}
+
+func (m *model) applyPending() {
+	p := m.pending
+	m.pending = nil
+	m.opts.org = p.owner
+	m.opts.repo = p.repo
+	m.jobs = nil
+	m.scanErr = nil
+	m.lastScan = ""
+	m.lastCost = nil
+	m.repoCount = scan.TotalUnknown
+	m.refresh()
 }
 
 func (m *model) beginScan() tea.Cmd {
@@ -239,6 +262,34 @@ var cancelRun = scan.CancelRun
 var usage = scan.Usage
 
 var saveCache = scan.SaveCache
+
+var listAccounts = scan.Accounts
+
+var listRepoNames = scan.Repos
+
+type reposMsg struct {
+	seq   int
+	owner string
+	names []string
+	err   error
+}
+
+func reposCmd(seq int, owner string, days int) tea.Cmd {
+	return func() tea.Msg {
+		names, err := listRepoNames(context.Background(), owner, days)
+		return reposMsg{seq: seq, owner: owner, names: names, err: err}
+	}
+}
+
+type accountsMsg struct {
+	list []scan.Account
+	err  error
+}
+
+func accountsCmd() tea.Msg {
+	list, err := listAccounts(context.Background())
+	return accountsMsg{list: list, err: err}
+}
 
 func saveCacheCmd() tea.Msg {
 	saveCache()
@@ -285,6 +336,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.layout()
+		return m, nil
+
+	case accountsMsg:
+		m.accounts = msg.list
+		m.accountsErr = msg.err
+		m.accountsReady = true
+		m.accountCursor = m.currentAccount()
+		return m, nil
+
+	case reposMsg:
+		if msg.seq != m.repoSeq {
+			return m, nil
+		}
+		m.repoChoices = msg.names
+		m.reposErr = msg.err
+		m.reposReady = true
 		return m, nil
 
 	case progressMsg:
@@ -351,66 +418,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.orgActive {
-		switch msg.String() {
-		case "ctrl+c":
-			return m, quitCmd()
-		case "esc":
-			if m.opts.org == "" {
-				return m, quitCmd()
-			}
-			m.orgActive = false
-			m.orgInput.SetValue("")
-			m.orgInput.Blur()
-			return m, nil
-		case "up":
-			m.moveOrgCursor(-1)
-			return m, nil
-		case "down":
-			m.moveOrgCursor(1)
-			return m, nil
-		case "enter":
-			org := strings.TrimSpace(m.orgInput.Value())
-			if org == "" {
-				if m.opts.org == "" {
-					return m, nil
-				}
-				m.orgActive = false
-				m.orgInput.SetValue("")
-				m.orgInput.Blur()
-				return m, nil
-			}
-			m.orgActive = false
-			m.orgInput.SetValue(org)
-			m.orgInput.Blur()
-			m.saveErr = config.SetOrg(org)
-			m.orgs = config.Load().Orgs
-			m.orgCursor = -1
-			if org == m.opts.org {
-				return m, nil
-			}
-			m.opts.org = org
-			m.jobs = nil
-			m.scanErr = nil
-			m.lastScan = ""
-			m.lastCost = nil
-			m.repoCount = scan.TotalUnknown
-			m.nextIn = m.opts.interval
-			cmd := m.beginScan()
-			m.refresh()
-			return m, cmd
-		case "x":
-			if m.orgCursor >= 0 && m.orgCursor < len(m.orgs) {
-				m.removeOrgAtCursor()
-				return m, nil
-			}
-		}
-		m.orgCursor = -1
-		var cmd tea.Cmd
-		m.orgInput, cmd = m.orgInput.Update(msg)
-		return m, cmd
+	if m.picking {
+		return m.pickerKey(msg)
 	}
-
 	if m.filterActive {
 		switch msg.String() {
 		case "esc":
@@ -492,19 +502,22 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filterInput.Focus()
 		m.layout()
 		return m, textinput.Blink
-	case "O":
-		m.orgActive = true
-		m.orgs = config.Load().Orgs
-		m.orgCursor = -1
-		m.orgInput.SetValue("")
-		m.orgInput.Focus()
-		return m, textinput.Blink
 	case "u":
 		m.usageActive = true
 		return m, nil
 	case "r":
 		m.nextIn = m.opts.interval
 		return m, m.startScan()
+	case "O":
+		m.picking = true
+		m.pickStep = 0
+		m.accountCursor = m.currentAccount()
+		if m.accountsErr != nil {
+			m.accountsReady = false
+			m.accountsErr = nil
+			return m, accountsCmd
+		}
+		return m, nil
 	case "h", "l":
 		m.focus = 1 - m.focus
 		return m, nil
@@ -562,48 +575,89 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *model) moveOrgCursor(delta int) {
-	if len(m.orgs) == 0 {
-		return
-	}
-	next := m.orgCursor + delta
-	if m.orgCursor < 0 && delta < 0 {
-		next = len(m.orgs) - 1
-	}
-	if next < 0 {
-		m.orgCursor = -1
-		m.orgInput.SetValue("")
-		return
-	}
-	if next > len(m.orgs)-1 {
-		next = len(m.orgs) - 1
-	}
-	m.orgCursor = next
-	m.orgInput.SetValue(m.orgs[next])
-	m.orgInput.CursorEnd()
-}
-
-func (m *model) removeOrgAtCursor() {
-	org := m.orgs[m.orgCursor]
-	m.saveErr = config.RemoveOrg(org)
-	kept := make([]string, 0, len(m.orgs))
-	for _, o := range m.orgs {
-		if o != org {
-			kept = append(kept, o)
+func (m model) currentAccount() int {
+	for i, a := range m.accounts {
+		if strings.EqualFold(a.Login, m.opts.org) {
+			return i
 		}
 	}
-	m.orgs = kept
-	if len(m.orgs) == 0 {
-		m.orgCursor = -1
-	} else if m.orgCursor > len(m.orgs)-1 {
-		m.orgCursor = len(m.orgs) - 1
+	return 0
+}
+
+func (m model) pickerRows() int {
+	if m.pickStep == 0 {
+		return len(m.accounts)
 	}
-	if m.orgCursor < 0 {
-		m.orgInput.SetValue("")
-	} else {
-		m.orgInput.SetValue(m.orgs[m.orgCursor])
+	return len(m.repoChoices) + 1
+}
+
+func (m *model) movePick(delta int) {
+	if m.pickStep == 0 {
+		m.accountCursor = clamp(m.accountCursor+delta, len(m.accounts))
+		return
 	}
-	m.orgInput.CursorEnd()
+	m.repoCursor = clamp(m.repoCursor+delta, len(m.repoChoices)+1)
+}
+
+func (m model) pickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, quitCmd()
+	case "esc":
+		if m.pickStep == 1 {
+			m.pickStep = 0
+			return m, nil
+		}
+		if m.opts.org == "" {
+			return m, quitCmd()
+		}
+		m.picking = false
+		return m, nil
+	case "j", "down":
+		m.movePick(1)
+	case "k", "up":
+		m.movePick(-1)
+	case "g", "home":
+		m.movePick(-m.pickerRows())
+	case "G", "end":
+		m.movePick(m.pickerRows())
+	case "enter":
+		if m.pickStep == 0 {
+			if m.accountCursor < 0 || m.accountCursor >= len(m.accounts) {
+				return m, nil
+			}
+			m.pickOwner = m.accounts[m.accountCursor].Login
+			m.pickStep = 1
+			m.repoChoices = nil
+			m.reposReady = false
+			m.reposErr = nil
+			m.repoCursor = 0
+			m.repoSeq++
+			return m, reposCmd(m.repoSeq, m.pickOwner, m.opts.days)
+		}
+		repo := ""
+		if m.repoCursor > 0 && m.repoCursor <= len(m.repoChoices) {
+			repo = m.repoChoices[m.repoCursor-1]
+		}
+		return m.applyPick(m.pickOwner, repo)
+	}
+	return m, nil
+}
+
+func (m model) applyPick(owner, repo string) (tea.Model, tea.Cmd) {
+	m.picking = false
+	m.pickStep = 0
+	m.saveErr = config.SetOrg(owner)
+	if strings.EqualFold(owner, m.opts.org) && repo == m.opts.repo {
+		m.pending = nil
+		return m, nil
+	}
+	m.pending = &pick{owner: owner, repo: repo}
+	if m.opts.org == "" {
+		m.nextIn = m.opts.interval
+		return m, m.startScan()
+	}
+	return m, nil
 }
 
 func (m *model) focusedTable() *table.Model {
@@ -1097,6 +1151,8 @@ const keybarHeight = 1
 
 const statusPanelHeight = 4
 
+const maxPickRows = 10
+
 const maxRepoRows = 6
 
 const minListWidth = 50
@@ -1107,10 +1163,6 @@ const minBodyHeight = 16
 
 const minListBox = 5
 
-const maxOrgRows = 8
-
-const orgInputWidth = 20
-
 func (m model) View() string {
 	return m.bodyView() + "\n" + m.statusView()
 }
@@ -1118,9 +1170,6 @@ func (m model) View() string {
 func (m model) bodyView() string {
 	if m.usageActive {
 		return m.usageOverlayView()
-	}
-	if m.orgActive {
-		return m.orgOverlayView()
 	}
 
 	left, right := m.columns()
@@ -1134,6 +1183,9 @@ func (m model) bodyView() string {
 	body := col
 	if right > 0 {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, col, m.detailPanel(right, m.bodyHeight()))
+	}
+	if m.picking {
+		body = overlay(body, m.pickerPopup(), m.width)
 	}
 	if m.confirming {
 		body = overlay(body, m.cancelPopup(), m.width)
@@ -1187,6 +1239,8 @@ func (m model) statusPanelLines() []string {
 	first := " " + hlStyle.Render(m.orgLabel()) + dimStyle.Render(" · "+m.repoCountLabel()+" · scanned "+m.lastScanLabel()+" UTC")
 	second := " " + dimStyle.Render("no scan yet")
 	switch {
+	case m.opts.org == "":
+		second = " " + dimStyle.Render("press O to pick an account")
 	case m.scanning && m.progress.total < 0:
 		second = " " + m.spin.View() + dimStyle.Render(" listing repos…")
 	case m.scanning:
@@ -1195,6 +1249,90 @@ func (m model) statusPanelLines() []string {
 		second = " " + dimStyle.Render(fmt.Sprintf("last scan %d req, %d free (304)", m.lastCost.requests, m.lastCost.free))
 	}
 	return []string{first, second}
+}
+
+func (m model) pickerPopup() string {
+	w := m.width - 4
+	if w > 64 {
+		w = 64
+	}
+	limit := m.bodyHeight() - 10
+	if limit > maxPickRows {
+		limit = maxPickRows
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	title := "Pick account"
+	hint := "enter next · esc close"
+	if m.opts.org == "" {
+		hint = "enter next · esc quit"
+	}
+	var rows []string
+	cursor := m.accountCursor
+	switch {
+	case m.pickStep == 1:
+		title = "Pick repo · " + m.pickOwner
+		hint = "enter scan · esc back"
+		cursor = m.repoCursor
+		rows = append(rows, "All repositories")
+		rows = append(rows, m.repoChoices...)
+	case !m.accountsReady:
+		rows = nil
+	default:
+		nameW := 0
+		for _, a := range m.accounts {
+			if lw := ansi.StringWidth(a.Login); lw > nameW {
+				nameW = lw
+			}
+		}
+		for _, a := range m.accounts {
+			kind := "you"
+			if a.Org {
+				kind = "org"
+			}
+			row := a.Login + strings.Repeat(" ", nameW-ansi.StringWidth(a.Login)) + "  " + kind
+			if strings.EqualFold(a.Login, m.opts.org) {
+				row += "  current"
+			}
+			rows = append(rows, row)
+		}
+	}
+
+	body := []string{""}
+	start := 0
+	if cursor >= limit {
+		start = cursor - limit + 1
+	}
+	end := start + limit
+	if end > len(rows) {
+		end = len(rows)
+	}
+	for i := start; i < end; i++ {
+		if i == cursor {
+			body = append(body, accentStyle.Render(" > "+rows[i]))
+			continue
+		}
+		body = append(body, "   "+rows[i])
+	}
+	switch {
+	case m.pickStep == 0 && !m.accountsReady:
+		body = append(body, " "+m.spin.View()+dimStyle.Render(" loading accounts…"))
+	case m.pickStep == 0 && m.accountsErr != nil:
+		body = append(body, "  "+redStyle.Render("cannot list accounts: "+m.accountsErr.Error()))
+	case m.pickStep == 1 && !m.reposReady:
+		body = append(body, " "+m.spin.View()+dimStyle.Render(" loading repositories…"))
+	case m.pickStep == 1 && m.reposErr != nil:
+		body = append(body, "  "+redStyle.Render("cannot list repositories: "+m.reposErr.Error()))
+	case m.pickStep == 1 && m.opts.days > 0:
+		body = append(body, "  "+dimStyle.Render(fmt.Sprintf("repos pushed in the last %d days", m.opts.days)))
+	}
+	body = append(body, "", "  "+dimStyle.Render(hint))
+	footer := ""
+	if n := len(rows); n > 0 {
+		footer = fmt.Sprintf("%d of %d", cursor+1, n)
+	}
+	return panel(title, footer, true, w, len(body)+2, body)
 }
 
 func (m model) reposFooter() string {
@@ -1375,30 +1513,6 @@ func overlay(bg, fg string, width int) string {
 	return strings.Join(bgLines, "\n")
 }
 
-func (m model) orgOverlayView() string {
-	hint := "↑↓ pick · x delete · enter confirm · esc cancel"
-	if m.opts.org == "" {
-		hint = "↑↓ pick · x delete · enter confirm · esc quit"
-	}
-
-	body := m.orgInput.View()
-	if list := m.orgListView(); list != "" {
-		body += "\n\n" + list
-	}
-
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colorAccent).
-		Padding(1, 2).
-		Render(body + "\n\n" + dimStyle.Render(hint))
-
-	area := m.bodyHeight()
-	if area < lipgloss.Height(box) {
-		area = lipgloss.Height(box)
-	}
-	return lipgloss.Place(m.width, area, lipgloss.Center, lipgloss.Center, box)
-}
-
 func (m model) usageOverlayView() string {
 	u := usage()
 	label := func(k, v string) string {
@@ -1490,43 +1604,6 @@ func (m model) usageIndicator() string {
 	return usageStyle(u).Render(text)
 }
 
-func (m model) orgListView() string {
-	orgs := m.orgs
-	cursor := m.orgCursor
-	if limit := m.orgListLimit(); len(orgs) > limit {
-		start := 0
-		if cursor >= limit {
-			start = cursor - limit + 1
-		}
-		orgs = orgs[start : start+limit]
-		cursor -= start
-	}
-
-	var lines []string
-	for i, org := range orgs {
-		row := "  " + org
-		if i == cursor {
-			row = accentStyle.Render("> " + org)
-		}
-		if org == m.opts.org {
-			row += dimStyle.Render("  (saved)")
-		}
-		lines = append(lines, row)
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (m model) orgListLimit() int {
-	limit := m.height - keybarHeight - 13
-	if limit < 1 {
-		limit = 1
-	}
-	if limit > maxOrgRows {
-		limit = maxOrgRows
-	}
-	return limit
-}
-
 func (m model) orgLabel() string {
 	if m.opts.org == "" {
 		return "—"
@@ -1562,13 +1639,20 @@ func (m model) statusView() string {
 		parts = append(parts, style.Render(m.notice))
 	}
 	if m.saveErr != nil {
-		parts = append(parts, yellowStyle.Render("org not saved"))
+		parts = append(parts, yellowStyle.Render("account not saved"))
 	}
 	if !m.scanning && m.scanErr != nil {
 		parts = append(parts, redStyle.Render("rate limited · incomplete"))
 	}
 	if m.filter != "" {
 		parts = append(parts, dimStyle.Render("filter: "+m.filter))
+	}
+	if m.pending != nil {
+		next := m.pending.owner
+		if m.pending.repo != "" {
+			next += "/" + m.pending.repo
+		}
+		parts = append(parts, yellowStyle.Render("next scan: "+next))
 	}
 	parts = append(parts, hlStyle.Render(m.orgLabel())+dimStyle.Render(fmt.Sprintf(" · next %ds", m.nextIn)), m.usageIndicator())
 	right := strings.Join(parts, dimStyle.Render(" · ")) + " "
