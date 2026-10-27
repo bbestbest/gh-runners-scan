@@ -42,6 +42,10 @@ func TestListReposFollowsPagination(t *testing.T) {
 	resetRepoCache(t)
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/users/org-a" {
+			fmt.Fprint(w, `{"login":"org-a","type":"Organization"}`)
+			return
+		}
 		if !strings.HasPrefix(r.URL.Path, "/orgs/org-a/repos") {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
@@ -85,6 +89,10 @@ func TestListReposStopsAtFirstRepoOutsideDays(t *testing.T) {
 		var pages atomic.Int32
 		var srv *httptest.Server
 		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/users/org-a" {
+				fmt.Fprint(w, `{"login":"org-a","type":"Organization"}`)
+				return
+			}
 			pages.Add(1)
 			if r.URL.Query().Get("page") == "2" {
 				fmt.Fprint(w, `[{"name":"gamma","pushed_at":"2019-01-01T00:00:00Z","archived":false}]`)
@@ -105,6 +113,59 @@ func TestListReposStopsAtFirstRepoOutsideDays(t *testing.T) {
 		if got := pages.Load(); got != tc.wantPages {
 			t.Fatalf("days=%d: fetched %d pages, want %d", tc.days, got, tc.wantPages)
 		}
+	}
+}
+
+func TestListReposPicksEndpointForOwnerType(t *testing.T) {
+	for _, tc := range []struct {
+		owner, kind, me, wantPath, wantQuery string
+	}{
+		{"org-a", "Organization", "me-user", "/orgs/org-a/repos", "direction=desc&per_page=100&sort=pushed"},
+		{"me-user", "User", "me-user", "/user/repos", "affiliation=owner&direction=desc&per_page=100&sort=pushed"},
+		{"Me-User", "User", "me-user", "/user/repos", "affiliation=owner&direction=desc&per_page=100&sort=pushed"},
+		{"other-user", "User", "me-user", "/users/other-user/repos", "direction=desc&per_page=100&sort=pushed&type=owner"},
+	} {
+		resetRepoCache(t)
+		var listed string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/users/" + tc.owner:
+				fmt.Fprintf(w, `{"login":%q,"type":%q}`, tc.owner, tc.kind)
+			case "/user":
+				fmt.Fprintf(w, `{"login":%q,"type":"User"}`, tc.me)
+			default:
+				listed = r.URL.Path + "?" + r.URL.Query().Encode()
+				fmt.Fprintf(w, `[{"name":"alpha","pushed_at":%q,"archived":false}]`, time.Now().UTC().Format(time.RFC3339))
+			}
+		}))
+		withClient(t, srv.URL)
+
+		var limited atomic.Bool
+		names := listRepos(context.Background(), &limited, tc.owner, 7)
+		srv.Close()
+		if !reflect.DeepEqual(names, []string{"alpha"}) {
+			t.Fatalf("%s: names = %v", tc.owner, names)
+		}
+		if want := tc.wantPath + "?" + tc.wantQuery; listed != want {
+			t.Fatalf("%s: listed %q, want %q", tc.owner, listed, want)
+		}
+	}
+}
+
+func TestListReposUnknownOwnerReturnsNothing(t *testing.T) {
+	resetRepoCache(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/users/nobody" {
+			t.Errorf("listed repos for an unknown owner: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	var limited atomic.Bool
+	if names := listRepos(context.Background(), &limited, "nobody", 7); names != nil {
+		t.Fatalf("names = %v, want nil", names)
 	}
 }
 
@@ -218,6 +279,10 @@ func TestScanReturnsErrRateLimited(t *testing.T) {
 	resetRepoCache(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		now := time.Now().UTC().Format(time.RFC3339)
+		if r.URL.Path == "/users/org-a" {
+			fmt.Fprint(w, `{"login":"org-a","type":"Organization"}`)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/orgs/") {
 			fmt.Fprintf(w, `[{"name":"web","pushed_at":%q,"archived":false}]`, now)
 			return

@@ -143,12 +143,22 @@ async function getJSON(url, cost, scan) {
 
 async function refusal(res) {
   if (res.headers.get('x-github-sso'))
-    return 'the organisation requires SSO: authorise this token for it in GitHub token settings'
+    return 'SSO is required: authorise this token for it in GitHub token settings'
   try {
     const body = await res.json()
     if (body && typeof body.message === 'string') return body.message
   } catch {}
   return `HTTP ${res.status}`
+}
+
+async function reposURL(owner, get) {
+  const name = encodeURIComponent(owner)
+  if (account.login && owner.toLowerCase() === account.login.toLowerCase())
+    return `${API}/user/repos?per_page=100&sort=pushed&direction=desc&affiliation=owner`
+  const info = await get(`${API}/users/${name}`)
+  if (!info) return ''
+  if (info.type === 'Organization') return `${API}/orgs/${name}/repos?per_page=100&sort=pushed&direction=desc`
+  return `${API}/users/${name}/repos?per_page=100&sort=pushed&direction=desc&type=owner`
 }
 
 async function listRepos(org, days, cost, scan) {
@@ -157,9 +167,11 @@ async function listRepos(org, days, cost, scan) {
   if (hit && hit.expires > Date.now()) return hit.names
   const cutoff = Date.now() - days * 24 * 3600 * 1000
   const names = []
-  let next = org === account.login
-    ? `${API}/user/repos?per_page=100&sort=pushed&affiliation=owner`
-    : `${API}/orgs/${encodeURIComponent(org)}/repos?per_page=100&sort=pushed&direction=desc`
+  let next = await reposURL(org, async url => {
+    const page = await getJSON(url, cost, scan)
+    return page && page.data
+  })
+  if (!next) throw new Error(`cannot find ${org}: ${cost.message}`)
   while (next) {
     const page = await getJSON(next, cost, scan)
     if (!page) throw new Error(`cannot list repos of ${org}: ${cost.message}`)
@@ -313,7 +325,7 @@ function showConfig() {
   $('stepUnlock').hidden = true
   $('stepToken').hidden = true
   $('stepConfig').hidden = false
-  $('connectTitle').textContent = 'Connect · 2/2 organisation and settings'
+  $('connectTitle').textContent = 'Connect · 2/2 owner and settings'
   $('submit').textContent = 'enter: start'
   $('whoami').textContent = account.login ? `signed in as ${account.login}${account.scopes ? ` · scopes: ${account.scopes}` : ''}` : ''
   $('whoami').className = account.scopes && !account.scopes.split(/,\s*/).includes('repo') ? 'yellow' : 'dim'
@@ -365,7 +377,7 @@ async function verifyToken(value) {
   try {
     const { res, data } = await connectGet(`${API}/user`)
     account = { login: data.login, scopes: res.headers.get('x-oauth-scopes') || '' }
-    setBusy('loading organisations…')
+    setBusy('loading accounts…')
     const orgs = new Set([data.login])
     try {
       const { data: list } = await connectGet(`${API}/user/orgs?per_page=100`)
@@ -649,9 +661,7 @@ async function loadRepos(org, keep) {
   const names = []
   let failure = ''
   try {
-    let next = org === account.login
-      ? `${API}/user/repos?per_page=100&sort=pushed&affiliation=owner`
-      : `${API}/orgs/${encodeURIComponent(org)}/repos?per_page=100&sort=pushed&direction=desc`
+    let next = await reposURL(org, async url => (await connectGet(url)).data)
     while (next) {
       const page = await connectGet(next)
       if (seq !== repoSeq) return
@@ -782,7 +792,7 @@ function renderStatus() {
     s.append(el('div', 'red', `${failed.reduce((t, [, n]) => t + n, 0)} requests refused (${counts}): ${state.cost.message}`))
   }
   if (!state.scanning && state.cost && state.progress.total === 0)
-    s.append(el('div', 'yellow', `this token sees no repos in ${state.org} pushed in the last ${state.days} days; check the token's resource owner is the organisation`))
+    s.append(el('div', 'yellow', `this token sees no repos in ${state.org} pushed in the last ${state.days} days; check the token's resource owner`))
   renderInfo()
 }
 
@@ -979,7 +989,7 @@ function submitConnect(e) {
   if (!$('stepToken').hidden) return submitToken()
   const org = $('org').value.trim()
   if (!org) {
-    $('loginError').textContent = 'pick or type an organisation'
+    $('loginError').textContent = 'pick or type an owner'
     return $('org').focus()
   }
   $('loginError').textContent = ''

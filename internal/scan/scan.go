@@ -45,6 +45,11 @@ type repoEntry struct {
 	Archived bool   `json:"archived"`
 }
 
+type ownerEntry struct {
+	Login string `json:"login"`
+	Type  string `json:"type"`
+}
+
 type runEntry struct {
 	DatabaseID int64 `json:"id"`
 }
@@ -165,9 +170,12 @@ func listRepos(ctx context.Context, limited *atomic.Bool, org string, days int) 
 		return names
 	}
 
+	next, ok := reposPath(ctx, limited, org)
+	if !ok {
+		return nil
+	}
 	cutoff := time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour)
 	var names []string
-	next := "/orgs/" + url.PathEscape(org) + "/repos?per_page=100&sort=pushed&direction=desc"
 	for next != "" {
 		var entries []repoEntry
 		link, ok := getJSON(ctx, limited, &entries, next)
@@ -200,6 +208,21 @@ func listRepos(ctx context.Context, limited *atomic.Bool, org string, days int) 
 	}
 	storeRepos(key, names)
 	return names
+}
+
+func reposPath(ctx context.Context, limited *atomic.Bool, owner string) (string, bool) {
+	var o ownerEntry
+	if _, ok := getJSON(ctx, limited, &o, "/users/"+url.PathEscape(owner)); !ok {
+		return "", false
+	}
+	if o.Type == "Organization" {
+		return "/orgs/" + url.PathEscape(owner) + "/repos?per_page=100&sort=pushed&direction=desc", true
+	}
+	var me ownerEntry
+	if _, ok := getJSON(ctx, limited, &me, "/user"); ok && strings.EqualFold(me.Login, owner) {
+		return "/user/repos?per_page=100&sort=pushed&direction=desc&affiliation=owner", true
+	}
+	return "/users/" + url.PathEscape(owner) + "/repos?per_page=100&sort=pushed&direction=desc&type=owner", true
 }
 
 func scanRepo(ctx context.Context, limited *atomic.Bool, org, repo string) []Job {

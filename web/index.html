@@ -30,16 +30,16 @@
         <div class="cyan bold">Permissions needed</div>
         <div><span class="green">Fine-grained token</span> <span class="dim">(recommended)</span></div>
         <ul>
-          <li>Resource owner: <b>the organisation</b>, not your user</li>
+          <li>Resource owner: <b>the account that owns the repos</b></li>
           <li>Repository access: <b>All repositories</b> (or the ones to watch)</li>
           <li>Repository permissions → <b>Actions: Read-only</b></li>
           <li><b>Metadata: Read-only</b> is added automatically</li>
-          <li>The organisation may have to approve it</li>
+          <li>The owner may have to approve it</li>
         </ul>
         <div><span class="yellow">Classic token</span> <span class="dim">(broader: full access to private repos)</span></div>
         <ul>
-          <li><b>repo</b> scope; add <b>read:org</b> to list your organisations</li>
-          <li>If the organisation uses SSO: Configure SSO → Authorize</li>
+          <li><b>repo</b> scope; add <b>read:org</b> to list more owners</li>
+          <li>If SSO is required: Configure SSO → Authorize</li>
         </ul>
         <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">Create a fine-grained token ↗</a>
       </div>
@@ -58,7 +58,7 @@
     </div>
     <div id="stepConfig" class="step" hidden>
       <div class="who"><span id="whoami" class="dim"></span><button type="button" id="changeToken" class="link">change token</button></div>
-      <label>Organisation <input id="org" name="org" list="orgList" spellcheck="false" placeholder="pick or type"></label>
+      <label>Owner <input id="org" name="org" list="orgList" spellcheck="false" placeholder="pick or type"></label>
       <datalist id="orgList"></datalist>
       <label>Repo <select id="repo" name="repo"><option value="">All repositories</option></select></label>
       <p id="repoNote" class="dim"></p>

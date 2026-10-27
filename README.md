@@ -1,6 +1,6 @@
 # gh-runners-scan
 
-**TL;DR:** see which jobs hold an org's self-hosted GitHub Actions runners, and why a job is stuck on *"Waiting for a runner"*.
+**TL;DR:** see which GitHub Actions jobs are running or queued across all repos of any GitHub account, and why a job is stuck on *"Waiting for a runner"*.
 
 | | |
 |---|---|
@@ -11,10 +11,10 @@
 ## Quick start
 
 ```sh
-./install.sh                 # builds and links gh-runner and gh-runners into ~/.local/bin
-gh-runner <org>              # live view
-gh-runner <org> --repo web   # one repo
-gh-runners <org> | cat       # one-shot table
+./install.sh                   # builds and links gh-runner and gh-runners into ~/.local/bin
+gh-runner <owner>              # live view of every repo the account owns
+gh-runner <owner> --repo web   # one repo
+gh-runners <owner> | cat       # one-shot table
 ```
 
 Token: `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`.
@@ -23,13 +23,13 @@ Token: `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`.
 
 | flag | env | default |
 |---|---|---|
-| `<org>` | `GH_RUNNERS_ORG` | from `~/.config/gh-runners/config` |
+| `<owner>` | `GH_RUNNERS_ORG` | from `~/.config/gh-runners/config` |
 | `--days N` (repos pushed within N days, 0 = all) | `GH_RUNNERS_DAYS` | 7 |
 | `--label`, `--repo`, `--interval` (TUI), `--select` (fzf) | | |
 
 ## Keys
 
-`j`/`k` move · `h`/`l` switch panel · `/` filter · `enter` open · `c` cancel run · `r` rescan · `O` org · `u` API usage · `q` quit
+`j`/`k` move · `h`/`l` switch panel · `/` filter · `enter` open · `c` cancel run · `r` rescan · `O` switch owner · `u` API usage · `q` quit
 
 ## Reading it
 
@@ -37,8 +37,8 @@ Queued and running jobs with the same labels: runners are **busy**. Queued with 
 
 ## Web version
 
-1. Open the [page](https://bbestbest.github.io/gh-runners-scan/) and paste a fine-grained token: resource owner = the org, **Actions: Read-only**, with an expiry date.
-2. Pick the org, optionally a repo, and the settings.
+1. Open the [page](https://bbestbest.github.io/gh-runners-scan/) and paste a fine-grained token: resource owner = the account that owns the repos, **Actions: Read-only**, with an expiry date.
+2. Pick the owner, optionally a repo, and the settings.
 3. Optional: tick "Remember". The token is stored encrypted under a passphrase that is never stored. Let Chrome save the passphrase, and later visits open straight to the dashboard.
 
 The page talks only to `api.github.com` and never changes anything. It's free to host on a public repo.
