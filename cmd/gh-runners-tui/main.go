@@ -17,7 +17,7 @@ import (
 func main() {
 	cfg := config.Load()
 
-	org, args := splitOrg(os.Args[1:], cfg.Org)
+	org, args := splitOrg(os.Args[1:], "")
 
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: gh-runner [owner] [flags]")
@@ -30,12 +30,15 @@ func main() {
 	once := flag.Bool("once", false, "print tables once and exit")
 	flag.CommandLine.Parse(args)
 
-	owner, ownerErr := resolveOwner(org)
-	opts := options{org: owner, label: *label, days: *days, interval: *interval, repo: *repo}
+	targets, targetsErr := scan.ResolveTargets(context.Background(), org, *repo, cfg.Scan, cfg.Org)
+	opts := options{targets: targets, label: *label, days: *days, interval: *interval, repo: *repo}
+	if len(targets) > 0 {
+		opts.org = targets[0].Owner
+	}
 
 	if *once {
-		if ownerErr != nil {
-			fmt.Fprintln(os.Stderr, "gh-runner: "+noOwnerHint(ownerErr))
+		if targetsErr != nil {
+			fmt.Fprintln(os.Stderr, "gh-runner: "+noOwnerHint(targetsErr))
 			os.Exit(1)
 		}
 		printOnce(opts)
@@ -54,13 +57,6 @@ func noOwnerHint(err error) string {
 		hint += ", or set org in " + path
 	}
 	return hint
-}
-
-func resolveOwner(owner string) (string, error) {
-	if owner != "" {
-		return owner, nil
-	}
-	return scan.Login(context.Background())
 }
 
 func envDays(cfg config.Config) int {
@@ -102,6 +98,9 @@ func splitOrg(argv []string, fallback string) (string, []string) {
 }
 
 func scanTarget(ctx context.Context, opts options, progress func(done, total int)) ([]scan.Job, error) {
+	if len(opts.targets) > 0 {
+		return scan.ScanTargets(ctx, opts.targets, opts.days, progress)
+	}
 	if opts.repo != "" {
 		return scan.ScanRepo(ctx, opts.org, opts.repo, progress)
 	}
@@ -111,16 +110,22 @@ func scanTarget(ctx context.Context, opts options, progress func(done, total int
 func printOnce(opts options) {
 	jobs, scanErr := scanLabeled(context.Background(), opts, func(done, total int) {
 		if total < 0 {
-			fmt.Fprintf(os.Stderr, "\r\033[Klisting repos in %s", opts.org)
+			fmt.Fprintf(os.Stderr, "\r\033[Klisting repos in %s", scan.TargetLabel(opts.targets))
 			return
 		}
-		fmt.Fprintf(os.Stderr, "\r\033[Kscanning %s  %d/%d repos", opts.org, done, total)
+		fmt.Fprintf(os.Stderr, "\r\033[Kscanning %s  %d/%d repos", scan.TargetLabel(opts.targets), done, total)
 	})
 	fmt.Fprint(os.Stderr, "\r\033[K")
 	scan.SaveCache()
 
 	running, queued := scan.SplitJobs(jobs)
 	now := time.Now().UTC()
+	repoName := func(j scan.Job) string {
+		if scan.MultiOwner(opts.targets) {
+			return j.Owner + "/" + j.Repo
+		}
+		return j.Repo
+	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 
@@ -131,7 +136,7 @@ func printOnce(opts options) {
 		if !j.StartedAt.IsZero() {
 			elapsed = fmtElapsed(now.Sub(j.StartedAt))
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", j.Runner, j.Repo, j.Workflow, j.Branch, j.Name, elapsed)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", j.Runner, repoName(j), j.Workflow, j.Branch, j.Name, elapsed)
 	}
 
 	fmt.Fprintln(w)
@@ -142,7 +147,7 @@ func printOnce(opts options) {
 		if !j.CreatedAt.IsZero() {
 			wait = fmt.Sprintf("%dm", int(now.Sub(j.CreatedAt).Minutes()))
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", wait, j.Repo, j.Workflow, j.Branch, j.Name, j.Labels)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", wait, repoName(j), j.Workflow, j.Branch, j.Name, j.Labels)
 	}
 
 	w.Flush()

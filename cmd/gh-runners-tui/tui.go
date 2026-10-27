@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,7 +47,7 @@ var keyHints = [][2]string{
 	{"/", "filter"},
 	{"h/l", "panel"},
 	{"r", "rescan"},
-	{"O", "owner"},
+	{"O", "choose"},
 	{"u", "usage"},
 	{"q", "quit"},
 }
@@ -91,6 +92,7 @@ type tickMsg time.Time
 
 type options struct {
 	org      string
+	targets  []scan.Target
 	label    string
 	days     int
 	interval int
@@ -98,8 +100,17 @@ type options struct {
 }
 
 type pick struct {
-	owner string
-	repo  string
+	targets []scan.Target
+}
+
+type choice struct {
+	all   bool
+	repos map[string]bool
+}
+
+type pickRow struct {
+	login string
+	kind  string
 }
 
 type model struct {
@@ -134,6 +145,8 @@ type model struct {
 	reposErr    error
 	repoSeq     int
 	pending     *pick
+	sel         map[string]*choice
+	selNote     string
 
 	spin      spinner.Model
 	scanning  bool
@@ -161,17 +174,27 @@ type model struct {
 }
 
 func newModel(opts options) model {
+	if len(opts.targets) == 0 && opts.org != "" {
+		opts.targets = []scan.Target{{Owner: opts.org, All: true}}
+		if opts.repo != "" {
+			if owner, name := scan.SplitRepo(opts.org, opts.repo); name != "" {
+				opts.targets = []scan.Target{{Owner: owner, Repos: []string{name}}}
+			}
+		}
+	}
 	m := model{
 		opts:      opts,
 		nextIn:    opts.interval,
 		width:     120,
 		height:    40,
-		scanning:  opts.org != "",
+		scanning:  len(opts.targets) > 0,
 		progress:  progressMsg{0, scan.TotalUnknown},
 		repoCount: scan.TotalUnknown,
 		cancels:   map[int64]bool{},
 	}
-	m.picking = opts.org == ""
+	if len(opts.targets) == 0 {
+		m.openPicker()
+	}
 
 	m.runTable = newTable(runningPanelCols)
 	m.qTable = newTable(queuedPanelCols)
@@ -206,8 +229,12 @@ func tableStyles() table.Styles {
 	return st
 }
 
+func (m model) hasTargets() bool {
+	return len(m.opts.targets) > 0
+}
+
 func (m model) Init() tea.Cmd {
-	if m.opts.org == "" {
+	if !m.hasTargets() {
 		return tea.Batch(tickCmd(), m.spin.Tick, accountsCmd)
 	}
 	return tea.Batch(scanCmd(context.Background(), m.opts, 0), tickCmd(), m.spin.Tick, accountsCmd)
@@ -226,7 +253,7 @@ func (m *model) startScan() tea.Cmd {
 	if m.pending != nil {
 		m.applyPending()
 	}
-	if m.opts.org == "" {
+	if !m.hasTargets() {
 		return nil
 	}
 	return m.beginScan()
@@ -235,8 +262,9 @@ func (m *model) startScan() tea.Cmd {
 func (m *model) applyPending() {
 	p := m.pending
 	m.pending = nil
-	m.opts.org = p.owner
-	m.opts.repo = p.repo
+	m.opts.targets = p.targets
+	m.opts.org = p.targets[0].Owner
+	m.opts.repo = ""
 	m.jobs = nil
 	m.scanErr = nil
 	m.lastScan = ""
@@ -350,6 +378,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.repoChoices = msg.names
+		if c := m.sel[strings.ToLower(msg.owner)]; c != nil {
+			var extra []string
+			for name := range c.repos {
+				if !slices.Contains(msg.names, name) {
+					extra = append(extra, name)
+				}
+			}
+			sort.Strings(extra)
+			m.repoChoices = append(append([]string{}, msg.names...), extra...)
+		}
 		m.reposErr = msg.err
 		m.reposReady = true
 		return m, nil
@@ -509,9 +547,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.nextIn = m.opts.interval
 		return m, m.startScan()
 	case "O":
-		m.picking = true
-		m.pickStep = 0
-		m.accountCursor = m.currentAccount()
+		m.openPicker()
 		if m.accountsErr != nil {
 			m.accountsReady = false
 			m.accountsErr = nil
@@ -575,9 +611,47 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *model) openPicker() {
+	m.picking = true
+	m.pickStep = 0
+	m.selNote = ""
+	m.sel = map[string]*choice{}
+	for _, t := range m.opts.targets {
+		c := &choice{all: t.All, repos: map[string]bool{}}
+		for _, r := range t.Repos {
+			c.repos[r] = true
+		}
+		m.sel[strings.ToLower(t.Owner)] = c
+	}
+	m.accountCursor = m.currentAccount()
+}
+
+func (m model) pickAccounts() []pickRow {
+	rows := make([]pickRow, 0, len(m.accounts)+len(m.opts.targets))
+	seen := map[string]bool{}
+	for _, a := range m.accounts {
+		kind := "you"
+		if a.Org {
+			kind = "org"
+		}
+		rows = append(rows, pickRow{a.Login, kind})
+		seen[strings.ToLower(a.Login)] = true
+	}
+	for _, t := range m.opts.targets {
+		if !seen[strings.ToLower(t.Owner)] {
+			rows = append(rows, pickRow{t.Owner, "saved"})
+			seen[strings.ToLower(t.Owner)] = true
+		}
+	}
+	return rows
+}
+
 func (m model) currentAccount() int {
-	for i, a := range m.accounts {
-		if strings.EqualFold(a.Login, m.opts.org) {
+	if len(m.opts.targets) == 0 {
+		return 0
+	}
+	for i, r := range m.pickAccounts() {
+		if strings.EqualFold(r.login, m.opts.targets[0].Owner) {
 			return i
 		}
 	}
@@ -586,20 +660,73 @@ func (m model) currentAccount() int {
 
 func (m model) pickerRows() int {
 	if m.pickStep == 0 {
-		return len(m.accounts)
+		return len(m.pickAccounts())
 	}
 	return len(m.repoChoices) + 1
 }
 
 func (m *model) movePick(delta int) {
 	if m.pickStep == 0 {
-		m.accountCursor = clamp(m.accountCursor+delta, len(m.accounts))
+		m.accountCursor = clamp(m.accountCursor+delta, len(m.pickAccounts()))
 		return
 	}
 	m.repoCursor = clamp(m.repoCursor+delta, len(m.repoChoices)+1)
 }
 
+func (m *model) toggleAccount() {
+	rows := m.pickAccounts()
+	if m.accountCursor < 0 || m.accountCursor >= len(rows) {
+		return
+	}
+	key := strings.ToLower(rows[m.accountCursor].login)
+	if m.sel[key] != nil {
+		delete(m.sel, key)
+		return
+	}
+	m.sel[key] = &choice{all: true, repos: map[string]bool{}}
+}
+
+func (m *model) toggleRepo() {
+	key := strings.ToLower(m.pickOwner)
+	c := m.sel[key]
+	if c == nil {
+		c = &choice{repos: map[string]bool{}}
+		m.sel[key] = c
+	}
+	if m.repoCursor == 0 {
+		if c.all {
+			delete(m.sel, key)
+			return
+		}
+		c.all = true
+		c.repos = map[string]bool{}
+		return
+	}
+	if m.repoCursor > len(m.repoChoices) {
+		return
+	}
+	name := m.repoChoices[m.repoCursor-1]
+	switch {
+	case c.all:
+		c.all = false
+		c.repos = map[string]bool{}
+		for _, r := range m.repoChoices {
+			if r != name {
+				c.repos[r] = true
+			}
+		}
+	case c.repos[name]:
+		delete(c.repos, name)
+	default:
+		c.repos[name] = true
+	}
+	if !c.all && len(c.repos) == 0 {
+		delete(m.sel, key)
+	}
+}
+
 func (m model) pickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.selNote = ""
 	switch msg.String() {
 	case "ctrl+c":
 		return m, quitCmd()
@@ -608,7 +735,7 @@ func (m model) pickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pickStep = 0
 			return m, nil
 		}
-		if m.opts.org == "" {
+		if !m.hasTargets() {
 			return m, quitCmd()
 		}
 		m.picking = false
@@ -621,43 +748,82 @@ func (m model) pickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.movePick(-m.pickerRows())
 	case "G", "end":
 		m.movePick(m.pickerRows())
-	case "enter":
+	case " ":
 		if m.pickStep == 0 {
-			if m.accountCursor < 0 || m.accountCursor >= len(m.accounts) {
-				return m, nil
-			}
-			m.pickOwner = m.accounts[m.accountCursor].Login
-			m.pickStep = 1
-			m.repoChoices = nil
-			m.reposReady = false
-			m.reposErr = nil
-			m.repoCursor = 0
-			m.repoSeq++
-			return m, reposCmd(m.repoSeq, m.pickOwner, m.opts.days)
+			m.toggleAccount()
+		} else {
+			m.toggleRepo()
 		}
-		repo := ""
-		if m.repoCursor > 0 && m.repoCursor <= len(m.repoChoices) {
-			repo = m.repoChoices[m.repoCursor-1]
+	case "s":
+		if m.pickStep == 0 {
+			return m.saveSelection()
 		}
-		return m.applyPick(m.pickOwner, repo)
+	case "enter":
+		if m.pickStep == 1 {
+			m.pickStep = 0
+			return m, nil
+		}
+		rows := m.pickAccounts()
+		if m.accountCursor < 0 || m.accountCursor >= len(rows) {
+			return m, nil
+		}
+		m.pickOwner = rows[m.accountCursor].login
+		m.pickStep = 1
+		m.repoChoices = nil
+		m.reposReady = false
+		m.reposErr = nil
+		m.repoCursor = 0
+		m.repoSeq++
+		return m, reposCmd(m.repoSeq, m.pickOwner, m.opts.days)
 	}
 	return m, nil
 }
 
-func (m model) applyPick(owner, repo string) (tea.Model, tea.Cmd) {
+func (m model) selection() []scan.Target {
+	var targets []scan.Target
+	for _, r := range m.pickAccounts() {
+		c := m.sel[strings.ToLower(r.login)]
+		if c == nil {
+			continue
+		}
+		t := scan.Target{Owner: r.login, All: c.all}
+		if !c.all {
+			for name := range c.repos {
+				t.Repos = append(t.Repos, name)
+			}
+			sort.Strings(t.Repos)
+		}
+		targets = append(targets, t)
+	}
+	return targets
+}
+
+func (m model) saveSelection() (tea.Model, tea.Cmd) {
+	targets := m.selection()
+	if len(targets) == 0 {
+		m.selNote = "select at least one account or repo"
+		return m, nil
+	}
 	m.picking = false
 	m.pickStep = 0
-	m.saveErr = config.SetOrg(owner)
-	if strings.EqualFold(owner, m.opts.org) && repo == m.opts.repo {
+	m.saveErr = config.SetScan(scan.FormatTargets(targets))
+	if strings.Join(scan.FormatTargets(targets), ",") == strings.Join(scan.FormatTargets(m.opts.targets), ",") {
 		m.pending = nil
 		return m, nil
 	}
-	m.pending = &pick{owner: owner, repo: repo}
-	if m.opts.org == "" {
+	m.pending = &pick{targets: targets}
+	if !m.hasTargets() {
 		m.nextIn = m.opts.interval
 		return m, m.startScan()
 	}
 	return m, nil
+}
+
+func (m model) repoName(j scan.Job) string {
+	if scan.MultiOwner(m.opts.targets) && j.Owner != "" {
+		return j.Owner + "/" + j.Repo
+	}
+	return j.Repo
 }
 
 func (m *model) focusedTable() *table.Model {
@@ -775,7 +941,7 @@ func (m *model) refresh() {
 	qCursor := m.qTable.Cursor()
 
 	m.running, m.queued = scan.SplitJobs(scan.FilterJobs(m.jobs, m.filter))
-	m.repos = repoCounts(m.running, m.queued)
+	m.repos = repoCounts(m.running, m.queued, m.repoName)
 
 	now := time.Now().UTC()
 	cols := m.runTable.Columns()
@@ -799,7 +965,7 @@ func (m *model) refresh() {
 		}
 		runRows = append(runRows, table.Row{
 			cell(j.Runner, cols, 0),
-			cell(j.Repo, cols, 1),
+			cell(m.repoName(j), cols, 1),
 			cell(j.Name, cols, 2),
 			cell(elapsed, cols, 3),
 		})
@@ -828,7 +994,7 @@ func (m *model) refresh() {
 		}
 		qRows = append(qRows, table.Row{
 			cell(wait, qcols, 0),
-			cell(j.Repo, qcols, 1),
+			cell(m.repoName(j), qcols, 1),
 			cell(j.Name, qcols, 2),
 			cell(j.Labels, qcols, 3),
 		})
@@ -851,7 +1017,7 @@ func waitColor(mins int, base lipgloss.Style) lipgloss.Style {
 	return base
 }
 
-func repoCounts(running, queued []scan.Job) []repoCount {
+func repoCounts(running, queued []scan.Job, name func(scan.Job) string) []repoCount {
 	idx := map[string]int{}
 	var out []repoCount
 	add := func(repo string, isRunning bool) {
@@ -868,10 +1034,10 @@ func repoCounts(running, queued []scan.Job) []repoCount {
 		}
 	}
 	for _, j := range running {
-		add(j.Repo, true)
+		add(name(j), true)
 	}
 	for _, j := range queued {
-		add(j.Repo, false)
+		add(name(j), false)
 	}
 	sort.SliceStable(out, func(a, b int) bool {
 		if out[a].running != out[b].running {
@@ -1149,7 +1315,7 @@ func colUnits(name string) int {
 
 const keybarHeight = 1
 
-const statusPanelHeight = 4
+const statusPanelHeight = 5
 
 const maxPickRows = 10
 
@@ -1175,7 +1341,7 @@ func (m model) bodyView() string {
 	left, right := m.columns()
 	runH, qH := m.listHeights()
 	col := lipgloss.JoinVertical(lipgloss.Left,
-		panel("Status", "", false, left, statusPanelHeight, m.statusPanelLines()),
+		panel("Status", "", false, left, statusPanelHeight, m.statusPanelLines(left-2)),
 		panel("Repos", m.reposFooter(), false, left, m.reposHeight(), m.repoLines(left-2)),
 		panel(fmt.Sprintf("[1] Running (%d)", len(m.running)), countFooter(m.runTable), m.focus == 0, left, runH, m.tableLines(0)),
 		panel(fmt.Sprintf("[2] Queued (%d)", len(m.queued)), countFooter(m.qTable), m.focus == 1, left, qH, m.tableLines(1)),
@@ -1235,12 +1401,13 @@ func countFooter(t table.Model) string {
 	return fmt.Sprintf("%d of %d", t.Cursor()+1, len(t.Rows()))
 }
 
-func (m model) statusPanelLines() []string {
-	first := " " + hlStyle.Render(m.orgLabel()) + dimStyle.Render(" · "+m.repoCountLabel()+" · scanned "+m.lastScanLabel()+" UTC")
+func (m model) statusPanelLines(width int) []string {
+	owners := " " + hlStyle.Render(ansi.Truncate(m.orgLabel(), width-2, "…"))
+	first := " " + dimStyle.Render(m.repoCountLabel()+" · scanned "+m.lastScanLabel()+" UTC")
 	second := " " + dimStyle.Render("no scan yet")
 	switch {
-	case m.opts.org == "":
-		second = " " + dimStyle.Render("press O to pick an account")
+	case !m.hasTargets():
+		second = " " + dimStyle.Render("press O to choose what to scan")
 	case m.scanning && m.progress.total < 0:
 		second = " " + m.spin.View() + dimStyle.Render(" listing repos…")
 	case m.scanning:
@@ -1248,7 +1415,7 @@ func (m model) statusPanelLines() []string {
 	case m.lastCost != nil:
 		second = " " + dimStyle.Render(fmt.Sprintf("last scan %d req, %d free (304)", m.lastCost.requests, m.lastCost.free))
 	}
-	return []string{first, second}
+	return []string{owners, first, second}
 }
 
 func (m model) pickerPopup() string {
@@ -1256,46 +1423,52 @@ func (m model) pickerPopup() string {
 	if w > 64 {
 		w = 64
 	}
-	limit := m.bodyHeight() - 10
+	limit := m.bodyHeight() - 12
 	if limit > maxPickRows {
 		limit = maxPickRows
 	}
 	if limit < 1 {
 		limit = 1
 	}
-	title := "Pick account"
-	hint := "enter next · esc close"
-	if m.opts.org == "" {
-		hint = "enter next · esc quit"
+	title := "Choose what to scan"
+	hints := []string{"space all/none · enter pick repos", "s save · esc cancel"}
+	if !m.hasTargets() {
+		hints[1] = "s save · esc quit"
 	}
 	var rows []string
 	cursor := m.accountCursor
 	switch {
 	case m.pickStep == 1:
-		title = "Pick repo · " + m.pickOwner
-		hint = "enter scan · esc back"
+		title = "Repos · " + m.pickOwner
+		hints = []string{"space toggle · enter/esc back"}
 		cursor = m.repoCursor
-		rows = append(rows, "All repositories")
-		rows = append(rows, m.repoChoices...)
+		c := m.sel[strings.ToLower(m.pickOwner)]
+		all := c != nil && c.all
+		rows = append(rows, checkbox(all, false)+" all repositories")
+		for _, name := range m.repoChoices {
+			rows = append(rows, checkbox(all || (c != nil && c.repos[name]), false)+" "+name)
+		}
 	case !m.accountsReady:
 		rows = nil
 	default:
+		accounts := m.pickAccounts()
 		nameW := 0
-		for _, a := range m.accounts {
-			if lw := ansi.StringWidth(a.Login); lw > nameW {
+		for _, a := range accounts {
+			if lw := ansi.StringWidth(a.login); lw > nameW {
 				nameW = lw
 			}
 		}
-		for _, a := range m.accounts {
-			kind := "you"
-			if a.Org {
-				kind = "org"
+		for _, a := range accounts {
+			c := m.sel[strings.ToLower(a.login)]
+			some := c != nil && !c.all && len(c.repos) > 0
+			row := checkbox(c != nil && c.all, some) + " " + a.login + strings.Repeat(" ", nameW-ansi.StringWidth(a.login)) + "  " + fmt.Sprintf("%-5s", a.kind)
+			switch {
+			case c != nil && c.all:
+				row += " all repos"
+			case some:
+				row += fmt.Sprintf(" %d %s", len(c.repos), plural(len(c.repos), "repo", "repos"))
 			}
-			row := a.Login + strings.Repeat(" ", nameW-ansi.StringWidth(a.Login)) + "  " + kind
-			if strings.EqualFold(a.Login, m.opts.org) {
-				row += "  current"
-			}
-			rows = append(rows, row)
+			rows = append(rows, strings.TrimRight(row, " "))
 		}
 	}
 
@@ -1327,12 +1500,35 @@ func (m model) pickerPopup() string {
 	case m.pickStep == 1 && m.opts.days > 0:
 		body = append(body, "  "+dimStyle.Render(fmt.Sprintf("repos pushed in the last %d days", m.opts.days)))
 	}
-	body = append(body, "", "  "+dimStyle.Render(hint))
+	if m.selNote != "" {
+		body = append(body, "  "+yellowStyle.Render(m.selNote))
+	}
+	body = append(body, "")
+	for _, h := range hints {
+		body = append(body, "  "+dimStyle.Render(h))
+	}
 	footer := ""
 	if n := len(rows); n > 0 {
 		footer = fmt.Sprintf("%d of %d", cursor+1, n)
 	}
 	return panel(title, footer, true, w, len(body)+2, body)
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+func checkbox(on, some bool) string {
+	switch {
+	case on:
+		return "[x]"
+	case some:
+		return "[~]"
+	}
+	return "[ ]"
 }
 
 func (m model) reposFooter() string {
@@ -1410,7 +1606,7 @@ func (m model) detailPanel(w, h int) string {
 
 	lines := []string{
 		"",
-		" " + hlStyle.Render(j.Repo) + dimStyle.Render(" › "+j.Workflow+" › ") + boldStyle.Render(j.Name),
+		" " + hlStyle.Render(m.repoName(j)) + dimStyle.Render(" › "+j.Workflow+" › ") + boldStyle.Render(j.Name),
 		"",
 		kv("Status", statusStyle.Render(status)),
 	}
@@ -1447,7 +1643,7 @@ func (m model) detailPanel(w, h int) string {
 				elapsed = fmtElapsed(now.Sub(r.StartedAt))
 			}
 			runner := fmt.Sprintf("%-10s", r.Runner)
-			what := ansi.Truncate(r.Repo+" › "+r.Name, inner-ansi.StringWidth(runner)-1-len(elapsed)-2, "…")
+			what := ansi.Truncate(m.repoName(r)+" › "+r.Name, inner-ansi.StringWidth(runner)-1-len(elapsed)-2, "…")
 			gap := inner - ansi.StringWidth(runner) - 1 - ansi.StringWidth(what) - len(elapsed)
 			if gap < 1 {
 				gap = 1
@@ -1471,7 +1667,7 @@ func (m model) cancelPopup() string {
 	j := m.confirmJob
 	body := []string{
 		"",
-		"  Cancel run #" + strconv.FormatInt(j.RunID, 10) + " of " + hlStyle.Render(j.Repo+" › "+j.Workflow) + "?",
+		"  Cancel run #" + strconv.FormatInt(j.RunID, 10) + " of " + hlStyle.Render(m.repoName(j)+" › "+j.Workflow) + "?",
 		"  " + dimStyle.Render("GitHub cancels the whole run, not one job."),
 		"",
 		"  " + hlStyle.Render("y") + dimStyle.Render(" cancel run      ") + hlStyle.Render("any other key") + dimStyle.Render(" keep it"),
@@ -1605,10 +1801,10 @@ func (m model) usageIndicator() string {
 }
 
 func (m model) orgLabel() string {
-	if m.opts.org == "" {
+	if !m.hasTargets() {
 		return "—"
 	}
-	return m.opts.org
+	return scan.TargetLabel(m.opts.targets)
 }
 
 func (m model) repoCountLabel() string {
@@ -1648,11 +1844,7 @@ func (m model) statusView() string {
 		parts = append(parts, dimStyle.Render("filter: "+m.filter))
 	}
 	if m.pending != nil {
-		next := m.pending.owner
-		if m.pending.repo != "" {
-			next += "/" + m.pending.repo
-		}
-		parts = append(parts, yellowStyle.Render("next scan: "+next))
+		parts = append(parts, yellowStyle.Render("next scan: "+scan.TargetLabel(m.pending.targets)))
 	}
 	parts = append(parts, hlStyle.Render(m.orgLabel())+dimStyle.Render(fmt.Sprintf(" · next %ds", m.nextIn)), m.usageIndicator())
 	right := strings.Join(parts, dimStyle.Render(" · ")) + " "

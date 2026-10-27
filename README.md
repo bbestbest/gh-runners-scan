@@ -23,13 +23,13 @@ Token: `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`.
 
 | flag | env | default |
 |---|---|---|
-| `<owner>` | | `org` in `~/.config/gh-runners/config`, else your own account |
+| `<owner>` | | `scan` in `~/.config/gh-runners/config` (e.g. `scan = my-org/*, other-org/api`, saved by `O`), else `org`, else your own account |
 | `--days N` (repos pushed within N days, 0 = all) | `GH_RUNNERS_DAYS` | 7 |
 | `--label`, `--repo`, `--interval` (TUI), `--select` (fzf) | | |
 
 ## Keys
 
-`j`/`k` move · `h`/`l` switch panel · `/` filter · `enter` open · `c` cancel run · `r` rescan · `O` pick an account, then a repo or all repos (applies at the next scan; `r` for now) · `u` API usage · `q` quit
+`j`/`k` move · `h`/`l` switch panel · `/` filter · `enter` open · `c` cancel run · `r` rescan · `O` choose what to scan: a checklist of accounts (`space` all/none) and their repos (`enter`), `s` saves (applies at the next scan; `r` for now) · `u` API usage · `q` quit
 
 ## Reading it
 
@@ -39,7 +39,7 @@ Queued and running jobs with the same labels: runners are **busy**. Queued with 
 
 1. Open the [page](https://bbestbest.github.io/gh-runners-scan/) and paste a fine-grained token: resource owner = the account that owns the repos, **Actions: Read-only**, with an expiry date.
 2. Pick the owner, optionally a repo, and the settings.
-3. Optional: tick "Remember". The token is stored encrypted under a passphrase that is never stored. Let Chrome save the passphrase, and later visits open straight to the dashboard.
+3. Optional: tick "Remember". The token is stored encrypted under a passphrase that is never stored. Let Chrome save the passphrase, and later visits open straight to the dashboard. Within a tab, the unlocked token and view are kept encrypted too (AES-GCM under a random, non-exportable key in IndexedDB), so nothing readable is ever written to browser storage.
 
 The page talks only to `api.github.com` and never changes anything. It's free to host on a public repo.
 

@@ -313,3 +313,32 @@ func TestSetOrgErrorsWhenPathUnavailable(t *testing.T) {
 		t.Fatal("SetOrg() = nil, want an error when the parent path is a file")
 	}
 }
+
+func TestSetScanRoundTripKeepsOtherKeys(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	path := filepath.Join(dir, "gh-runners", "config")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("# mine\norg = org-a\ndays = 30\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetScan([]string{"org-a/*", "org-b/api"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Load()
+	if !reflect.DeepEqual(cfg.Scan, []string{"org-a/*", "org-b/api"}) || cfg.Org != "org-a" || cfg.Days != 30 {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.HasPrefix(string(data), "# mine\norg = org-a\ndays = 30\nscan = org-a/*, org-b/api\n") {
+		t.Fatalf("file = %q", data)
+	}
+	if err := SetScan([]string{"org-c/*"}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := Load(); !reflect.DeepEqual(cfg.Scan, []string{"org-c/*"}) {
+		t.Fatalf("second save: %+v", cfg.Scan)
+	}
+}

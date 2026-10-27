@@ -190,7 +190,7 @@ func scrollModel(t *testing.T, n int) model {
 	m := newModel(options{org: "org-c", interval: 30})
 	m.jobs = manyJobs(n)
 	m.refresh()
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 42})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 43})
 	return next.(model)
 }
 
@@ -501,6 +501,14 @@ func TestCancelWorksFromQueuedPanel(t *testing.T) {
 	}
 }
 
+func space() tea.KeyMsg {
+	return tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")}
+}
+
+func formatted(ts []scan.Target) string {
+	return strings.Join(scan.FormatTargets(ts), ",")
+}
+
 func TestPickWhileScanningWaitsForNextScan(t *testing.T) {
 	m := newTestModel(t)
 	stopped := false
@@ -511,33 +519,36 @@ func TestPickWhileScanningWaitsForNextScan(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m = withAccounts(m, []scan.Account{{Login: "me-user"}, {Login: "org-b", Org: true}}, nil)
 	m = send(m, key("O"))
+	m = send(m, key("g"))
 	m = send(m, key("j"))
 	m = send(m, key("enter"))
-	m = withRepos(m, []string{"api"}, nil)
-	m = send(m, key("G"))
-	m = send(m, key("enter"))
+	m = withRepos(m, []string{"api", "web"}, nil)
+	m = send(m, key("j"))
+	m = send(m, space())
+	m = send(m, key("esc"))
+	m = send(m, key("s"))
 
-	if stopped || m.scanID != oldID || m.opts.org != "org-c" {
-		t.Fatalf("pick interrupted the running scan: stopped=%v scanID=%d org=%q", stopped, m.scanID, m.opts.org)
+	if stopped || m.scanID != oldID || formatted(m.opts.targets) != "org-c/repo-a" {
+		t.Fatalf("save interrupted the running scan: stopped=%v scanID=%d targets=%v", stopped, m.scanID, m.opts.targets)
 	}
-	if m.pending == nil || m.pending.owner != "org-b" || m.pending.repo != "api" {
-		t.Fatalf("pending = %+v, want org-b/api", m.pending)
+	if m.pending == nil || formatted(m.pending.targets) != "org-b/api,org-c/repo-a" {
+		t.Fatalf("pending = %+v", m.pending)
 	}
-	if !strings.Contains(ansi.Strip(m.statusView()), "next scan: org-b/api") {
-		t.Fatal("key bar does not show the queued change")
+	if !strings.Contains(ansi.Strip(m.statusView()), "next scan: org-b/api, org-c/repo-a") {
+		t.Fatal("key bar does not show the queued selection")
 	}
 
 	next, _ := m.Update(scanDoneMsg{id: oldID, jobs: testJobs()})
 	m = next.(model)
-	if len(m.jobs) != 3 || m.opts.org != "org-c" {
-		t.Fatalf("the running scan's results were dropped: jobs=%d org=%q", len(m.jobs), m.opts.org)
+	if len(m.jobs) != 3 {
+		t.Fatalf("the running scan's results were dropped: jobs=%d", len(m.jobs))
 	}
 
 	m.nextIn = 1
 	next, cmd := m.Update(tickMsg(time.Now()))
 	m = next.(model)
-	if cmd == nil || !m.scanning || m.scanID == oldID || m.opts.org != "org-b" || m.opts.repo != "api" || m.pending != nil || len(m.jobs) != 0 {
-		t.Fatalf("next scan did not switch: scanning=%v org=%q repo=%q pending=%v jobs=%d", m.scanning, m.opts.org, m.opts.repo, m.pending, len(m.jobs))
+	if cmd == nil || !m.scanning || m.scanID == oldID || formatted(m.opts.targets) != "org-b/api,org-c/repo-a" || m.pending != nil || len(m.jobs) != 0 {
+		t.Fatalf("next scan did not switch: scanning=%v targets=%v pending=%v jobs=%d", m.scanning, m.opts.targets, m.pending, len(m.jobs))
 	}
 }
 
@@ -546,27 +557,110 @@ func TestRescanKeyAppliesQueuedPick(t *testing.T) {
 	m := withAccounts(newTestModel(t), []scan.Account{{Login: "me-user"}, {Login: "org-c", Org: true}}, nil)
 	m.scanning = false
 	m = send(m, key("O"))
-	m = send(m, key("k"))
-	m = send(m, key("enter"))
-	m = withRepos(m, []string{"dots"}, nil)
-	m = send(m, key("enter"))
-	if m.scanning || m.pending == nil {
-		t.Fatalf("pick started a scan at once: scanning=%v pending=%v", m.scanning, m.pending)
+	m = send(m, key("g"))
+	m = send(m, space())
+	m = send(m, key("j"))
+	m = send(m, space())
+	m = send(m, key("s"))
+	if m.scanning || m.pending == nil || formatted(m.pending.targets) != "me-user/*" {
+		t.Fatalf("save started a scan at once or wrong pending: scanning=%v pending=%v", m.scanning, m.pending)
 	}
 	m = send(m, key("r"))
-	if !m.scanning || m.opts.org != "me-user" || m.opts.repo != "" || m.pending != nil {
-		t.Fatalf("r: scanning=%v org=%q repo=%q pending=%v", m.scanning, m.opts.org, m.opts.repo, m.pending)
+	if !m.scanning || formatted(m.opts.targets) != "me-user/*" || m.pending != nil {
+		t.Fatalf("r: scanning=%v targets=%v pending=%v", m.scanning, m.opts.targets, m.pending)
 	}
 }
 
 func TestFirstPickWithoutOwnerScansAtOnce(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := withAccounts(newModel(options{interval: 30}), []scan.Account{{Login: "me-user"}}, nil)
+	m = send(m, space())
+	m, cmd := sendCmd(m, key("s"))
+	if cmd == nil || !m.scanning || formatted(m.opts.targets) != "me-user/*" || m.pending != nil {
+		t.Fatalf("scanning=%v targets=%v pending=%v", m.scanning, m.opts.targets, m.pending)
+	}
+	if got := config.Load().Scan; strings.Join(got, ",") != "me-user/*" {
+		t.Fatalf("saved scan = %v", got)
+	}
+}
+
+func TestSaveNeedsASelection(t *testing.T) {
+	m := withAccounts(newModel(options{interval: 30}), []scan.Account{{Login: "me-user"}}, nil)
+	m = send(m, key("s"))
+	if !m.picking || m.scanning || !strings.Contains(popupText(m), "select at least one account or repo") {
+		t.Fatal("empty selection was accepted")
+	}
+}
+
+func TestChecklistMarksAllSomeNone(t *testing.T) {
+	m := withAccounts(layoutModel(t, 140, 40), []scan.Account{{Login: "me-user"}, {Login: "org-a", Org: true}, {Login: "org-b", Org: true}}, nil)
+	m.opts.targets = []scan.Target{{Owner: "me-user", All: true}, {Owner: "org-a", Repos: []string{"api", "web"}}}
+	m = send(m, key("O"))
+	view := popupText(m)
+	for _, want := range []string{"Choose what to scan", "[x] me-user  you   all repos", "[~] org-a    org   2 repos", "[ ] org-b    org", "space all/none · enter pick repos", "s save · esc cancel"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("checklist lacks %q", want)
+		}
+	}
+}
+
+func TestToggleRepoWhileAllSelectsTheRest(t *testing.T) {
+	m := withAccounts(newTestModel(t), []scan.Account{{Login: "me-user"}}, nil)
+	m = send(m, key("O"))
+	m = send(m, key("g"))
+	m = send(m, space())
 	m = send(m, key("enter"))
-	m = withRepos(m, nil, nil)
-	m, cmd := sendCmd(m, key("enter"))
-	if cmd == nil || !m.scanning || m.opts.org != "me-user" || m.pending != nil {
-		t.Fatalf("scanning=%v org=%q pending=%v", m.scanning, m.opts.org, m.pending)
+	m = withRepos(m, []string{"a", "b", "c"}, nil)
+	if !strings.Contains(popupText(m), "[x] all repositories") || !strings.Contains(popupText(m), "[x] b") {
+		t.Fatal("all repositories not shown as checked")
+	}
+	m = send(m, key("j"))
+	m = send(m, key("j"))
+	m = send(m, space())
+	c := m.sel["me-user"]
+	if c.all || len(c.repos) != 2 || !c.repos["a"] || !c.repos["c"] {
+		t.Fatalf("after unchecking b: all=%v repos=%v", c.all, c.repos)
+	}
+	m = send(m, key("k"))
+	m = send(m, space())
+	m = send(m, key("j"))
+	m = send(m, key("j"))
+	m = send(m, space())
+	if _, ok := m.sel["me-user"]; ok {
+		t.Fatal("unchecking every repo should drop the account")
+	}
+}
+
+func TestSavedReposOutsideTheListStayListed(t *testing.T) {
+	m := newModel(options{targets: []scan.Target{{Owner: "org-a", Repos: []string{"old-repo"}}}, interval: 30})
+	m = withAccounts(m, []scan.Account{{Login: "me-user"}, {Login: "org-a", Org: true}}, nil)
+	m = send(m, key("O"))
+	m = send(m, key("enter"))
+	m = withRepos(m, []string{"fresh"}, nil)
+	if view := popupText(m); !strings.Contains(view, "[ ] fresh") || !strings.Contains(view, "[x] old-repo") {
+		t.Fatal("a saved repo older than the days filter disappeared from the list")
+	}
+}
+
+func TestMultipleOwnersShowOwnerSlashRepo(t *testing.T) {
+	m := newModel(options{targets: []scan.Target{{Owner: "org-a", All: true}, {Owner: "org-b", All: true}}, interval: 30})
+	m.scanning = false
+	now := time.Now().UTC()
+	m.jobs = []scan.Job{
+		{Status: "in_progress", Owner: "org-a", Repo: "api", Name: "build", Runner: "r1", RunID: 1, StartedAt: now},
+		{Status: "queued", Owner: "org-b", Repo: "api", Name: "test", Labels: "x", RunID: 2, CreatedAt: now},
+	}
+	m.refresh()
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	m = next.(model)
+	view := ansi.Strip(m.View())
+	for _, want := range []string{"org-a/api", "org-b/api", "org-a, org-b"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("view lacks %q", want)
+		}
+	}
+	if len(m.repos) != 2 {
+		t.Fatalf("repo counts merged two owners' api repos: %+v", m.repos)
 	}
 }
 
@@ -918,6 +1012,27 @@ func TestRepoPanelCapsRows(t *testing.T) {
 	}
 }
 
+func TestStatusPanelKeepsEachFactOnItsLine(t *testing.T) {
+	m := newModel(options{targets: []scan.Target{{Owner: "org-a", Repos: []string{"web", "api"}}, {Owner: "org-long-name-b", All: true}, {Owner: "org-long-name-c", All: true}}, interval: 30})
+	m.repoCount = 89
+	m.lastScan = "09:12"
+	lines := m.statusPanelLines(30)
+	if len(lines) != 3 {
+		t.Fatalf("status lines = %d, want 3", len(lines))
+	}
+	for i, l := range lines {
+		if w := ansi.StringWidth(l); w > 30 {
+			t.Fatalf("line %d width %d > 30: %q", i, w, ansi.Strip(l))
+		}
+	}
+	if got := ansi.Strip(lines[0]); !strings.HasPrefix(got, " org-a") || !strings.HasSuffix(got, "…") {
+		t.Fatalf("owners line = %q, want cut with …", got)
+	}
+	if got := ansi.Strip(lines[1]); got != " 89 repos · scanned 09:12 UTC" {
+		t.Fatalf("scan line = %q", got)
+	}
+}
+
 func TestBusyRunners(t *testing.T) {
 	jobs := layoutJobs()
 	running, queued := scan.SplitJobs(jobs)
@@ -998,72 +1113,15 @@ func TestPickerOpensOnStartWithoutOwner(t *testing.T) {
 	if !m.picking || m.scanning {
 		t.Fatalf("picking=%v scanning=%v, want the picker open and no scan", m.picking, m.scanning)
 	}
-	if view := popupText(m); !strings.Contains(view, "Pick account") || !strings.Contains(view, "loading accounts") || !strings.Contains(view, "esc quit") {
+	if view := popupText(m); !strings.Contains(view, "Choose what to scan") || !strings.Contains(view, "loading accounts") || !strings.Contains(view, "esc quit") {
 		t.Fatal("startup picker missing title, loading line or quit hint")
 	}
 	m = withAccounts(m, []scan.Account{{Login: "me-user"}, {Login: "org-a", Org: true}}, nil)
-	if view := popupText(m); !strings.Contains(view, " > me-user  you") || !strings.Contains(view, "org-a    org") {
-		t.Fatal("accounts not listed with the cursor on the first one")
+	if view := popupText(m); !strings.Contains(view, " > [ ] me-user  you") || !strings.Contains(view, "[ ] org-a    org") {
+		t.Fatal("accounts not listed unchecked with the cursor on the first one")
 	}
 	if _, cmd := sendCmd(m, key("esc")); cmd == nil {
 		t.Fatal("esc with no owner should quit")
-	}
-}
-
-func TestPickerAccountThenRepoScansThatRepo(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	var asked []string
-	prev := listRepoNames
-	listRepoNames = func(_ context.Context, owner string, days int) ([]string, error) {
-		asked = append(asked, owner+"/"+strconv.Itoa(days))
-		return []string{"api", "web"}, nil
-	}
-	t.Cleanup(func() { listRepoNames = prev })
-
-	m := withAccounts(newTestModel(t), []scan.Account{{Login: "me-user"}, {Login: "org-a", Org: true}, {Login: "org-c", Org: true}}, nil)
-	runCursor := m.runTable.Cursor()
-	m = send(m, key("O"))
-	if !m.picking || m.accountCursor != 2 {
-		t.Fatalf("picking=%v cursor=%d, want open on the current owner org-c", m.picking, m.accountCursor)
-	}
-	m = send(m, key("k"))
-	if m.accountCursor != 1 || m.runTable.Cursor() != runCursor {
-		t.Fatalf("k moved account cursor %d and table cursor %d", m.accountCursor, m.runTable.Cursor())
-	}
-	m, cmd := sendCmd(m, key("enter"))
-	if m.pickStep != 1 || m.pickOwner != "org-a" || cmd == nil {
-		t.Fatalf("enter on an account: step=%d owner=%q cmd=%v", m.pickStep, m.pickOwner, cmd != nil)
-	}
-	if view := popupText(m); !strings.Contains(view, "Pick repo · org-a") || !strings.Contains(view, "loading repositories") {
-		t.Fatal("repo step not shown while loading")
-	}
-	next, _ := m.Update(cmd())
-	m = next.(model)
-	if len(asked) != 1 || asked[0] != "org-a/"+strconv.Itoa(m.opts.days) {
-		t.Fatalf("repos requested = %v", asked)
-	}
-	if view := popupText(m); !strings.Contains(view, " > All repositories") || !strings.Contains(view, "   web") {
-		t.Fatal("repo list not shown with All repositories first")
-	}
-	m = send(m, key("G"))
-	m = send(m, key("enter"))
-	if m.picking || m.pending == nil || m.pending.owner != "org-a" || m.pending.repo != "web" {
-		t.Fatalf("pick: picking=%v pending=%+v", m.picking, m.pending)
-	}
-	if got := config.Load().Org; got != "org-a" {
-		t.Fatalf("saved org = %q, want org-a", got)
-	}
-}
-
-func TestPickerAllRepositoriesClearsRepo(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	m := withAccounts(newTestModel(t), []scan.Account{{Login: "me-user"}, {Login: "org-c", Org: true}}, nil)
-	m = send(m, key("O"))
-	m = send(m, key("enter"))
-	m = withRepos(m, []string{"repo-a"}, nil)
-	m = send(m, key("enter"))
-	if m.picking || m.pending == nil || m.pending.owner != "org-c" || m.pending.repo != "" {
-		t.Fatalf("pending = %+v, want org-c with all repositories", m.pending)
 	}
 }
 

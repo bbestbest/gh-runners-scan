@@ -27,7 +27,7 @@ var frames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "�
 func main() {
 	cfg := config.Load()
 
-	org, args := splitOrg(os.Args[1:], cfg.Org)
+	org, args := splitOrg(os.Args[1:], "")
 
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: gh-runners [owner] [flags]")
@@ -51,13 +51,13 @@ func main() {
 		}
 	}
 
-	org, err := resolveOwner(org)
+	targets, err := scan.ResolveTargets(context.Background(), org, *repo, cfg.Scan, cfg.Org)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gh-runners: "+noOwnerHint(err))
 		os.Exit(1)
 	}
 
-	rows, scanErr := collect(org, *repo, *days, *label)
+	rows, scanErr := collect(targets, *days, *label)
 	scan.SaveCache()
 
 	if selectMode {
@@ -127,13 +127,6 @@ func noOwnerHint(err error) string {
 	return hint
 }
 
-func resolveOwner(owner string) (string, error) {
-	if owner != "" {
-		return owner, nil
-	}
-	return scan.Login(context.Background())
-}
-
 func envDays(cfg config.Config) int {
 	if v := os.Getenv("GH_RUNNERS_DAYS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -146,14 +139,14 @@ func envDays(cfg config.Config) int {
 	return 7
 }
 
-func collect(org, repo string, days int, label string) ([][9]string, error) {
+func collect(targets []scan.Target, days int, label string) ([][9]string, error) {
 	var done, total atomic.Int64
-	stop := startSpinner(org, &done, &total)
+	stop := startSpinner(scan.TargetLabel(targets), &done, &total)
 	progress := func(d, t int) {
 		done.Store(int64(d))
 		total.Store(int64(t))
 	}
-	jobs, scanErr := scanTarget(org, repo, days, progress)
+	jobs, scanErr := scan.ScanTargets(context.Background(), targets, days, progress)
 	stop()
 
 	needle := strings.ToLower(label)
@@ -168,7 +161,7 @@ func collect(org, repo string, days int, label string) ([][9]string, error) {
 			since = j.CreatedAt
 		}
 		row := [9]string{
-			j.Status, j.Repo, j.Workflow, j.Branch, j.Name, runner, j.Labels,
+			j.Status, repoName(j, scan.MultiOwner(targets)), j.Workflow, j.Branch, j.Name, runner, j.Labels,
 			formatTime(since), j.URL,
 		}
 		if needle != "" && !strings.Contains(strings.ToLower(strings.Join(row[:], "\t")), needle) {
@@ -182,11 +175,11 @@ func collect(org, repo string, days int, label string) ([][9]string, error) {
 	return rows, scanErr
 }
 
-func scanTarget(org, repo string, days int, progress func(done, total int)) ([]scan.Job, error) {
-	if repo != "" {
-		return scan.ScanRepo(context.Background(), org, repo, progress)
+func repoName(j scan.Job, multi bool) string {
+	if multi {
+		return j.Owner + "/" + j.Repo
 	}
-	return scan.Scan(context.Background(), org, days, progress)
+	return j.Repo
 }
 
 func formatTime(t time.Time) string {

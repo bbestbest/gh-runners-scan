@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -231,6 +232,72 @@ func TestReposListsOwnerAndReportsUnknown(t *testing.T) {
 	}
 	if names, err := Repos(context.Background(), "nobody", 7); err == nil || names != nil {
 		t.Fatalf("Repos(nobody) = %v, %v; want an error", names, err)
+	}
+}
+
+func TestParseAndFormatTargets(t *testing.T) {
+	got := ParseTargets([]string{"org-a/*", "org-b/api", " org-b / web ", "ORG-A/extra", "", "/x", "org-c"})
+	want := []Target{{Owner: "org-a", All: true}, {Owner: "org-b", Repos: []string{"api", "web"}}, {Owner: "org-c", All: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseTargets = %+v, want %+v", got, want)
+	}
+	if out := FormatTargets(want); !reflect.DeepEqual(out, []string{"org-a/*", "org-b/api", "org-b/web", "org-c/*"}) {
+		t.Fatalf("FormatTargets = %v", out)
+	}
+}
+
+func TestScanTargetsMixesWholeOwnersAndSingleRepos(t *testing.T) {
+	resetRepoCache(t)
+	var mu sync.Mutex
+	var runs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/users/org-a":
+			fmt.Fprint(w, `{"login":"org-a","type":"Organization"}`)
+		case r.URL.Path == "/orgs/org-a/repos":
+			fmt.Fprintf(w, `[{"name":"one","pushed_at":%q,"archived":false},{"name":"two","pushed_at":%q,"archived":false}]`, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
+		case strings.HasSuffix(r.URL.Path, "/actions/runs"):
+			mu.Lock()
+			runs = append(runs, strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/actions/runs"), "/repos/")+"?"+r.URL.Query().Get("status"))
+			mu.Unlock()
+			if r.URL.Query().Get("status") == "queued" {
+				fmt.Fprint(w, `{"workflow_runs":[{"id":7}]}`)
+				return
+			}
+			fmt.Fprint(w, `{"workflow_runs":[]}`)
+		case strings.HasSuffix(r.URL.Path, "/jobs"):
+			fmt.Fprint(w, `{"jobs":[{"run_id":7,"status":"queued","name":"build","labels":["x"]}]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	var calls []progressCall
+	jobs, err := ScanTargets(context.Background(), []Target{{Owner: "org-a", All: true}, {Owner: "org-b", Repos: []string{"api"}}}, 7, func(d, total int) {
+		mu.Lock()
+		calls = append(calls, progressCall{d, total})
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(runs)
+	want := []string{"org-a/one?in_progress", "org-a/one?queued", "org-a/two?in_progress", "org-a/two?queued", "org-b/api?in_progress", "org-b/api?queued"}
+	if !reflect.DeepEqual(runs, want) {
+		t.Fatalf("runs requested = %v, want %v", runs, want)
+	}
+	owners := map[string]bool{}
+	for _, j := range jobs {
+		owners[j.Owner+"/"+j.Repo] = true
+	}
+	if len(jobs) != 3 || !owners["org-a/one"] || !owners["org-a/two"] || !owners["org-b/api"] {
+		t.Fatalf("jobs = %+v", jobs)
+	}
+	if calls[0] != (progressCall{0, TotalUnknown}) || calls[1] != (progressCall{0, 3}) || calls[len(calls)-1] != (progressCall{3, 3}) {
+		t.Fatalf("progress = %v", calls)
 	}
 }
 

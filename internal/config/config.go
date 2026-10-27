@@ -13,6 +13,7 @@ const maxOrgs = 10
 type Config struct {
 	Org     string
 	Orgs    []string
+	Scan    []string
 	Days    int
 	DaysSet bool
 }
@@ -58,6 +59,8 @@ func parse(text string) Config {
 			cfg.Org = value
 		case "orgs":
 			cfg.Orgs = splitOrgs(value)
+		case "scan":
+			cfg.Scan = splitOrgs(value)
 		case "days":
 			n, err := strconv.Atoi(value)
 			if err != nil {
@@ -118,6 +121,21 @@ func SetOrg(org string) error {
 	text = replaceKey(text, "org", org)
 	text = replaceKey(text, "orgs", strings.Join(orgs, ", "))
 	return writeFileAtomic(path, text)
+}
+
+func SetScan(entries []string) error {
+	path := Path()
+	if path == "" {
+		return errors.New("config: no path for the config file")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	existing, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return writeFileAtomic(path, replaceKey(string(existing), "scan", strings.Join(entries, ", ")))
 }
 
 func replaceKey(text, key, value string) string {

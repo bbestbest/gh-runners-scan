@@ -3,6 +3,7 @@ package scan
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"sort"
 	"strconv"
@@ -363,14 +364,122 @@ func ScanRepo(ctx context.Context, org, repo string, progress func(done, total i
 }
 
 func Scan(ctx context.Context, org string, days int, progress func(done, total int)) ([]Job, error) {
+	return ScanTargets(ctx, []Target{{Owner: org, All: true}}, days, progress)
+}
+
+type Target struct {
+	Owner string
+	All   bool
+	Repos []string
+}
+
+func ParseTargets(entries []string) []Target {
+	var out []Target
+	index := map[string]int{}
+	for _, entry := range entries {
+		owner, repo, _ := strings.Cut(strings.TrimSpace(entry), "/")
+		owner = strings.TrimSpace(owner)
+		repo = strings.TrimSpace(repo)
+		if owner == "" {
+			continue
+		}
+		key := strings.ToLower(owner)
+		i, seen := index[key]
+		if !seen {
+			i = len(out)
+			index[key] = i
+			out = append(out, Target{Owner: owner})
+		}
+		if repo == "" || repo == "*" {
+			out[i].All = true
+			out[i].Repos = nil
+			continue
+		}
+		if !out[i].All {
+			out[i].Repos = append(out[i].Repos, repo)
+		}
+	}
+	return out
+}
+
+func FormatTargets(targets []Target) []string {
+	var out []string
+	for _, t := range targets {
+		if t.All {
+			out = append(out, t.Owner+"/*")
+			continue
+		}
+		for _, r := range t.Repos {
+			out = append(out, t.Owner+"/"+r)
+		}
+	}
+	return out
+}
+
+func ResolveTargets(ctx context.Context, owner, repo string, saved []string, savedOrg string) ([]Target, error) {
+	if owner == "" && repo == "" {
+		if targets := ParseTargets(saved); len(targets) > 0 {
+			return targets, nil
+		}
+	}
+	if owner == "" {
+		owner = savedOrg
+	}
+	if owner == "" {
+		login, err := Login(ctx)
+		if err != nil {
+			return nil, err
+		}
+		owner = login
+	}
+	if repo != "" {
+		if o, name := SplitRepo(owner, repo); name != "" {
+			return []Target{{Owner: o, Repos: []string{name}}}, nil
+		}
+	}
+	return []Target{{Owner: owner, All: true}}, nil
+}
+
+func TargetLabel(targets []Target) string {
+	parts := make([]string, 0, len(targets))
+	for _, t := range targets {
+		switch {
+		case t.All:
+			parts = append(parts, t.Owner)
+		case len(t.Repos) == 1:
+			parts = append(parts, t.Owner+"/"+t.Repos[0])
+		default:
+			parts = append(parts, fmt.Sprintf("%s (%d repos)", t.Owner, len(t.Repos)))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func MultiOwner(targets []Target) bool {
+	return len(targets) > 1
+}
+
+func ScanTargets(ctx context.Context, targets []Target, days int, progress func(done, total int)) ([]Job, error) {
 	var limited atomic.Bool
 
 	if progress != nil {
 		progress(0, TotalUnknown)
 	}
 
-	repos := listRepos(ctx, &limited, org, days)
-	total := len(repos)
+	type pair struct{ owner, repo string }
+	var pairs []pair
+	for _, t := range targets {
+		if t.All {
+			for _, repo := range listRepos(ctx, &limited, t.Owner, days) {
+				pairs = append(pairs, pair{t.Owner, repo})
+			}
+			continue
+		}
+		for _, repo := range t.Repos {
+			pairs = append(pairs, pair{t.Owner, repo})
+		}
+	}
+	total := len(pairs)
 	if progress != nil {
 		progress(0, total)
 	}
@@ -380,9 +489,9 @@ func Scan(ctx context.Context, org string, days int, progress func(done, total i
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(workers)
-	for i, repo := range repos {
+	for i, p := range pairs {
 		g.Go(func() error {
-			results[i] = scanRepo(gctx, &limited, org, repo)
+			results[i] = scanRepo(gctx, &limited, p.owner, p.repo)
 			done <- 1
 			return nil
 		})
@@ -414,7 +523,6 @@ func Scan(ctx context.Context, org string, days int, progress func(done, total i
 	}
 	return jobs, nil
 }
-
 func SplitJobs(jobs []Job) (running, queued []Job) {
 	for _, j := range jobs {
 		if j.Status == "in_progress" {
