@@ -14,6 +14,8 @@ const TOKEN_KEY = 'gh-runner:token'
 
 const SESSION_KEY = 'gh-runner:session'
 
+const PM_USER = 'gh-runner'
+
 const KDF_ITERATIONS = 600000
 
 const REPO_TTL = 12 * 60 * 1000
@@ -289,6 +291,7 @@ function showUnlock() {
   $('savedFor').textContent = `token saved for ${saved && saved.login ? saved.login : 'this device'}`
   $('unlockPass').value = ''
   $('unlockPass').focus()
+  fillFromPasswordManager()
 }
 
 function showTokenStep() {
@@ -395,6 +398,7 @@ async function submitToken() {
     try {
       await saveToken(value, pass, account.login)
       keepSession(value)
+      await offerToPasswordManager(pass)
     } catch (err) {
       $('loginError').textContent = `token works but could not be saved: ${err.message}`
     }
@@ -489,6 +493,23 @@ async function suggestPassphrase() {
   try {
     await navigator.clipboard.writeText(pass)
     $('passNote').textContent = 'copied; save it in your password manager before you continue'
+  } catch {}
+}
+
+async function offerToPasswordManager(pass) {
+  if (!window.PasswordCredential || !navigator.credentials) return
+  try {
+    await navigator.credentials.store(new PasswordCredential({ id: PM_USER, password: pass, name: 'gh-runner passphrase' }))
+  } catch {}
+}
+
+async function fillFromPasswordManager() {
+  if (!window.PasswordCredential || !navigator.credentials || sessionToken()) return
+  try {
+    const cred = await navigator.credentials.get({ password: true, mediation: 'optional' })
+    if (!cred || !cred.password || $('stepUnlock').hidden || $('unlockPass').value) return
+    $('unlockPass').value = cred.password
+    submitUnlock()
   } catch {}
 }
 
