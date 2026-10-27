@@ -506,9 +506,10 @@ async function submitUnlock() {
   $('unlockPass').value = ''
   const result = await verifyToken(opened.token)
   if (result === 'ok') {
-    await keepSession(opened.token, opened.view)
     await loadCache()
-    return applyView(opened.view) || showConfig()
+    const view = await latestView(opened.view)
+    await keepSession(opened.token, view)
+    return applyView(view) || showConfig()
   }
   if (result === 'rejected') {
     forgetToken()
@@ -688,6 +689,7 @@ async function resumeSession() {
     return openConnect()
   }
   let opened = await readSession()
+  const fromSession = !!opened
   if (!opened) {
     dropSession()
     const pass = await passwordFromManager()
@@ -702,9 +704,10 @@ async function resumeSession() {
   statusNote('checking token…')
   const result = await verifyToken(opened.token)
   if (result === 'ok') {
-    await keepSession(opened.token, opened.view)
     await loadCache()
-    return applyView(opened.view) || openConnect()
+    const view = fromSession ? opened.view : await latestView(opened.view)
+    await keepSession(opened.token, view)
+    return applyView(view) || openConnect()
   }
   if (result === 'rejected') {
     forgetToken()
@@ -718,9 +721,40 @@ function formDays() {
   return Math.max(0, parseInt($('days').value, 10) || 0)
 }
 
-async function cacheKey(salt) {
+async function cacheKey(salt, info = 'gh-runner cache') {
   const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(token), 'HKDF', false, ['deriveKey'])
-  return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode('gh-runner cache') }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'])
+  return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode(info) }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'])
+}
+
+async function sealRecord(name, value) {
+  const salt = crypto.getRandomValues(new Uint8Array(16))
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await cacheKey(salt, 'gh-runner ' + name), new TextEncoder().encode(JSON.stringify(value)))
+  await keyStore('readwrite', store => store.put({ v: CACHE_VERSION, salt: b64(salt), iv: b64(iv), data: b64(data) }, name), 'cache')
+}
+
+async function openRecord(name) {
+  const raw = await keyStore('readonly', store => store.get(name), 'cache')
+  if (!raw || raw.v !== CACHE_VERSION) return null
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(raw.iv) }, await cacheKey(unb64(raw.salt), 'gh-runner ' + name), unb64(raw.data))
+  return JSON.parse(new TextDecoder().decode(plain))
+}
+
+async function saveView(view) {
+  if (!token || !savedToken()) return
+  try {
+    await sealRecord('view', view)
+  } catch {}
+}
+
+async function latestView(fallback) {
+  if (!token || !savedToken()) return fallback
+  try {
+    const view = await openRecord('view')
+    return viewTargets(view).length ? view : fallback
+  } catch {
+    return fallback
+  }
 }
 
 function trimBody(data) {
@@ -745,20 +779,15 @@ async function saveCache() {
       etags: [...etags].filter(([url]) => usedUrls.has(url)),
       repos: [...repoCache].filter(([, entry]) => entry.expires > now),
     }
-    const salt = crypto.getRandomValues(new Uint8Array(16))
-    const iv = crypto.getRandomValues(new Uint8Array(12))
-    const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await cacheKey(salt), new TextEncoder().encode(JSON.stringify(payload)))
-    await keyStore('readwrite', store => store.put({ v: CACHE_VERSION, salt: b64(salt), iv: b64(iv), data: b64(data) }, 'api'), 'cache')
+    await sealRecord('api', payload)
   } catch {}
 }
 
 async function loadCache() {
   if (!token || !savedToken()) return
   try {
-    const raw = await keyStore('readonly', store => store.get('api'), 'cache')
-    if (!raw || raw.v !== CACHE_VERSION) return
-    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(raw.iv) }, await cacheKey(unb64(raw.salt)), unb64(raw.data))
-    const payload = JSON.parse(new TextDecoder().decode(plain))
+    const payload = await openRecord('api')
+    if (!payload) return
     const now = Date.now()
     for (const [url, entry] of payload.etags || [])
       if (typeof url === 'string' && url.startsWith(API + '/') && entry && typeof entry.etag === 'string') etags.set(url, entry)
@@ -771,7 +800,7 @@ function dropCache() {
   etags.clear()
   repoCache.clear()
   usedUrls.clear()
-  keyStore('readwrite', store => store.delete('api'), 'cache').catch(() => {})
+  keyStore('readwrite', store => store.clear(), 'cache').catch(() => {})
 }
 
 function forgetToken() {
@@ -1378,6 +1407,7 @@ async function start() {
   saveSettings()
   if (hasSession()) await keepSession(token, currentView())
   sealVault(token, currentView()).catch(() => {})
+  await saveView(currentView())
   closeConnect()
   refresh()
   if (!first) return
