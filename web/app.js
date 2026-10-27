@@ -24,6 +24,8 @@ const KDF_ITERATIONS = 600000
 
 const REPO_TTL = 12 * 60 * 1000
 
+const CACHE_VERSION = 1
+
 const RUNS_PER_STATUS = 20
 
 const RATE_ATTEMPTS = 3
@@ -81,6 +83,8 @@ const etags = new Map()
 
 const repoCache = new Map()
 
+const usedUrls = new Set()
+
 const $ = id => document.getElementById(id)
 
 function el(tag, cls, text) {
@@ -122,6 +126,7 @@ async function getJSON(url, cost, scan) {
       'X-GitHub-Api-Version': '2022-11-28',
     }
     const cached = etags.get(url)
+    if (cached) usedUrls.add(url)
     if (cached) headers['If-None-Match'] = cached.etag
     const res = await fetch(url, { headers, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer' })
     if (scan !== state.scanId) throw new Error('stale')
@@ -135,7 +140,10 @@ async function getJSON(url, cost, scan) {
       const data = await res.json()
       const next = nextLink(res.headers.get('link'))
       const etag = res.headers.get('etag')
-      if (etag) etags.set(url, { etag, data, next })
+      if (etag) {
+        etags.set(url, { etag, data: trimBody(data), next })
+        usedUrls.add(url)
+      }
       return { data, next }
     }
     if (res.status === 401) throw new AuthError('token rejected (401)')
@@ -311,6 +319,7 @@ async function startScan() {
   state.lastScan = clock(Date.now(), true)
   state.nextIn = state.interval
   refresh()
+  saveCache()
 }
 
 function logout(message) {
@@ -455,6 +464,7 @@ async function submitToken() {
     try {
       await saveToken(value, pass, account.login)
       await keepSession(value)
+      await loadCache()
       await offerToPasswordManager(pass)
     } catch (err) {
       $('loginError').textContent = `token works but could not be saved: ${err.message}`
@@ -497,6 +507,7 @@ async function submitUnlock() {
   const result = await verifyToken(opened.token)
   if (result === 'ok') {
     await keepSession(opened.token, opened.view)
+    await loadCache()
     return applyView(opened.view) || showConfig()
   }
   if (result === 'rejected') {
@@ -578,14 +589,17 @@ async function passwordFromManager() {
   }
 }
 
-function keyStore(mode, run) {
+function keyStore(mode, run, name = 'keys') {
   return new Promise((resolve, reject) => {
-    const open = indexedDB.open(KEY_DB, 1)
-    open.onupgradeneeded = () => open.result.createObjectStore('keys')
+    const open = indexedDB.open(KEY_DB, 2)
+    open.onupgradeneeded = () => {
+      for (const store of ['keys', 'cache'])
+        if (!open.result.objectStoreNames.contains(store)) open.result.createObjectStore(store)
+    }
     open.onerror = () => reject(open.error)
     open.onsuccess = () => {
-      const tx = open.result.transaction('keys', mode)
-      const req = run(tx.objectStore('keys'))
+      const tx = open.result.transaction(name, mode)
+      const req = run(tx.objectStore(name))
       tx.oncomplete = () => resolve(req.result)
       tx.onerror = () => reject(tx.error)
     }
@@ -689,6 +703,7 @@ async function resumeSession() {
   const result = await verifyToken(opened.token)
   if (result === 'ok') {
     await keepSession(opened.token, opened.view)
+    await loadCache()
     return applyView(opened.view) || openConnect()
   }
   if (result === 'rejected') {
@@ -703,8 +718,65 @@ function formDays() {
   return Math.max(0, parseInt($('days').value, 10) || 0)
 }
 
+async function cacheKey(salt) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(token), 'HKDF', false, ['deriveKey'])
+  return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode('gh-runner cache') }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'])
+}
+
+function trimBody(data) {
+  if (Array.isArray(data)) return data.map(r => ({ name: r.name, pushed_at: r.pushed_at, archived: r.archived }))
+  if (data && Array.isArray(data.workflow_runs)) return { workflow_runs: data.workflow_runs.map(r => ({ id: r.id })) }
+  if (data && Array.isArray(data.jobs))
+    return {
+      jobs: data.jobs.map(j => ({
+        run_id: j.run_id, status: j.status, workflow_name: j.workflow_name, head_branch: j.head_branch, name: j.name,
+        runner_name: j.runner_name, labels: j.labels, started_at: j.started_at, created_at: j.created_at, html_url: j.html_url,
+        steps: (j.steps || []).map(st => ({ name: st.name, status: st.status })),
+      })),
+    }
+  return { login: data && data.login, type: data && data.type }
+}
+
+async function saveCache() {
+  if (!token || !savedToken()) return
+  try {
+    const now = Date.now()
+    const payload = {
+      etags: [...etags].filter(([url]) => usedUrls.has(url)),
+      repos: [...repoCache].filter(([, entry]) => entry.expires > now),
+    }
+    const salt = crypto.getRandomValues(new Uint8Array(16))
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await cacheKey(salt), new TextEncoder().encode(JSON.stringify(payload)))
+    await keyStore('readwrite', store => store.put({ v: CACHE_VERSION, salt: b64(salt), iv: b64(iv), data: b64(data) }, 'api'), 'cache')
+  } catch {}
+}
+
+async function loadCache() {
+  if (!token || !savedToken()) return
+  try {
+    const raw = await keyStore('readonly', store => store.get('api'), 'cache')
+    if (!raw || raw.v !== CACHE_VERSION) return
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(raw.iv) }, await cacheKey(unb64(raw.salt)), unb64(raw.data))
+    const payload = JSON.parse(new TextDecoder().decode(plain))
+    const now = Date.now()
+    for (const [url, entry] of payload.etags || [])
+      if (typeof url === 'string' && url.startsWith(API + '/') && entry && typeof entry.etag === 'string') etags.set(url, entry)
+    for (const [key, entry] of payload.repos || [])
+      if (typeof key === 'string' && entry && entry.expires > now && Array.isArray(entry.names)) repoCache.set(key, entry)
+  } catch {}
+}
+
+function dropCache() {
+  etags.clear()
+  repoCache.clear()
+  usedUrls.clear()
+  keyStore('readwrite', store => store.delete('api'), 'cache').catch(() => {})
+}
+
 function forgetToken() {
   vault = null
+  dropCache()
   try {
     localStorage.removeItem(TOKEN_KEY)
   } catch {}
