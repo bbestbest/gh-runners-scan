@@ -30,7 +30,7 @@ const RATE_BACKOFF = 3000
 
 const MAX_REPO_ROWS = 6
 
-const HINTS = [['enter', 'open'], ['/', 'filter'], ['h/l', 'panel'], ['r', 'rescan'], ['j/k', 'move'], ['O', 'connect']]
+const HINTS = [['enter', 'open'], ['/', 'filter'], ['h/l', 'panel'], ['r', 'rescan'], ['j/k', 'move'], ['O', 'config']]
 
 const CONNECT_HINTS = [['enter', 'start'], ['tab', 'next field']]
 
@@ -320,11 +320,17 @@ function showConfig() {
   $('org').value = state.org
   loadRepos(state.org, state.repo)
   $('org').focus()
+  renderHints()
 }
 
 function closeConnect() {
   $('login').hidden = true
   renderHints()
+}
+
+function toggleConnect() {
+  if ($('login').hidden) openConnect()
+  else if (token) closeConnect()
 }
 
 async function connectGet(url) {
@@ -860,6 +866,10 @@ function renderDetail() {
 function renderHints() {
   const hints = $('hints')
   hints.replaceChildren()
+  const open = !$('login').hidden
+  $('configBtn').classList.toggle('on', open)
+  $('configBtn').textContent = open ? '✕ close config' : '⚙ config'
+  $('configBtn').disabled = open && !token
   const list = $('login').hidden ? HINTS : token ? [...CONNECT_HINTS, ['esc', 'close']] : CONNECT_HINTS
   list.forEach(([k, v], i) => {
     if (i) hints.append(' | ')
@@ -999,6 +1009,7 @@ function init() {
     showTokenStep()
   })
   $('suggestPass').addEventListener('click', suggestPassphrase)
+  $('configBtn').addEventListener('click', toggleConnect)
   $('remember').addEventListener('change', () => {
     $('rememberFields').hidden = !$('remember').checked
     if ($('remember').checked) $('newPass').focus()

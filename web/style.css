@@ -160,11 +160,15 @@ tr.sel td { background: var(--seldim); color: #f0f6fc; font-weight: 700; }
 .busy .row { display: flex; gap: 12px; white-space: nowrap; }
 .busy .row span:nth-child(2) { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 
-.keybar { display: flex; gap: 12px; align-items: center; white-space: nowrap; }
+.keybar { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; white-space: nowrap; min-width: 0; }
 .keybar #hints { overflow: hidden; text-overflow: ellipsis; color: var(--dim); }
 .keybar #hints b { color: var(--cyan); }
 .keybar #filter { width: 14em; padding: 1px 6px; }
 .keybar #info { margin-left: auto; color: var(--dim); }
+.keybar #info { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.keybar .kbtn { flex: none; padding: 1px 10px; background: transparent; color: var(--cyan); border: 1px solid var(--border); font-weight: 400; }
+.keybar .kbtn.on { color: var(--bg); background: var(--green); border-color: var(--green); }
+.keybar .kbtn:disabled { opacity: 0.5; cursor: default; }
 
 @media (max-width: 900px) {
   .cols { flex-direction: column; overflow-y: auto; }
