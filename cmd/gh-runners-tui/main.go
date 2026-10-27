@@ -99,7 +99,7 @@ func splitOrg(argv []string, fallback string) (string, []string) {
 
 func scanTarget(ctx context.Context, opts options, progress func(done, total int)) ([]scan.Job, error) {
 	if len(opts.targets) > 0 {
-		return scan.ScanTargets(ctx, opts.targets, opts.days, progress)
+		return scan.ScanRound(ctx, opts.targets, opts.days, opts.rounds, progress, opts.onRepo)
 	}
 	if opts.repo != "" {
 		return scan.ScanRepo(ctx, opts.org, opts.repo, progress)
@@ -158,16 +158,29 @@ func printOnce(opts options) {
 }
 
 func scanLabeled(ctx context.Context, opts options, progress func(done, total int)) ([]scan.Job, error) {
-	jobs, scanErr := scanTarget(ctx, opts, progress)
-	if opts.label == "" {
-		return jobs, scanErr
+	jobs, scanErr := scanTarget(ctx, labelStream(opts), progress)
+	return filterLabel(opts.label, jobs), scanErr
+}
+
+func labelStream(opts options) options {
+	if inner := opts.onRepo; inner != nil && opts.label != "" {
+		opts.onRepo = func(owner, repo string, jobs []scan.Job) {
+			inner(owner, repo, filterLabel(opts.label, jobs))
+		}
 	}
-	needle := strings.ToLower(opts.label)
+	return opts
+}
+
+func filterLabel(label string, jobs []scan.Job) []scan.Job {
+	if label == "" {
+		return jobs
+	}
+	needle := strings.ToLower(label)
 	var kept []scan.Job
 	for _, j := range jobs {
 		if strings.Contains(strings.ToLower(j.Labels), needle) {
 			kept = append(kept, j)
 		}
 	}
-	return kept, scanErr
+	return kept
 }

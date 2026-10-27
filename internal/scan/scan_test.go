@@ -227,7 +227,7 @@ func TestReposListsOwnerAndReportsUnknown(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(names, []string{"api"}) {
 		t.Fatalf("Repos(org-a) = %v, %v", names, err)
 	}
-	if cached, ok := cachedRepos("org-a\x007"); !ok || !reflect.DeepEqual(cached, []string{"api"}) {
+	if cached, ok := cachedRepos("org-a", 7); !ok || !reflect.DeepEqual(cached, []string{"api"}) {
 		t.Fatalf("repo list not cached for the first scan: %v %v", cached, ok)
 	}
 	if names, err := Repos(context.Background(), "nobody", 7); err == nil || names != nil {
@@ -679,5 +679,96 @@ func TestCurrentStep(t *testing.T) {
 				t.Fatalf("currentStep = %+v %q, want %+v %q", got, got.Fraction(), tc.want, tc.frac)
 			}
 		})
+	}
+}
+
+func TestScanRoundSkipsQuietRepos(t *testing.T) {
+	resetRepoCache(t)
+	base := time.Now().Add(-time.Hour).UTC()
+	var mu sync.Mutex
+	pushedAt := base
+	var scanned []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/users/org-a":
+			fmt.Fprint(w, `{"login":"org-a","type":"Organization"}`)
+		case r.URL.Path == "/orgs/org-a/repos":
+			fmt.Fprintf(w, `[{"name":"pushed","pushed_at":%q},{"name":"busy","pushed_at":%q},{"name":"quiet","pushed_at":%q}]`,
+				pushedAt.Format(time.RFC3339), base.Format(time.RFC3339), base.Add(-time.Minute).Format(time.RFC3339))
+		case strings.HasSuffix(r.URL.Path, "/actions/runs"):
+			repo := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/repos/"), "/actions/runs")
+			if r.URL.Query().Get("status") == "queued" {
+				scanned = append(scanned, repo)
+			}
+			if repo == "org-a/busy" && r.URL.Query().Get("status") == "queued" {
+				fmt.Fprint(w, `{"workflow_runs":[{"id":7}]}`)
+				return
+			}
+			fmt.Fprint(w, `{"workflow_runs":[]}`)
+		case strings.HasSuffix(r.URL.Path, "/jobs"):
+			fmt.Fprint(w, `{"jobs":[{"run_id":7,"status":"queued","name":"build"}]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	rounds := NewRounds()
+	targets := []Target{{Owner: "org-a", All: true}, {Owner: "org-b", Repos: []string{"api"}}}
+	round := func() ([]string, []string, []progressCall, []Job) {
+		mu.Lock()
+		scanned = nil
+		mu.Unlock()
+		var streamed []string
+		var calls []progressCall
+		var smu sync.Mutex
+		jobs, err := ScanRound(context.Background(), targets, 7, rounds, func(d, total int) {
+			smu.Lock()
+			calls = append(calls, progressCall{d, total})
+			smu.Unlock()
+		}, func(owner, repo string, jobs []Job) {
+			smu.Lock()
+			streamed = append(streamed, owner+"/"+repo)
+			smu.Unlock()
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		got := append([]string{}, scanned...)
+		sort.Strings(got)
+		sort.Strings(streamed)
+		return got, streamed, calls, jobs
+	}
+
+	all := []string{"org-a/busy", "org-a/pushed", "org-a/quiet", "org-b/api"}
+	steady := []string{"org-a/busy", "org-b/api"}
+	got, streamed, _, jobs := round()
+	if !reflect.DeepEqual(got, all) || !reflect.DeepEqual(streamed, all) || len(jobs) != 1 {
+		t.Fatalf("round 1 scanned %v streamed %v jobs %d, want all and 1 job", got, streamed, len(jobs))
+	}
+	got, streamed, calls, jobs := round()
+	if !reflect.DeepEqual(got, steady) || !reflect.DeepEqual(streamed, steady) || len(jobs) != 1 {
+		t.Fatalf("round 2 scanned %v streamed %v jobs %d, want %v", got, streamed, len(jobs), steady)
+	}
+	if calls[1] != (progressCall{2, 4}) || calls[len(calls)-1] != (progressCall{4, 4}) {
+		t.Fatalf("round 2 progress = %v, want skipped repos counted as done", calls)
+	}
+	mu.Lock()
+	pushedAt = base.Add(time.Minute)
+	mu.Unlock()
+	if got, _, _, _ := round(); !reflect.DeepEqual(got, []string{"org-a/busy", "org-a/pushed", "org-b/api"}) {
+		t.Fatalf("round 3 scanned %v, want busy, pushed and api", got)
+	}
+	if got, _, _, _ := round(); !reflect.DeepEqual(got, steady) {
+		t.Fatalf("round 4 scanned %v, want %v", got, steady)
+	}
+	if got, _, _, _ := round(); !reflect.DeepEqual(got, all) {
+		t.Fatalf("round 5 scanned %v, want a full sweep %v", got, all)
 	}
 }

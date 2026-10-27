@@ -8,6 +8,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,6 +31,8 @@ func TestMain(m *testing.M) {
 	os.Setenv("XDG_CONFIG_HOME", dir)
 	os.Setenv("XDG_CACHE_HOME", dir)
 	saveCache = func() error { return nil }
+	saveLastJobs = func(string, []scan.Job) error { return nil }
+	loadLastJobs = func(string) ([]scan.Job, time.Time, bool) { return nil, time.Time{}, false }
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -928,6 +931,103 @@ func TestStepShownForRunningJob(t *testing.T) {
 	}
 	if !strings.Contains(ansi.Strip(m.detailPanel(80, 30)), "Step       4/7 · Run tests") {
 		t.Fatalf("detail missing step:\n%s", ansi.Strip(m.detailPanel(80, 30)))
+	}
+}
+
+func TestLastResultsShownStaleUntilScan(t *testing.T) {
+	prevLoad, prevSave := loadLastJobs, saveLastJobs
+	t.Cleanup(func() { loadLastJobs, saveLastJobs = prevLoad, prevSave })
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.Local)
+	var asked string
+	loadLastJobs = func(key string) ([]scan.Job, time.Time, bool) {
+		asked = key
+		return testJobs(), at, true
+	}
+	var saved []string
+	saveLastJobs = func(key string, jobs []scan.Job) error {
+		saved = append(saved, key)
+		return nil
+	}
+	m := newModel(options{targets: []scan.Target{{Owner: "org-a", All: true}}, days: 7, interval: 30})
+	m.restoreLast()
+	if asked != "org-a/*|7|" {
+		t.Fatalf("view key = %q", asked)
+	}
+	if !m.stale || len(m.jobs) != len(testJobs()) {
+		t.Fatalf("stale=%v jobs=%d, want restored", m.stale, len(m.jobs))
+	}
+	if got := ansi.Strip(m.statusPanelLines(60)[1]); got != " last results from "+clock(at, "15:04:05") {
+		t.Fatalf("status line = %q", got)
+	}
+
+	next, cmd := m.Update(scanDoneMsg{id: m.scanID, jobs: testJobs()[:1], err: scan.ErrRateLimited})
+	m = next.(model)
+	runBatch(cmd)
+	if m.stale || len(saved) != 0 {
+		t.Fatalf("after limited scan: stale=%v saved=%v, want fresh and not saved", m.stale, saved)
+	}
+	_, cmd = m.Update(scanDoneMsg{id: m.scanID, jobs: testJobs()})
+	runBatch(cmd)
+	if len(saved) != 1 || saved[0] != "org-a/*|7|" {
+		t.Fatalf("saved = %v, want one save for the view", saved)
+	}
+}
+
+func TestNoLastResultsKeepsEmpty(t *testing.T) {
+	m := newModel(options{targets: []scan.Target{{Owner: "org-a", All: true}}, days: 7, interval: 30})
+	m.restoreLast()
+	if m.stale || len(m.jobs) != 0 {
+		t.Fatalf("stale=%v jobs=%d, want nothing restored", m.stale, len(m.jobs))
+	}
+}
+
+func TestRepoJobsMsgReplacesThatRepoOnly(t *testing.T) {
+	m := newModel(options{targets: []scan.Target{{Owner: "org-a", All: true}}, interval: 30})
+	m.jobs = []scan.Job{
+		{Owner: "org-a", Repo: "api", Status: "queued", Name: "old-api"},
+		{Owner: "org-a", Repo: "web", Status: "queued", Name: "web-job"},
+	}
+	next, _ := m.Update(repoJobsMsg{id: m.scanID, owner: "org-a", repo: "API", jobs: []scan.Job{{Owner: "org-a", Repo: "api", Status: "in_progress", Runner: "r1", Name: "new-api"}}})
+	m = next.(model)
+	var names []string
+	for _, j := range m.jobs {
+		names = append(names, j.Name)
+	}
+	sort.Strings(names)
+	if !reflect.DeepEqual(names, []string{"new-api", "web-job"}) {
+		t.Fatalf("jobs = %v, want new-api and web-job", names)
+	}
+	if len(m.running) != 1 || len(m.queued) != 1 {
+		t.Fatalf("tables not refreshed: running %d queued %d", len(m.running), len(m.queued))
+	}
+	next, _ = m.Update(repoJobsMsg{id: m.scanID + 1, owner: "org-a", repo: "web", jobs: nil})
+	if got := len(next.(model).jobs); got != 2 {
+		t.Fatalf("stale scan changed jobs: %d", got)
+	}
+}
+
+func TestScanLabeledFiltersStreamedRepos(t *testing.T) {
+	var got []scan.Job
+	opts := labelStream(options{label: "arm", onRepo: func(owner, repo string, jobs []scan.Job) { got = append(got, jobs...) }})
+	opts.onRepo("o", "r", []scan.Job{{Name: "a", Labels: "self-hosted,ARM64"}, {Name: "b", Labels: "x64"}})
+	if len(got) != 1 || got[0].Name != "a" {
+		t.Fatalf("streamed = %+v, want only the arm job", got)
+	}
+	if kept := filterLabel("", []scan.Job{{Name: "a"}}); len(kept) != 1 {
+		t.Fatal("empty label dropped jobs")
+	}
+}
+
+func TestListingKeepsLastRepoCount(t *testing.T) {
+	m := newModel(options{targets: []scan.Target{{Owner: "org-a", All: true}}, interval: 30})
+	next, _ := m.Update(progressMsg{0, 75})
+	next, _ = next.(model).Update(progressMsg{0, scan.TotalUnknown})
+	m = next.(model)
+	if m.repoCount != 75 {
+		t.Fatalf("repoCount = %d during listing, want 75 kept", m.repoCount)
+	}
+	if got := ansi.Strip(m.statusPanelLines(60)[1]); !strings.HasPrefix(got, " 75 repos") {
+		t.Fatalf("status = %q", got)
 	}
 }
 

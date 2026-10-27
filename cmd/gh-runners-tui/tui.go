@@ -97,6 +97,8 @@ type options struct {
 	days     int
 	interval int
 	repo     string
+	rounds   *scan.Rounds
+	onRepo   func(owner, repo string, jobs []scan.Job)
 }
 
 type pick struct {
@@ -155,6 +157,7 @@ type model struct {
 	progress  progressMsg
 	repoCount int
 	lastScan  string
+	stale     bool
 	nextIn    int
 	scanErr   error
 	saveErr   error
@@ -181,6 +184,9 @@ func newModel(opts options) model {
 				opts.targets = []scan.Target{{Owner: owner, Repos: []string{name}}}
 			}
 		}
+	}
+	if opts.rounds == nil {
+		opts.rounds = scan.NewRounds()
 	}
 	m := model{
 		opts:      opts,
@@ -266,6 +272,7 @@ func (m *model) applyPending() {
 	m.opts.org = p.targets[0].Owner
 	m.opts.repo = ""
 	m.jobs = nil
+	m.stale = false
 	m.scanErr = nil
 	m.lastScan = ""
 	m.lastCost = nil
@@ -290,6 +297,10 @@ var cancelRun = scan.CancelRun
 var usage = scan.Usage
 
 var saveCache = scan.SaveCache
+
+var saveLastJobs = scan.SaveLastJobs
+
+var loadLastJobs = scan.LoadLastJobs
 
 var listAccounts = scan.Accounts
 
@@ -319,6 +330,31 @@ func accountsCmd() tea.Msg {
 	return accountsMsg{list: list, err: err}
 }
 
+func (m model) viewKey() string {
+	return strings.Join(scan.FormatTargets(m.opts.targets), ",") + "|" + strconv.Itoa(m.opts.days) + "|" + m.opts.label
+}
+
+func (m *model) restoreLast() {
+	if !m.hasTargets() {
+		return
+	}
+	jobs, at, ok := loadLastJobs(m.viewKey())
+	if !ok {
+		return
+	}
+	m.jobs = jobs
+	m.lastScan = clock(at, "15:04:05")
+	m.stale = true
+	m.refresh()
+}
+
+func saveLastCmd(key string, jobs []scan.Job) tea.Cmd {
+	return func() tea.Msg {
+		saveLastJobs(key, jobs)
+		return nil
+	}
+}
+
 func saveCacheCmd() tea.Msg {
 	saveCache()
 	return nil
@@ -340,6 +376,11 @@ func cancelCmd(j scan.Job) tea.Cmd {
 func scanCmd(ctx context.Context, opts options, id int) tea.Cmd {
 	return func() tea.Msg {
 		before := usage()
+		opts.onRepo = func(owner, repo string, jobs []scan.Job) {
+			if program != nil {
+				program.Send(repoJobsMsg{id: id, owner: owner, repo: repo, jobs: jobs})
+			}
+		}
 		jobs, scanErr := scanLabeled(ctx, opts, func(done, total int) {
 			if program != nil {
 				program.Send(progressMsg{done, total})
@@ -357,6 +398,23 @@ func scanCmd(ctx context.Context, opts options, id int) tea.Cmd {
 }
 
 var program *tea.Program
+
+type repoJobsMsg struct {
+	id    int
+	owner string
+	repo  string
+	jobs  []scan.Job
+}
+
+func replaceRepoJobs(jobs []scan.Job, owner, repo string, fresh []scan.Job) []scan.Job {
+	out := make([]scan.Job, 0, len(jobs)+len(fresh))
+	for _, j := range jobs {
+		if !strings.EqualFold(j.Owner, owner) || !strings.EqualFold(j.Repo, repo) {
+			out = append(out, j)
+		}
+	}
+	return append(out, fresh...)
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -392,9 +450,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.reposReady = true
 		return m, nil
 
+	case repoJobsMsg:
+		if msg.id != m.scanID {
+			return m, nil
+		}
+		m.jobs = replaceRepoJobs(m.jobs, msg.owner, msg.repo, msg.jobs)
+		m.refresh()
+		return m, nil
+
 	case progressMsg:
 		m.progress = msg
-		m.repoCount = msg.total
+		if msg.total >= 0 {
+			m.repoCount = msg.total
+		}
 		return m, nil
 
 	case scanDoneMsg:
@@ -407,8 +475,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastCost = &scanCost{requests: msg.requests, free: msg.free}
 		m.lastScan = clock(time.Now(), "15:04:05")
 		m.nextIn = m.opts.interval
+		m.stale = false
 		m.refresh()
-		return m, tea.Batch(saveCacheCmd, tea.SetWindowTitle(windowTitle(m.jobs)))
+		cmds := []tea.Cmd{saveCacheCmd, tea.SetWindowTitle(windowTitle(m.jobs))}
+		if msg.err == nil {
+			cmds = append(cmds, saveLastCmd(m.viewKey(), m.jobs))
+		}
+		return m, tea.Batch(cmds...)
 
 	case cancelDoneMsg:
 		label := msg.job.Workflow + " (" + msg.job.Repo + ")"
@@ -1425,6 +1498,9 @@ func countFooter(t table.Model) string {
 func (m model) statusPanelLines(width int) []string {
 	owners := " " + hlStyle.Render(ansi.Truncate(m.orgLabel(), width-2, "…"))
 	first := " " + dimStyle.Render(m.repoCountLabel()+" · scanned "+m.lastScanLabel())
+	if m.stale {
+		first = " " + yellowStyle.Render("last results from "+m.lastScanLabel())
+	}
 	second := " " + dimStyle.Render("no scan yet")
 	switch {
 	case !m.hasTargets():
@@ -1917,6 +1993,7 @@ func (m model) statusView() string {
 
 func Run(opts options) error {
 	m := newModel(opts)
+	m.restoreLast()
 	program = tea.NewProgram(m, tea.WithAltScreen())
 	_, err := program.Run()
 	return err

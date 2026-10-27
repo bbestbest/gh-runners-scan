@@ -151,9 +151,19 @@ func parseTime(value string) time.Time {
 	return t.UTC()
 }
 
+type repoInfo struct {
+	Name   string    `json:"name"`
+	Pushed time.Time `json:"pushed"`
+}
+
 type repoCacheEntry struct {
-	names   []string
-	expires time.Time
+	repos   []repoInfo
+	days    int
+	fetched time.Time
+}
+
+func covers(cached, days int) bool {
+	return cached == 0 || (days > 0 && days <= cached)
 }
 
 var (
@@ -161,35 +171,60 @@ var (
 	repoCache   = map[string]repoCacheEntry{}
 )
 
-func cachedRepos(key string) ([]string, bool) {
+func cachedRepoInfos(owner string, days int) ([]repoInfo, bool) {
 	repoCacheMu.Lock()
 	defer repoCacheMu.Unlock()
-	entry, ok := repoCache[key]
-	if !ok || time.Now().After(entry.expires) {
+	entry, ok := repoCache[strings.ToLower(owner)]
+	if !ok || time.Since(entry.fetched) > repoCacheTTL || !covers(entry.days, days) {
 		return nil, false
 	}
-	return entry.names, true
+	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	var out []repoInfo
+	for _, r := range entry.repos {
+		if days <= 0 || r.Pushed.After(cutoff) {
+			out = append(out, r)
+		}
+	}
+	return out, true
 }
 
-func storeRepos(key string, names []string) {
+func cachedRepos(owner string, days int) ([]string, bool) {
+	infos, ok := cachedRepoInfos(owner, days)
+	if !ok {
+		return nil, false
+	}
+	return repoNames(infos), true
+}
+
+func repoNames(infos []repoInfo) []string {
+	var names []string
+	for _, r := range infos {
+		names = append(names, r.Name)
+	}
+	return names
+}
+
+func storeRepos(owner string, days int, repos []repoInfo) {
 	repoCacheMu.Lock()
 	defer repoCacheMu.Unlock()
-	repoCache[key] = repoCacheEntry{names: names, expires: time.Now().Add(repoCacheTTL)}
+	repoCache[strings.ToLower(owner)] = repoCacheEntry{repos: repos, days: days, fetched: time.Now()}
 }
 
 func listRepos(ctx context.Context, limited *atomic.Bool, org string, days int) []string {
 	sharedClient()
-	key := org + "\x00" + strconv.Itoa(days)
-	if names, ok := cachedRepos(key); ok {
+	if names, ok := cachedRepos(org, days); ok {
 		return names
 	}
+	return repoNames(fetchRepos(ctx, limited, org, days))
+}
 
+func fetchRepos(ctx context.Context, limited *atomic.Bool, org string, days int) []repoInfo {
 	next, ok := reposPath(ctx, limited, org)
 	if !ok {
 		return nil
 	}
 	cutoff := time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour)
-	var names []string
+	var repos []repoInfo
 	for next != "" {
 		var entries []repoEntry
 		link, ok := getJSON(ctx, limited, &entries, next)
@@ -201,11 +236,11 @@ func listRepos(ctx context.Context, limited *atomic.Bool, org string, days int) 
 			if e.Archived {
 				continue
 			}
+			ts := parseTime(e.PushedAt)
 			if days <= 0 {
-				names = append(names, e.Name)
+				repos = append(repos, repoInfo{Name: e.Name, Pushed: ts})
 				continue
 			}
-			ts := parseTime(e.PushedAt)
 			if ts.IsZero() {
 				continue
 			}
@@ -213,15 +248,15 @@ func listRepos(ctx context.Context, limited *atomic.Bool, org string, days int) 
 				older = true
 				break
 			}
-			names = append(names, e.Name)
+			repos = append(repos, repoInfo{Name: e.Name, Pushed: ts})
 		}
 		if older {
 			break
 		}
 		next = nextPageURL(link)
 	}
-	storeRepos(key, names)
-	return names
+	storeRepos(org, days, repos)
+	return repos
 }
 
 func Login(ctx context.Context) (string, error) {
@@ -260,6 +295,9 @@ func Accounts(ctx context.Context) ([]Account, error) {
 }
 
 func Repos(ctx context.Context, owner string, days int) ([]string, error) {
+	if names, ok := cachedRepos(owner, days); ok {
+		return names, nil
+	}
 	var limited atomic.Bool
 	if _, ok := reposPath(ctx, &limited, owner); !ok {
 		if limited.Load() {
@@ -492,39 +530,112 @@ func MultiOwner(targets []Target) bool {
 	return len(targets) > 1
 }
 
+const fullSweepEvery = 4
+
+type repoMemory struct {
+	pushed time.Time
+	active bool
+}
+
+type Rounds struct {
+	mu    sync.Mutex
+	seen  map[string]repoMemory
+	count int
+}
+
+func NewRounds() *Rounds {
+	return &Rounds{seen: map[string]repoMemory{}}
+}
+
+func (r *Rounds) next() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	full := r.count%fullSweepEvery == 0
+	r.count++
+	return full
+}
+
+func (r *Rounds) needs(key string, pushed time.Time, full bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m, ok := r.seen[key]
+	return full || !ok || m.active || pushed.IsZero() || pushed.After(m.pushed)
+}
+
+func (r *Rounds) mark(key string, pushed time.Time, active bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen[key] = repoMemory{pushed: pushed, active: active}
+}
+
 func ScanTargets(ctx context.Context, targets []Target, days int, progress func(done, total int)) ([]Job, error) {
+	return ScanRound(ctx, targets, days, nil, progress, nil)
+}
+
+func ScanRound(ctx context.Context, targets []Target, days int, rounds *Rounds, progress func(done, total int), onRepo func(owner, repo string, jobs []Job)) ([]Job, error) {
 	var limited atomic.Bool
 
 	if progress != nil {
 		progress(0, TotalUnknown)
 	}
 
-	type pair struct{ owner, repo string }
+	full := rounds == nil || rounds.next()
+	type pair struct {
+		owner, repo string
+		pushed      time.Time
+	}
 	var pairs []pair
 	for _, t := range targets {
-		if t.All {
-			for _, repo := range listRepos(ctx, &limited, t.Owner, days) {
-				pairs = append(pairs, pair{t.Owner, repo})
+		if !t.All {
+			for _, repo := range t.Repos {
+				pairs = append(pairs, pair{owner: t.Owner, repo: repo})
 			}
 			continue
 		}
-		for _, repo := range t.Repos {
-			pairs = append(pairs, pair{t.Owner, repo})
+		var infos []repoInfo
+		if rounds == nil {
+			if cached, ok := cachedRepoInfos(t.Owner, days); ok {
+				infos = cached
+			}
+		}
+		if infos == nil {
+			infos = fetchRepos(ctx, &limited, t.Owner, days)
+		}
+		if infos == nil {
+			infos, _ = cachedRepoInfos(t.Owner, days)
+		}
+		for _, r := range infos {
+			pairs = append(pairs, pair{owner: t.Owner, repo: r.Name, pushed: r.Pushed})
 		}
 	}
 	total := len(pairs)
+
+	var todo []pair
+	for _, p := range pairs {
+		if rounds == nil || rounds.needs(strings.ToLower(p.owner+"/"+p.repo), p.pushed, full) {
+			todo = append(todo, p)
+		}
+	}
+	skipped := total - len(todo)
 	if progress != nil {
-		progress(0, total)
+		progress(skipped, total)
 	}
 
-	results := make([][]Job, total)
-	done := make(chan int, total)
+	results := make([][]Job, len(todo))
+	done := make(chan int, len(todo))
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(workers)
-	for i, p := range pairs {
+	for i, p := range todo {
 		g.Go(func() error {
-			results[i] = scanRepo(gctx, &limited, p.owner, p.repo)
+			jobs := scanRepo(gctx, &limited, p.owner, p.repo)
+			results[i] = jobs
+			if rounds != nil && !limited.Load() && gctx.Err() == nil {
+				rounds.mark(strings.ToLower(p.owner+"/"+p.repo), p.pushed, len(jobs) > 0)
+			}
+			if onRepo != nil {
+				onRepo(p.owner, p.repo, jobs)
+			}
 			done <- 1
 			return nil
 		})
@@ -532,7 +643,7 @@ func ScanTargets(ctx context.Context, targets []Target, days int, progress func(
 
 	finished := make(chan struct{})
 	go func() {
-		count := 0
+		count := skipped
 		for range done {
 			count++
 			if progress != nil {
@@ -556,6 +667,7 @@ func ScanTargets(ctx context.Context, targets []Target, days int, progress func(
 	}
 	return jobs, nil
 }
+
 func SplitJobs(jobs []Job) (running, queued []Job) {
 	for _, j := range jobs {
 		if j.Status == "in_progress" {

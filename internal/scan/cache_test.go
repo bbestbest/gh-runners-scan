@@ -368,11 +368,15 @@ func reposServer(t *testing.T, hits *atomic.Int64) *httptest.Server {
 	return srv
 }
 
-func persistRepos(t *testing.T, token, key string, names []string, expires time.Time) {
+func persistRepos(t *testing.T, token, owner string, days int, names []string, fetched time.Time) {
 	t.Helper()
 	resetRepoCache(t)
+	var repos []repoInfo
+	for _, n := range names {
+		repos = append(repos, repoInfo{Name: n, Pushed: time.Now().Add(-time.Hour)})
+	}
 	repoCacheMu.Lock()
-	repoCache[key] = repoCacheEntry{names: names, expires: expires}
+	repoCache[owner] = repoCacheEntry{repos: repos, days: days, fetched: fetched}
 	repoCacheMu.Unlock()
 	if err := cacheClient(token).saveRepoCache(); err != nil {
 		t.Fatal(err)
@@ -385,7 +389,7 @@ func TestRepoCacheRoundTripServesWithoutRequests(t *testing.T) {
 	var hits atomic.Int64
 	srv := reposServer(t, &hits)
 	withClient(t, srv.URL)
-	persistRepos(t, "tok", "o\x007", []string{"alpha", "beta"}, time.Now().Add(time.Minute))
+	persistRepos(t, "tok", "o", 7, []string{"alpha", "beta"}, time.Now())
 
 	loadRepoCache("tok")
 	var limited atomic.Bool
@@ -402,24 +406,24 @@ func TestRepoCacheColdCases(t *testing.T) {
 	cases := []struct {
 		name  string
 		token string
-		key   string
+		days  int
 		ttl   time.Duration
 		prep  func(t *testing.T, path string)
 	}{
-		{"expired", "tok", "o\x007", -time.Minute, nil},
-		{"different days", "tok", "o\x0030", time.Minute, nil},
-		{"different token", "other", "o\x007", time.Minute, nil},
-		{"missing file", "tok", "o\x007", time.Minute, func(t *testing.T, path string) {
+		{"expired", "tok", 7, -time.Minute, nil},
+		{"wider days", "tok", 30, time.Minute, nil},
+		{"different token", "other", 7, time.Minute, nil},
+		{"missing file", "tok", 7, time.Minute, func(t *testing.T, path string) {
 			if err := os.Remove(path); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{"corrupt", "tok", "o\x007", time.Minute, func(t *testing.T, path string) {
+		{"corrupt", "tok", 7, time.Minute, func(t *testing.T, path string) {
 			if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{"wrong version", "tok", "o\x007", time.Minute, func(t *testing.T, path string) {
+		{"wrong version", "tok", 7, time.Minute, func(t *testing.T, path string) {
 			data, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
@@ -438,19 +442,12 @@ func TestRepoCacheColdCases(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := useCacheDir(t)
-			persistRepos(t, "tok", "o\x007", []string{"alpha"}, time.Now().Add(tc.ttl))
+			persistRepos(t, "tok", "o", 7, []string{"alpha"}, time.Now().Add(-repoCacheTTL+tc.ttl))
 			if tc.prep != nil {
 				tc.prep(t, filepath.Join(dir, "gh-runners", "repos.json"))
 			}
-			if tc.token == "tok" && tc.key == "o\x0030" {
-				loadRepoCache("tok")
-				if _, ok := cachedRepos(tc.key); ok {
-					t.Fatal("served wrong days")
-				}
-				return
-			}
 			loadRepoCache(tc.token)
-			if _, ok := cachedRepos("o\x007"); ok {
+			if _, ok := cachedRepos("o", tc.days); ok {
 				t.Fatal("expected cold start")
 			}
 		})
@@ -460,7 +457,7 @@ func TestRepoCacheColdCases(t *testing.T) {
 func TestRepoCacheSurvivesRepoOnlyRun(t *testing.T) {
 	useCacheDir(t)
 	srv := etagServer(t)
-	persistRepos(t, "tok", "o\x007", []string{"alpha"}, time.Now().Add(time.Minute))
+	persistRepos(t, "tok", "o", 7, []string{"alpha"}, time.Now())
 
 	loadRepoCache("tok")
 	a := cacheClient("tok")
@@ -475,14 +472,14 @@ func TestRepoCacheSurvivesRepoOnlyRun(t *testing.T) {
 
 	resetRepoCache(t)
 	loadRepoCache("tok")
-	if names, ok := cachedRepos("o\x007"); !ok || !reflect.DeepEqual(names, []string{"alpha"}) {
+	if names, ok := cachedRepos("o", 7); !ok || !reflect.DeepEqual(names, []string{"alpha"}) {
 		t.Fatalf("repo list dropped: %v %v", names, ok)
 	}
 }
 
 func TestRepoCacheFileModesAndNoToken(t *testing.T) {
 	dir := useCacheDir(t)
-	persistRepos(t, "super-secret-token", "o\x007", []string{"alpha"}, time.Now().Add(time.Minute))
+	persistRepos(t, "super-secret-token", "o", 7, []string{"alpha"}, time.Now())
 	sub := filepath.Join(dir, "gh-runners")
 	di, err := os.Stat(sub)
 	if err != nil {
@@ -515,7 +512,7 @@ func TestRepoCacheFileModesAndNoToken(t *testing.T) {
 func TestListReposLoadsPersistedListBeforeClientExists(t *testing.T) {
 	useCacheDir(t)
 	t.Setenv("GH_TOKEN", "tok")
-	persistRepos(t, "tok", "o\x007", []string{"alpha"}, time.Now().Add(time.Minute))
+	persistRepos(t, "tok", "o", 7, []string{"alpha"}, time.Now())
 
 	prev, prevErr := defaultClient, defaultClientErr
 	prevActive := activeClient.Load()
@@ -531,5 +528,63 @@ func TestListReposLoadsPersistedListBeforeClientExists(t *testing.T) {
 	names := listRepos(context.Background(), &limited, "o", 7)
 	if !reflect.DeepEqual(names, []string{"alpha"}) {
 		t.Fatalf("names = %v", names)
+	}
+}
+
+func TestLastJobsRoundTrip(t *testing.T) {
+	dir := useCacheDir(t)
+	useClient(t, cacheClient("tok-a"))
+	jobs := []Job{{Owner: "o", Repo: "r", Status: "queued", Name: "build", Step: Step{Num: 2, Total: 5, Name: "Test"}, CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}}
+	if err := SaveLastJobs("o/*|7|", jobs); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "gh-runners", "last.json"))
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("last.json mode = %v, err %v", info, err)
+	}
+	got, at, ok := LoadLastJobs("o/*|7|")
+	if !ok || !reflect.DeepEqual(got, jobs) || time.Since(at) > time.Minute {
+		t.Fatalf("load = %+v %v %v, want %+v", got, at, ok, jobs)
+	}
+	if _, _, ok := LoadLastJobs("o/*|3|"); ok {
+		t.Fatal("other view key loaded")
+	}
+	useClient(t, cacheClient("tok-b"))
+	if _, _, ok := LoadLastJobs("o/*|7|"); ok {
+		t.Fatal("other token loaded")
+	}
+}
+
+func TestRepoCacheServesNarrowerDaysWithoutRequests(t *testing.T) {
+	useCacheDir(t)
+	var hits atomic.Int64
+	srv := reposServer(t, &hits)
+	withClient(t, srv.URL)
+	resetRepoCache(t)
+	now := time.Now()
+	storeRepos("O", 7, []repoInfo{{"new", now.Add(-time.Hour)}, {"mid", now.Add(-4 * 24 * time.Hour)}})
+	cases := []struct {
+		days int
+		want []string
+		hit  bool
+	}{
+		{7, []string{"new", "mid"}, true},
+		{3, []string{"new"}, true},
+		{1, []string{"new"}, true},
+		{30, nil, false},
+		{0, nil, false},
+	}
+	for _, tc := range cases {
+		got, ok := cachedRepos("o", tc.days)
+		if ok != tc.hit || !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("days %d: %v %v, want %v %v", tc.days, got, ok, tc.want, tc.hit)
+		}
+	}
+	var limited atomic.Bool
+	if names := listRepos(context.Background(), &limited, "o", 3); !reflect.DeepEqual(names, []string{"new"}) || hits.Load() != 0 {
+		t.Fatalf("listRepos(3) = %v with %d requests, want [new] and 0", names, hits.Load())
+	}
+	if names, err := Repos(context.Background(), "o", 3); err != nil || !reflect.DeepEqual(names, []string{"new"}) || hits.Load() != 0 {
+		t.Fatalf("Repos(3) = %v %v with %d requests, want [new] and 0", names, err, hits.Load())
 	}
 }

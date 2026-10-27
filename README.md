@@ -33,7 +33,9 @@ Token: `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`.
 
 ## Reading it
 
-Times are in your local time zone, labelled like `10:04 UTC+7`, in both the TUI and the web page. Running jobs show their current step (`3/4`, and `3/4 · Run tests` in the detail). The terminal or browser tab title shows the queued count, e.g. `(2 queued) gh-runner`.
+Times are in your local time zone, labelled like `10:04 UTC+7`, in both the TUI and the web page. Running jobs show their current step (`3/4`, and `3/4 · Run tests` in the detail). The terminal or browser tab title shows the queued count, e.g. `(2 queued) gh-runner`. On start or reload both show the last results at once, marked `last results from …` in yellow, until the new scan replaces them (TUI: `~/.cache/gh-runners/last.json`; web: inside the encrypted cache, only with "Remember").
+
+Rescans only look at repos that were pushed since the last round or still have jobs, with a full sweep every 4th round, and rows appear as each repo finishes. A quiet round of a 75-repo account takes under a second instead of ~18.
 
 Queued and running jobs with the same labels: runners are **busy**. Queued with nothing running: runners may be **offline**.
 

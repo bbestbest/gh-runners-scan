@@ -11,7 +11,7 @@ import (
 
 const cacheVersion = 3
 
-const repoCacheVersion = 1
+const repoCacheVersion = 2
 
 type diskEntry struct {
 	ETag string `json:"etag"`
@@ -45,8 +45,9 @@ func cachePath() string {
 }
 
 type diskRepoEntry struct {
-	Names   []string  `json:"names"`
-	Expires time.Time `json:"expires"`
+	Repos   []repoInfo `json:"repos"`
+	Days    int        `json:"days"`
+	Fetched time.Time  `json:"fetched"`
 }
 
 type diskRepos struct {
@@ -71,12 +72,11 @@ func loadRepoCache(token string) {
 	if disk.Version != repoCacheVersion || disk.TokenHash != tokenHash(token) {
 		return
 	}
-	now := time.Now()
 	repoCacheMu.Lock()
 	defer repoCacheMu.Unlock()
 	for key, e := range disk.Entries {
-		if now.Before(e.Expires) {
-			repoCache[key] = repoCacheEntry{names: e.Names, expires: e.Expires}
+		if time.Since(e.Fetched) <= repoCacheTTL {
+			repoCache[key] = repoCacheEntry{repos: e.Repos, days: e.Days, fetched: e.Fetched}
 		}
 	}
 }
@@ -86,12 +86,11 @@ func (c *client) saveRepoCache() error {
 	if path == "" {
 		return nil
 	}
-	now := time.Now()
 	repoCacheMu.Lock()
 	entries := make(map[string]diskRepoEntry, len(repoCache))
 	for key, e := range repoCache {
-		if now.Before(e.expires) {
-			entries[key] = diskRepoEntry{Names: e.names, Expires: e.expires}
+		if time.Since(e.fetched) <= repoCacheTTL {
+			entries[key] = diskRepoEntry{Repos: e.repos, Days: e.days, Fetched: e.fetched}
 		}
 	}
 	repoCacheMu.Unlock()
@@ -205,4 +204,60 @@ func SaveCache() error {
 		err = rerr
 	}
 	return err
+}
+
+const lastJobsVersion = 1
+
+type diskLast struct {
+	Version   int       `json:"version"`
+	TokenHash string    `json:"token_hash"`
+	Key       string    `json:"key"`
+	At        time.Time `json:"at"`
+	Jobs      []Job     `json:"jobs"`
+}
+
+func SaveLastJobs(key string, jobs []Job) error {
+	c, err := sharedClient()
+	if err != nil {
+		return err
+	}
+	path := cacheFile("last.json")
+	if path == "" {
+		return nil
+	}
+	data, err := json.Marshal(diskLast{
+		Version:   lastJobsVersion,
+		TokenHash: tokenHash(c.token),
+		Key:       key,
+		At:        time.Now(),
+		Jobs:      jobs,
+	})
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return writeFileAtomic(dir, path, data)
+}
+
+func LoadLastJobs(key string) ([]Job, time.Time, bool) {
+	c, err := sharedClient()
+	if err != nil {
+		return nil, time.Time{}, false
+	}
+	path := cacheFile("last.json")
+	if path == "" {
+		return nil, time.Time{}, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, time.Time{}, false
+	}
+	var disk diskLast
+	if json.Unmarshal(data, &disk) != nil || disk.Version != lastJobsVersion || disk.TokenHash != tokenHash(c.token) || disk.Key != key {
+		return nil, time.Time{}, false
+	}
+	return disk.Jobs, disk.At, true
 }
