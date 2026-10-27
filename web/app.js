@@ -38,6 +38,7 @@ const CONNECT_HINTS = [['enter', 'start'], ['space', 'tick'], ['tab', 'next fiel
 
 const state = {
   targets: [],
+  pending: null,
   days: 7,
   interval: INTERVAL,
   jobs: [],
@@ -71,6 +72,8 @@ const picks = new Map()
 const repoChoices = new Map()
 
 let openOwner = ''
+
+let repoFilter = ''
 
 let daysTimer = 0
 
@@ -271,6 +274,8 @@ async function scanTargets(targets, days, scan) {
 
 async function startScan() {
   if (state.scanning) return
+  if (state.pending) applyPending()
+  if (!state.targets.length) return
   state.scanning = true
   const scan = ++state.scanId
   try {
@@ -285,7 +290,7 @@ async function startScan() {
     state.error = err.message
   }
   state.scanning = false
-  state.lastScan = new Date().toISOString().slice(11, 19)
+  state.lastScan = clock(Date.now(), true)
   state.nextIn = state.interval
   refresh()
 }
@@ -343,7 +348,7 @@ function showConfig() {
   $('whoami').className = account.scopes && !account.scopes.split(/,\s*/).includes('repo') ? 'yellow' : 'dim'
   if ($('whoami').className === 'yellow') $('whoami').textContent += ' · no repo scope: private repos stay hidden'
   $('org').value = ''
-  setPicks(state.targets)
+  setPicks((state.pending || state).targets)
   renderAccounts()
   const first = $('accounts').querySelector('input')
   ;(first || $('org')).focus()
@@ -578,7 +583,8 @@ async function sessionKey() {
 }
 
 function currentView() {
-  return { targets: state.targets, days: state.days, interval: state.interval }
+  const view = state.pending || state
+  return { targets: view.targets, days: view.days, interval: state.interval }
 }
 
 async function keepSession(value, view) {
@@ -742,55 +748,116 @@ function toggleRepo(owner, name, on, names) {
   else picks.delete(key)
 }
 
+function age(ms) {
+  const mins = Math.max(0, Math.floor((Date.now() - ms) / 60000))
+  if (mins < 60) return mins + 'm'
+  if (mins < 1440) return Math.floor(mins / 60) + 'h'
+  return Math.floor(mins / 1440) + 'd'
+}
+
+function leaf(branch, ...parts) {
+  const row = el('div', 'leaf')
+  const branchEl = el('span', 'branch ' + ({ '│': 'pipe', '├─': 'tee', '└─': 'last' }[branch] || 'none'), branch)
+  branchEl.setAttribute('aria-hidden', 'true')
+  row.append(branchEl, ...parts)
+  return row
+}
+
 function repoList(owner) {
   const key = owner.toLowerCase()
   const wrap = el('div', 'repolist')
   const choice = repoChoices.get(key)
-  const names = (choice && choice.names) || []
+  const repos = (choice && choice.repos) || []
+  const names = repos.map(r => r.name)
   const p = picks.get(key)
   const all = !!(p && p.all)
-  wrap.append(tickRow('all repositories', all, 'all:' + key, on => {
+  const filter = el('input', 'filter')
+  filter.type = 'search'
+  filter.placeholder = '⌕ filter repos…'
+  filter.spellcheck = false
+  filter.value = repoFilter
+  filter.dataset.pick = 'f:' + key
+  filter.addEventListener('input', () => {
+    repoFilter = filter.value
+    renderAccounts()
+  })
+  filter.addEventListener('keydown', e => {
+    if (e.key === 'Enter') e.preventDefault()
+    if (e.key === 'Escape' && repoFilter) {
+      e.stopPropagation()
+      repoFilter = ''
+      renderAccounts()
+    }
+  })
+  wrap.append(leaf('│', filter))
+  const needle = repoFilter.toLowerCase()
+  const items = [[tickRow('all repositories', all, 'all:' + key, on => {
     if (on) picks.set(key, { owner, all: true, repos: new Set() })
     else picks.delete(key)
-  }))
-  for (const name of names)
-    wrap.append(tickRow(name, all || !!(p && p.repos.has(name)), `r:${key}/${name}`, on => toggleRepo(owner, name, on, names)))
-  if (choice && choice.note) wrap.append(el('div', choice.cls, choice.note))
+  })]]
+  for (const r of repos.filter(r => r.name.toLowerCase().includes(needle)))
+    items.push([
+      tickRow(r.name, all || !!(p && p.repos.has(r.name)), `r:${key}/${r.name}`, on => toggleRepo(owner, r.name, on, names)),
+      el('span', 'age dim', r.pushed ? 'pushed ' + age(r.pushed) : ''),
+    ])
+  if (needle && items.length === 1 && choice && choice.done) items.push([el('span', 'dim', `no repo matches "${repoFilter}"`)])
+  items.forEach((parts, i) => wrap.append(leaf(i === items.length - 1 ? '└─' : '├─', ...parts)))
+  if (choice && choice.note) wrap.append(leaf('', el('span', choice.cls, choice.note)))
   return wrap
+}
+
+function pickSummary(targets) {
+  if (!targets.length) return 'nothing ticked'
+  const all = targets.filter(t => t.all).length
+  const repos = targets.reduce((n, t) => n + t.repos.length, 0)
+  const parts = []
+  if (all) parts.push(`${all} all`)
+  if (repos) parts.push(plural(repos, 'repo'))
+  return `${plural(targets.length, 'account')} · ${parts.join(' + ')}`
 }
 
 function renderAccounts() {
   const box = $('accounts')
-  const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.pick : ''
+  const active = document.activeElement
+  const focused = active && active.dataset ? active.dataset.pick : ''
   box.replaceChildren()
   const rows = pickRows()
   if (!rows.length) box.append(el('div', 'dim', 'no accounts yet; add an owner below'))
   for (const a of rows) {
     const key = a.login.toLowerCase()
     const p = picks.get(key)
+    const choice = repoChoices.get(key)
     const row = el('div', 'acct')
     const label = tickRow(a.login, !!(p && p.all), 'a:' + key, on => {
       if (on) picks.set(key, { owner: a.login, all: true, repos: new Set() })
       else picks.delete(key)
     })
     label.querySelector('input').indeterminate = !!(p && !p.all && p.repos.size)
-    const open = el('button', 'link', openOwner === key ? 'repos ▾' : 'repos ▸')
-    open.type = 'button'
-    open.dataset.pick = 'o:' + key
-    open.addEventListener('click', () => toggleRepos(a.login))
-    const count = p ? (p.all ? 'all repos' : plural(p.repos.size, 'repo')) : ''
-    row.append(label, el('span', 'kind dim', a.kind), el('span', 'count dim', count), open)
+    const open = openOwner === key
+    const arrow = el('button', 'arrow', open ? '▾' : '▸')
+    arrow.type = 'button'
+    arrow.title = `repos of ${a.login}`
+    arrow.setAttribute('aria-label', arrow.title)
+    arrow.setAttribute('aria-expanded', String(open))
+    arrow.dataset.pick = 'o:' + key
+    arrow.addEventListener('click', () => toggleRepos(a.login))
+    let count = ''
+    if (p && p.all) count = 'all repos'
+    else if (p) count = choice && choice.done ? `${p.repos.size} of ${choice.repos.length}` : plural(p.repos.size, 'repo')
+    row.append(label, el('span', 'kind dim', a.kind), el('span', 'count ' + (p ? 'green' : 'dim'), count), arrow)
     box.append(row)
-    if (openOwner === key) box.append(repoList(a.login))
+    if (open) box.append(repoList(a.login))
   }
-  const targets = selection()
-  $('pickSummary').textContent = targets.length ? `${plural(targets.length, 'account')} ticked` : 'nothing ticked'
+  box.append(el('div', 'summary dim', pickSummary(selection())))
   const again = focused && [...box.querySelectorAll('[data-pick]')].find(e => e.dataset.pick === focused)
-  if (again) again.focus()
+  if (!again) return
+  again.focus()
+  if (again.type === 'search') again.setSelectionRange(again.value.length, again.value.length)
 }
 
 function toggleRepos(owner) {
   const key = owner.toLowerCase()
+  repoFilter = ''
   if (openOwner === key) openOwner = ''
   else {
     openOwner = key
@@ -805,11 +872,11 @@ async function loadRepoChoices(owner) {
   const seq = ++repoSeq
   const days = formDays()
   const within = days > 0 ? ` pushed in the last ${days} ${days === 1 ? 'day' : 'days'}` : ''
-  const choice = { days, names: [], done: false, note: `loading repositories of ${owner}${within}…`, cls: 'dim' }
+  const choice = { days, repos: [], done: false, note: `loading repositories of ${owner}${within}…`, cls: 'dim' }
   repoChoices.set(key, choice)
   renderAccounts()
   const cutoff = Date.now() - days * 24 * 3600 * 1000
-  const names = []
+  const repos = []
   let failure = ''
   try {
     let next = await reposURL(owner, async url => (await connectGet(url)).data)
@@ -824,9 +891,9 @@ async function loadRepoChoices(owner) {
           older = true
           break
         }
-        names.push(r.name)
+        repos.push({ name: r.name, pushed: r.pushed_at ? Date.parse(r.pushed_at) : 0 })
       }
-      choice.note = `loading repositories of ${owner}${within}… ${names.length}`
+      choice.note = `loading repositories of ${owner}${within}… ${repos.length}`
       renderAccounts()
       next = older ? '' : page.next
     }
@@ -834,20 +901,20 @@ async function loadRepoChoices(owner) {
     if (seq !== repoSeq) return
     failure = err.message
   }
-  if (!failure) repoCache.set(owner + '\u0000' + days, { names, expires: Date.now() + REPO_TTL })
-  choice.names = names
+  if (!failure) repoCache.set(owner + '\u0000' + days, { names: repos.map(r => r.name), expires: Date.now() + REPO_TTL })
+  choice.repos = repos
   choice.done = !failure
   if (failure) {
     choice.cls = 'red'
     choice.note = `cannot list repositories of ${owner}: ${failure}`
-  } else if (!names.length) {
+  } else if (!repos.length) {
     choice.cls = 'yellow'
     choice.note = days > 0
       ? `no repositories${within}; raise "Pushed within" or set it to 0`
       : 'this token sees no repositories here; check the token\'s resource owner'
   } else {
     choice.cls = 'dim'
-    choice.note = `${names.length} ${names.length === 1 ? 'repository' : 'repositories'}${within}`
+    choice.note = `${repos.length} ${repos.length === 1 ? 'repository' : 'repositories'}${within}`
   }
   renderAccounts()
 }
@@ -936,8 +1003,17 @@ function waitClass(mins) {
   return ''
 }
 
-function utcClock(ms) {
-  return new Date(ms).toISOString().slice(11, 16)
+function zoneLabel(d) {
+  const off = -d.getTimezoneOffset()
+  if (!off) return 'UTC'
+  const abs = Math.abs(off)
+  return `UTC${off < 0 ? '-' : '+'}${Math.floor(abs / 60)}${abs % 60 ? ':' + String(abs % 60).padStart(2, '0') : ''}`
+}
+
+function clock(ms, seconds) {
+  const d = new Date(ms)
+  const parts = seconds ? [d.getHours(), d.getMinutes(), d.getSeconds()] : [d.getHours(), d.getMinutes()]
+  return `${parts.map(n => String(n).padStart(2, '0')).join(':')} ${zoneLabel(d)}`
 }
 
 function safeURL(url) {
@@ -965,7 +1041,7 @@ function renderStatus() {
   }
   const owners = el('div', 'line cyan bold', targetLabel(state.targets))
   owners.title = targetLabel(state.targets)
-  const first = el('div', 'line dim', `${state.progress.total >= 0 ? state.progress.total + ' repos' : '…'} · scanned ${state.lastScan || '-'} UTC`)
+  const first = el('div', 'line dim', `${state.progress.total >= 0 ? state.progress.total + ' repos' : '…'} · scanned ${state.lastScan || '-'}`)
   let second
   if (state.scanning && state.progress.total < 0) second = el('div', 'line dim', 'listing repos…')
   else if (state.scanning) second = el('div', 'line dim', `scanning ${state.progress.done}/${state.progress.total} repos`)
@@ -989,9 +1065,10 @@ function renderInfo() {
   const u = state.usage
   if (!state.targets.length) return
   const parts = [el('span', 'cyan bold', targetLabel(state.targets)), el('span', '', ` · next ${state.scanning ? '…' : state.nextIn + 's'}`)]
+  if (state.pending) parts.push(el('span', '', ' · '), el('span', 'yellow', `next scan: ${targetLabel(state.pending.targets)}`))
   if (u.limit) {
     const cls = u.remaining < u.limit * 0.1 ? 'red' : u.remaining < u.limit * 0.3 ? 'yellow' : 'green'
-    parts.push(el('span', '', ' · '), el('span', cls, `api ${u.remaining}/${u.limit}`), el('span', '', ` · resets ${new Date(u.reset * 1000).toISOString().slice(11, 16)} UTC`))
+    parts.push(el('span', '', ' · '), el('span', cls, `api ${u.remaining}/${u.limit}`), el('span', '', ` · resets ${clock(u.reset * 1000)}`))
   }
   info.append(...parts)
 }
@@ -1070,10 +1147,10 @@ function renderDetail() {
   const rows = [['Status', j.status === 'in_progress' ? 'running' : j.status, j.status === 'in_progress' ? 'green bold' : 'yellow bold']]
   if (j.status === 'in_progress') {
     rows.push(['Runner', j.runner || '-', 'green'])
-    rows.push(['Elapsed', j.startedAt ? `${fmtElapsed(now - j.startedAt)}  (since ${utcClock(j.startedAt)} UTC)` : '-'])
+    rows.push(['Elapsed', j.startedAt ? `${fmtElapsed(now - j.startedAt)}  (since ${clock(j.startedAt)})` : '-'])
   } else {
     const mins = j.createdAt ? Math.floor((now - j.createdAt) / 60000) : -1
-    rows.push(['Waiting', mins >= 0 ? `${mins}m  (since ${utcClock(j.createdAt)} UTC)` : '-', waitClass(mins)])
+    rows.push(['Waiting', mins >= 0 ? `${mins}m  (since ${clock(j.createdAt)})` : '-', waitClass(mins)])
   }
   rows.push(['Branch', j.branch], ['Labels', j.labels.split(',').join(', ')], ['Run', '#' + j.runId], ['URL', safeURL(j.url).replace('https://', ''), 'blue'])
   kv(box, rows)
@@ -1183,25 +1260,40 @@ function submitConnect(e) {
   start()
 }
 
-function start() {
-  const targets = selection()
-  if (!targets.length || !token) return
-  state.scanId++
-  state.scanning = false
-  state.targets = targets
-  state.days = Math.max(0, parseInt($('days').value, 10) || 0)
-  state.interval = Math.max(MIN_INTERVAL, parseInt($('interval').value, 10) || INTERVAL)
-  state.nextIn = state.interval
-  saveSettings()
-  if (hasSession()) keepSession(token, currentView())
-  sealVault(token, currentView()).catch(() => {})
+function sameView(a, b) {
+  return a.days === b.days && JSON.stringify(a.targets) === JSON.stringify(b.targets)
+}
+
+function applyPending() {
+  const p = state.pending
+  state.pending = null
+  state.targets = p.targets
+  state.days = p.days
   state.jobs = []
   state.cost = null
   state.lastScan = ''
   state.error = ''
-  state.usage = { limit: 0, remaining: 0, reset: 0 }
+  state.progress = { done: 0, total: -1 }
+  refresh()
+}
+
+async function start() {
+  const targets = selection()
+  if (!targets.length || !token) return
+  const pick = { targets, days: formDays() }
+  state.interval = Math.max(MIN_INTERVAL, parseInt($('interval').value, 10) || INTERVAL)
+  const first = !state.targets.length
+  state.pending = first || !sameView(pick, state) ? pick : null
+  saveSettings()
+  if (hasSession()) await keepSession(token, currentView())
+  sealVault(token, currentView()).catch(() => {})
   closeConnect()
   refresh()
+  if (!first) return
+  state.scanId++
+  state.scanning = false
+  state.nextIn = state.interval
+  state.usage = { limit: 0, remaining: 0, reset: 0 }
   startScan()
 }
 
@@ -1215,7 +1307,7 @@ function loadSettings() {
 
 function saveSettings() {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ days: state.days, interval: state.interval }))
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ days: (state.pending || state).days, interval: state.interval }))
   } catch {}
 }
 

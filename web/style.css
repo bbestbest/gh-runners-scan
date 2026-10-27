@@ -73,14 +73,26 @@ select { font: inherit; color: var(--fg); background: #161b22; border: 1px solid
 .connect .unit input { width: 6em; flex: none; }
 .connect .hint { margin: 0 0 2px calc(9.5em + 8px); color: var(--dim); font-size: 12px; }
 #rememberFields:not([hidden]) { display: grid; gap: 8px; }
-.connect .pick-head { display: flex; justify-content: space-between; gap: 8px; }
-.connect .accounts { border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; display: grid; gap: 4px; max-height: 40vh; overflow-y: auto; }
-.connect .acct { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.connect .acct label.check { flex: 1; min-width: 0; }
-.connect .acct .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connect .accounts { border: 1px solid var(--border); border-radius: 6px; padding: 6px 4px; display: grid; max-height: 45vh; overflow-y: auto; }
+.connect .acct, .connect .leaf { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 24px; padding: 0 6px; border-radius: 4px; }
+.connect .acct:hover, .connect .leaf:hover { background: #161b22; }
+.connect .acct label.check, .connect .leaf label.check { flex: 1; min-width: 0; }
+.connect .accounts .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .connect .acct .kind { width: 3.5em; flex: none; }
-.connect .acct .count { flex: none; }
-.connect .repolist { display: grid; gap: 2px; padding: 2px 0 6px 26px; }
+.connect .acct .count { flex: none; min-width: 5.5em; text-align: right; }
+.connect .acct .arrow { flex: none; width: 2em; padding: 0; background: none; border: none; color: var(--cyan); font-weight: 700; }
+.connect .acct .arrow[aria-expanded="true"] { color: var(--green); }
+.connect .acct .arrow:hover { color: var(--green); }
+.connect .repolist { display: grid; padding: 0 0 4px 10px; }
+.connect .leaf { gap: 6px; padding-left: 0; }
+.connect .leaf .branch { flex: none; width: 2ch; align-self: stretch; position: relative; color: transparent; overflow: hidden; }
+.connect .leaf .branch:not(.none)::before { content: ''; position: absolute; left: 0.5ch; top: 0; bottom: 0; border-left: 1px solid var(--dim); }
+.connect .leaf .branch.last::before { bottom: 50%; }
+.connect .leaf .branch.tee::after, .connect .leaf .branch.last::after { content: ''; position: absolute; left: 0.5ch; right: 0; top: 50%; border-top: 1px solid var(--dim); }
+.connect .leaf .age { flex: none; }
+.connect .leaf .filter { flex: 1; width: auto; padding: 2px 6px; margin: 2px 0; }
+.connect .accounts .summary { border-top: 1px solid var(--border); margin-top: 4px; padding: 4px 6px 0; }
+.connect input[type="checkbox"] { accent-color: var(--green); }
 .connect .unit #org { width: auto; flex: 1; }
 .connect .unit .kbtn { flex: none; padding: 4px 10px; background: transparent; color: var(--cyan); border: 1px solid var(--border); font-weight: 400; }
 #status .line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
