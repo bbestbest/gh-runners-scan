@@ -167,11 +167,13 @@ curl -s -D- -o /dev/null -H "Authorization: token $(gh auth token)" \
 
 `web/` is a read-only browser version of the TUI, deployed to GitHub Pages by `.github/workflows/pages.yml` on every push to `main` that touches `web/`. It has no build step and no third-party code.
 
-- Paste an organisation and a token. The token lives only in the tab's memory: it is never written to storage or the URL, and a reload or closing the tab drops it. A `401` clears it and returns to the form.
+- A floating Connect box over the dashboard asks for the organisation, an optional repo and a token. With a repo (`owner/repo` or a name in the organisation) only that repo is scanned and the repo listing is skipped. `O` reopens the box; leave Token empty there to keep the current one, `esc` closes it.
+- The token lives only in the tab's memory: it is never written to storage or the URL, and a reload or closing the tab drops it. A `401` clears it and reopens the box.
 - Use a fine-grained token with **Actions: read** on the organisation's repositories. The page never cancels or changes anything.
 - A Content-Security-Policy limits the page to its own files and lets it connect only to `https://api.github.com`. API text is inserted as plain text, and only job links starting with `https://github.com/` are opened.
-- The organisation field starts empty on every load; the org is never written to the URL.
-- Same scan and costs as the CLI: 6 parallel requests, ETag cache (304s are free), repo list cached 12 minutes, rescan 15s after each scan. Keys: `j`/`k`, `g`/`G`, `h`/`l`/`1`/`2`, `enter`/`o`, `/`, `esc`, `r`.
+- The organisation and repo fields start empty on every load; neither is written to the URL or stored.
+- Days and the refresh interval (seconds, minimum 5, default 15) are remembered in `localStorage` under `gh-runner:settings`. The org and token are never stored.
+- Same scan and costs as the CLI: 6 parallel requests, ETag cache (304s are free), repo list cached 12 minutes, rescan the chosen interval after each scan. Keys: `j`/`k`, `g`/`G`, `h`/`l`/`1`/`2`, `enter`/`o`, `/`, `esc`, `r`, `O`.
 - All your Pages sites share the `<user>.github.io` origin. That is why the token is never stored.
 
 ## Limitations

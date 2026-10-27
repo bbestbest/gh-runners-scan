@@ -33,19 +33,38 @@ body {
 .blue { color: var(--blue); }
 b, .bold { font-weight: 700; }
 
-.login {
-  max-width: 460px;
-  margin: 10vh auto;
-  padding: 16px;
-  border: 1px solid var(--border);
+.connect {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(440px, calc(100vw - 32px));
+  padding: 16px 14px 14px;
+  border: 1px solid var(--green);
   border-radius: 8px;
+  background: var(--bg);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
   display: grid;
-  gap: 10px;
+  gap: 8px;
+  z-index: 10;
 }
 
-.login h1 { margin: 0; font-size: 16px; color: var(--cyan); }
-.login p { margin: 0; }
-.login label { display: grid; gap: 4px; color: var(--dim); }
+.connect h2 {
+  position: absolute;
+  top: -9px;
+  left: 8px;
+  margin: 0;
+  padding: 0 4px;
+  font-size: 13px;
+  color: var(--green);
+  background: var(--bg);
+}
+
+.connect label { display: grid; grid-template-columns: 7.5em 1fr; align-items: center; gap: 8px; color: var(--dim); }
+.connect .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.connect .pair label { grid-template-columns: auto 1fr; white-space: nowrap; }
+.connect p { margin: 0; }
+.connect p:empty { display: none; }
 
 input, button {
   font: inherit;

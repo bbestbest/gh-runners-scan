@@ -6,6 +6,10 @@ const WORKERS = 6
 
 const INTERVAL = 15
 
+const MIN_INTERVAL = 5
+
+const SETTINGS_KEY = 'gh-runner:settings'
+
 const REPO_TTL = 12 * 60 * 1000
 
 const RUNS_PER_STATUS = 20
@@ -16,11 +20,15 @@ const RATE_BACKOFF = 3000
 
 const MAX_REPO_ROWS = 6
 
-const HINTS = [['enter', 'open'], ['/', 'filter'], ['h/l', 'panel'], ['r', 'rescan'], ['j/k', 'move']]
+const HINTS = [['enter', 'open'], ['/', 'filter'], ['h/l', 'panel'], ['r', 'rescan'], ['j/k', 'move'], ['O', 'connect']]
+
+const CONNECT_HINTS = [['enter', 'start'], ['tab', 'next field']]
 
 const state = {
   org: '',
+  repo: '',
   days: 7,
+  interval: INTERVAL,
   jobs: [],
   running: [],
   queued: [],
@@ -181,7 +189,7 @@ async function scanOrg(org, days, scan) {
   const cost = { requests: 0, free: 0, failed: {}, message: '' }
   state.progress = { done: 0, total: -1 }
   render()
-  const repos = await listRepos(org, days, cost, scan)
+  const repos = state.repo ? [state.repo] : await listRepos(org, days, cost, scan)
   state.progress = { done: 0, total: repos.length }
   render()
   const results = []
@@ -222,7 +230,7 @@ async function startScan() {
   }
   state.scanning = false
   state.lastScan = new Date().toISOString().slice(11, 19)
-  state.nextIn = INTERVAL
+  state.nextIn = state.interval
   refresh()
 }
 
@@ -230,11 +238,37 @@ function logout(message) {
   token = ''
   state.scanId++
   state.scanning = false
-  $('app').hidden = true
+  openConnect(message)
+}
+
+function openConnect(message) {
   $('login').hidden = false
-  $('loginError').textContent = message
+  $('loginError').textContent = message || ''
+  $('org').value = state.org
+  $('repo').value = state.repo && `${state.org}/${state.repo}`
   $('token').value = ''
-  $('token').focus()
+  $('token').required = !token
+  $('token').placeholder = token ? 'keep current token' : ''
+  renderHints()
+  ;(state.org && token ? $('repo') : state.org ? $('token') : $('org')).focus()
+}
+
+function closeConnect() {
+  $('login').hidden = true
+  renderHints()
+}
+
+function target() {
+  return state.repo ? `${state.org}/${state.repo}` : state.org
+}
+
+function splitRepo(org, value) {
+  const repo = value.trim().replace(/^\/+|\/+$/g, '')
+  const slash = repo.indexOf('/')
+  if (slash < 0) return [org, repo]
+  const owner = repo.slice(0, slash).trim()
+  const name = repo.slice(slash + 1).trim()
+  return [owner || org, name]
 }
 
 function filterJobs(jobs, needle) {
@@ -307,8 +341,12 @@ function selected() {
 function renderStatus() {
   const s = $('status')
   s.replaceChildren()
+  if (!state.org) {
+    s.append(el('div', 'dim', 'not connected'))
+    return renderInfo()
+  }
   const first = el('div')
-  first.append(el('span', 'cyan bold', state.org), el('span', 'dim', ` · ${state.progress.total >= 0 ? state.progress.total + ' repos' : '…'} · scanned ${state.lastScan || '-'} UTC`))
+  first.append(el('span', 'cyan bold', target()), el('span', 'dim', ` · ${state.progress.total >= 0 ? state.progress.total + ' repos' : '…'} · scanned ${state.lastScan || '-'} UTC`))
   let second
   if (state.scanning && state.progress.total < 0) second = el('div', 'dim', 'listing repos…')
   else if (state.scanning) second = el('div', 'dim', `scanning ${state.progress.done}/${state.progress.total} repos`)
@@ -330,7 +368,8 @@ function renderInfo() {
   const info = $('info')
   info.replaceChildren()
   const u = state.usage
-  const parts = [el('span', 'cyan bold', state.org), el('span', '', ` · next ${state.scanning ? '…' : state.nextIn + 's'}`)]
+  if (!state.org) return
+  const parts = [el('span', 'cyan bold', target()), el('span', '', ` · next ${state.scanning ? '…' : state.nextIn + 's'}`)]
   if (u.limit) {
     const cls = u.remaining < u.limit * 0.1 ? 'red' : u.remaining < u.limit * 0.3 ? 'yellow' : 'green'
     parts.push(el('span', '', ' · '), el('span', cls, `api ${u.remaining}/${u.limit}`), el('span', '', ` · resets ${new Date(u.reset * 1000).toISOString().slice(11, 16)} UTC`))
@@ -435,7 +474,8 @@ function renderDetail() {
 function renderHints() {
   const hints = $('hints')
   hints.replaceChildren()
-  HINTS.forEach(([k, v], i) => {
+  const list = $('login').hidden ? HINTS : token ? [...CONNECT_HINTS, ['esc', 'close']] : CONNECT_HINTS
+  list.forEach(([k, v], i) => {
     if (i) hints.append(' | ')
     hints.append(el('b', '', k), `: ${v}`)
   })
@@ -462,7 +502,10 @@ function move(delta) {
 }
 
 function onKey(e) {
-  if ($('app').hidden) return
+  if (!$('login').hidden) {
+    if (e.key === 'Escape' && token) closeConnect()
+    return
+  }
   if (e.target === $('filter')) {
     if (e.key === 'Escape' || e.key === 'Enter') $('filter').blur()
     if (e.key === 'Escape') {
@@ -486,6 +529,7 @@ function onKey(e) {
     r: () => startScan(),
     '/': () => $('filter').focus(),
     Escape: () => { $('filter').value = ''; state.filter = ''; refresh() },
+    O: () => openConnect(),
   }
   const fn = keys[e.key]
   if (!fn) return
@@ -504,26 +548,45 @@ function tick() {
 
 function start(e) {
   e.preventDefault()
-  const org = $('org').value.trim()
-  const value = $('token').value.trim()
+  const value = $('token').value.trim() || token
+  const [org, repo] = splitRepo($('org').value.trim(), $('repo').value)
   if (!org || !value) return
   token = value
   $('token').value = ''
+  state.scanId++
+  state.scanning = false
   state.org = org
+  state.repo = repo
   state.days = Math.max(0, parseInt($('days').value, 10) || 0)
+  state.interval = Math.max(MIN_INTERVAL, parseInt($('interval').value, 10) || INTERVAL)
+  state.nextIn = state.interval
+  saveSettings()
   state.jobs = []
   state.cost = null
   state.lastScan = ''
   state.error = ''
   state.usage = { limit: 0, remaining: 0, reset: 0 }
-  $('login').hidden = true
-  $('app').hidden = false
-  $('loginError').textContent = ''
+  closeConnect()
   refresh()
   startScan()
 }
 
+function loadSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')
+    if (Number.isInteger(saved.days) && saved.days >= 0) $('days').value = saved.days
+    if (Number.isInteger(saved.interval) && saved.interval >= MIN_INTERVAL) $('interval').value = saved.interval
+  } catch {}
+}
+
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ days: state.days, interval: state.interval }))
+  } catch {}
+}
+
 function init() {
+  loadSettings()
   renderHints()
   $('login').addEventListener('submit', start)
   $('filter').addEventListener('input', () => {
@@ -532,7 +595,8 @@ function init() {
   })
   document.addEventListener('keydown', onKey)
   setInterval(tick, 1000)
-  $('org').focus()
+  refresh()
+  openConnect()
 }
 
 init()

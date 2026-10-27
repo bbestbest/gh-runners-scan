@@ -10,18 +10,7 @@
 <script src="app.js" defer></script>
 </head>
 <body>
-<form id="login" class="login" autocomplete="off">
-  <h1>gh-runner</h1>
-  <p class="dim">Which jobs occupy an organisation's self-hosted runners. The token stays in this tab's memory and is sent only to api.github.com; reload or close the tab to drop it.</p>
-  <label>Organisation <input id="org" name="org" required spellcheck="false"></label>
-  <label>Token <input id="token" name="token" type="password" required spellcheck="false" autocomplete="off"></label>
-  <label>Days <input id="days" name="days" type="number" min="0" value="7"></label>
-  <p class="dim">Use a fine-grained token with <b>Actions: read</b> on the organisation's repositories. Read-only: this page never cancels or changes anything.</p>
-  <button type="submit">Start</button>
-  <p id="loginError" class="red"></p>
-</form>
-
-<main id="app" hidden>
+<main id="app">
   <div class="cols">
     <div class="left">
       <section class="panel" id="statusPanel"><h2>Status</h2><div class="body" id="status"></div></section>
@@ -32,6 +21,19 @@
     <section class="panel right" id="detailPanel"><h2>Job</h2><div class="body" id="detail"></div></section>
   </div>
   <div class="keybar"><span id="hints"></span><input id="filter" placeholder="/ filter" spellcheck="false"><span id="info"></span></div>
+  <form id="login" class="connect" autocomplete="off">
+    <h2>Connect</h2>
+    <label>Organisation <input id="org" name="org" required spellcheck="false"></label>
+    <label>Repo <input id="repo" name="repo" spellcheck="false" placeholder="optional: owner/repo or name"></label>
+    <label>Token <input id="token" name="token" type="password" required spellcheck="false" autocomplete="off"></label>
+    <div class="pair">
+      <label>Days <input id="days" name="days" type="number" min="0" value="7"></label>
+      <label>Refresh (s) <input id="interval" name="interval" type="number" min="5" value="15"></label>
+    </div>
+    <p class="dim">Fine-grained token, <b>Actions: read</b>. Kept in this tab's memory only and sent only to api.github.com. Leave Repo empty to scan the whole organisation.</p>
+    <p id="loginError" class="red"></p>
+    <button type="submit">enter: start</button>
+  </form>
 </main>
 </body>
 </html>
