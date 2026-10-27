@@ -55,7 +55,7 @@ var keyHints = [][2]string{
 var runningCols = []string{"Runner", "Repo", "Workflow", "Branch", "Job", "Elapsed"}
 var queuedCols = []string{"Waiting", "Repo", "Workflow", "Branch", "Job", "Labels"}
 
-var runningPanelCols = []string{"Runner", "Repo", "Job", "Elapsed"}
+var runningPanelCols = []string{"Runner", "Repo", "Job", "Step", "Elapsed"}
 
 var queuedPanelCols = []string{"Wait", "Repo", "Job", "Labels"}
 
@@ -408,7 +408,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastScan = clock(time.Now(), "15:04:05")
 		m.nextIn = m.opts.interval
 		m.refresh()
-		return m, saveCacheCmd
+		return m, tea.Batch(saveCacheCmd, tea.SetWindowTitle(windowTitle(m.jobs)))
 
 	case cancelDoneMsg:
 		label := msg.job.Workflow + " (" + msg.job.Repo + ")"
@@ -967,9 +967,10 @@ func (m *model) refresh() {
 			cell(j.Runner, cols, 0),
 			cell(m.repoName(j), cols, 1),
 			cell(j.Name, cols, 2),
-			cell(elapsed, cols, 3),
+			cell(j.Step.Fraction(), cols, 3),
+			cell(elapsed, cols, 4),
 		})
-		runStyles = append(runStyles, []lipgloss.Style{runnerStyle, rest, rest, elapsedStyle})
+		runStyles = append(runStyles, []lipgloss.Style{runnerStyle, rest, rest, rest, elapsedStyle})
 	}
 
 	qcols := m.qTable.Columns()
@@ -1005,6 +1006,14 @@ func (m *model) refresh() {
 	setRows(&m.runTable, runRows, runCursor)
 	setRows(&m.qTable, qRows, qCursor)
 	m.layout()
+}
+
+func windowTitle(jobs []scan.Job) string {
+	_, queued := scan.SplitJobs(jobs)
+	if len(queued) == 0 {
+		return "gh-runner"
+	}
+	return fmt.Sprintf("(%d queued) gh-runner", len(queued))
 }
 
 func waitColor(mins int, base lipgloss.Style) lipgloss.Style {
@@ -1292,6 +1301,18 @@ func columnWidths(cols []string, inner int) []table.Column {
 		}
 		used += w
 		widths[i] = table.Column{Title: c, Width: w}
+	}
+	for ; used > avail; used-- {
+		widest := -1
+		for i, c := range widths {
+			if c.Width > colMin(c.Title) && (widest < 0 || c.Width-colMin(c.Title) > widths[widest].Width-colMin(widths[widest].Title)) {
+				widest = i
+			}
+		}
+		if widest < 0 {
+			break
+		}
+		widths[widest].Width--
 	}
 	return widths
 }
@@ -1612,6 +1633,9 @@ func (m model) detailPanel(w, h int) string {
 	}
 	if isRunning {
 		lines = append(lines, kv("Runner", greenStyle.Render(j.Runner)))
+		if j.Step.Total > 0 {
+			lines = append(lines, kv("Step", j.Step.Fraction()+dimStyle.Render(" · ")+j.Step.Name))
+		}
 		if !j.StartedAt.IsZero() {
 			lines = append(lines, kv("Elapsed", fmtElapsed(now.Sub(j.StartedAt))+dimStyle.Render("  (since "+clock(j.StartedAt, "15:04")+")")))
 		}

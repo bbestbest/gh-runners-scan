@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const cacheVersion = 2
+const cacheVersion = 3
 
 const repoCacheVersion = 1
 

@@ -659,3 +659,25 @@ func TestScanRepoFollowsJobsPagination(t *testing.T) {
 		t.Fatal("should not be rate limited")
 	}
 }
+
+func TestCurrentStep(t *testing.T) {
+	cases := []struct {
+		name  string
+		steps []stepEntry
+		want  Step
+		frac  string
+	}{
+		{"no steps", nil, Step{}, "-"},
+		{"first running", []stepEntry{{"Set up job", "in_progress"}, {"Build", "queued"}}, Step{1, 2, "Set up job"}, "1/2"},
+		{"middle running", []stepEntry{{"Set up job", "completed"}, {"Build", "in_progress"}, {"Test", "queued"}}, Step{2, 3, "Build"}, "2/3"},
+		{"all completed", []stepEntry{{"Set up job", "completed"}, {"Build", "completed"}}, Step{2, 2, "Build"}, "2/2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := currentStep(tc.steps)
+			if got != tc.want || got.Fraction() != tc.frac {
+				t.Fatalf("currentStep = %+v %q, want %+v %q", got, got.Fraction(), tc.want, tc.frac)
+			}
+		})
+	}
+}

@@ -38,6 +38,18 @@ type Job struct {
 	StartedAt time.Time
 	CreatedAt time.Time
 	URL       string
+	Step      Step
+}
+
+type Step struct {
+	Num   int
+	Total int
+	Name  string
+}
+
+type stepEntry struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
 }
 
 type repoEntry struct {
@@ -61,16 +73,17 @@ type runsResponse struct {
 
 type jobsResponse struct {
 	Jobs []struct {
-		RunID        int64    `json:"run_id"`
-		Status       string   `json:"status"`
-		WorkflowName string   `json:"workflow_name"`
-		HeadBranch   string   `json:"head_branch"`
-		Name         string   `json:"name"`
-		RunnerName   string   `json:"runner_name"`
-		Labels       []string `json:"labels"`
-		StartedAt    string   `json:"started_at"`
-		CreatedAt    string   `json:"created_at"`
-		HTMLURL      string   `json:"html_url"`
+		RunID        int64       `json:"run_id"`
+		Status       string      `json:"status"`
+		WorkflowName string      `json:"workflow_name"`
+		HeadBranch   string      `json:"head_branch"`
+		Name         string      `json:"name"`
+		RunnerName   string      `json:"runner_name"`
+		Labels       []string    `json:"labels"`
+		StartedAt    string      `json:"started_at"`
+		CreatedAt    string      `json:"created_at"`
+		HTMLURL      string      `json:"html_url"`
+		Steps        []stepEntry `json:"steps"`
 	} `json:"jobs"`
 }
 
@@ -311,6 +324,7 @@ func scanRepo(ctx context.Context, limited *atomic.Bool, org, repo string) []Job
 						StartedAt: parseTime(j.StartedAt),
 						CreatedAt: parseTime(j.CreatedAt),
 						URL:       j.HTMLURL,
+						Step:      currentStep(j.Steps),
 					})
 				}
 				next = nextPageURL(link)
@@ -318,6 +332,25 @@ func scanRepo(ctx context.Context, limited *atomic.Bool, org, repo string) []Job
 		}
 	}
 	return jobs
+}
+
+func currentStep(steps []stepEntry) Step {
+	for i, s := range steps {
+		if s.Status != "completed" {
+			return Step{Num: i + 1, Total: len(steps), Name: s.Name}
+		}
+	}
+	if len(steps) == 0 {
+		return Step{}
+	}
+	return Step{Num: len(steps), Total: len(steps), Name: steps[len(steps)-1].Name}
+}
+
+func (s Step) Fraction() string {
+	if s.Total == 0 {
+		return "-"
+	}
+	return strconv.Itoa(s.Num) + "/" + strconv.Itoa(s.Total)
 }
 
 const TotalUnknown = -1

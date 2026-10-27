@@ -33,7 +33,7 @@ Token: `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`.
 
 ## Reading it
 
-Times are in your local time zone, labelled like `10:04 UTC+7`, in both the TUI and the web page.
+Times are in your local time zone, labelled like `10:04 UTC+7`, in both the TUI and the web page. Running jobs show their current step (`3/4`, and `3/4 · Run tests` in the detail). The terminal or browser tab title shows the queued count, e.g. `(2 queued) gh-runner`.
 
 Queued and running jobs with the same labels: runners are **busy**. Queued with nothing running: runners may be **offline**.
 

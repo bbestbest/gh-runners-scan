@@ -267,7 +267,7 @@ func sensitiveServer(t *testing.T, conditional *int) *httptest.Server {
 		case strings.HasSuffix(r.URL.Path, "/runs"):
 			fmt.Fprint(w, `{"total_count":1,"workflow_runs":[{"id":77,"actor":{"login":"SECRET-ACTOR"},"triggering_actor":{"login":"SECRET-TRIG"},"head_commit":{"message":"SECRET-MSG","author":{"name":"SECRET-NAME","email":"secret@example.com"}}}]}`)
 		default:
-			fmt.Fprint(w, `{"total_count":1,"jobs":[{"run_id":77,"status":"queued","workflow_name":"ci","head_branch":"main","name":"build","runner_name":"r1","labels":["self-hosted","linux"],"started_at":"2026-01-02T03:04:05Z","created_at":"2026-01-02T03:00:00Z","html_url":"https://github.com/o/alpha/actions/runs/77/job/1","steps":[{"name":"SECRET-STEP"}],"actor":{"login":"SECRET-JOBACTOR"}}]}`)
+			fmt.Fprint(w, `{"total_count":1,"jobs":[{"run_id":77,"status":"queued","workflow_name":"ci","head_branch":"main","name":"build","runner_name":"r1","labels":["self-hosted","linux"],"started_at":"2026-01-02T03:04:05Z","created_at":"2026-01-02T03:00:00Z","html_url":"https://github.com/o/alpha/actions/runs/77/job/1","steps":[{"name":"Run tests","status":"in_progress","number":1,"conclusion":null}],"actor":{"login":"SECRET-JOBACTOR"}}]}`)
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -300,12 +300,12 @@ func TestCacheStoresOnlyUsedFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	for _, bad := range []string{"SECRET", "secret@example.com", "email", "message", "login", "description", "head_commit", "actor"} {
+	for _, bad := range []string{"SECRET", "secret@example.com", "email", "message", "login", "description", "head_commit", "actor", "conclusion", "number"} {
 		if strings.Contains(text, bad) {
 			t.Fatalf("cache file contains %q: %s", bad, text)
 		}
 	}
-	for _, want := range []string{"alpha", "pushed_at", "archived", `\"id\":77`, "run_id", "queued", "workflow_name", "head_branch", "build", "runner_name", "self-hosted", "started_at", "created_at", "html_url", "actions/runs/77/job/1", `W/\"s1\"`} {
+	for _, want := range []string{"alpha", "pushed_at", "archived", `\"id\":77`, "run_id", "queued", "workflow_name", "head_branch", "build", "runner_name", "self-hosted", "started_at", "created_at", "html_url", "actions/runs/77/job/1", `W/\"s1\"`, "Run tests"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("cache file missing %q: %s", want, text)
 		}

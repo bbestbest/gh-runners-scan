@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"os"
 	"reflect"
@@ -860,6 +861,76 @@ func stubSaveCache(t *testing.T) *int {
 	return calls
 }
 
+func runBatch(cmd tea.Cmd) []tea.Msg {
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		return []tea.Msg{msg}
+	}
+	var out []tea.Msg
+	for _, c := range batch {
+		if c != nil {
+			out = append(out, runBatch(c)...)
+		}
+	}
+	return out
+}
+
+func TestScanDoneSetsWindowTitle(t *testing.T) {
+	stubSaveCache(t)
+	cases := []struct {
+		name string
+		jobs []scan.Job
+		want string
+	}{
+		{"none queued", []scan.Job{{Status: "in_progress", Runner: "r1"}}, "gh-runner"},
+		{"two queued", []scan.Job{{Status: "queued"}, {Status: "queued"}, {Status: "in_progress"}}, "(2 queued) gh-runner"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestModel(t)
+			_, cmd := m.Update(scanDoneMsg{id: m.scanID, jobs: tc.jobs})
+			found := false
+			for _, msg := range runBatch(cmd) {
+				if fmt.Sprint(msg) == fmt.Sprint(tea.SetWindowTitle(tc.want)()) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("no window title %q in %v", tc.want, runBatch(cmd))
+			}
+		})
+	}
+}
+
+func TestColumnWidthsFitPanel(t *testing.T) {
+	for inner := 30; inner <= 120; inner++ {
+		total := 0
+		for _, c := range columnWidths(runningPanelCols, inner) {
+			if c.Width < colMin(c.Title) {
+				t.Fatalf("inner %d: %s width %d < min %d", inner, c.Title, c.Width, colMin(c.Title))
+			}
+			total += c.Width
+		}
+		avail := inner - 2 - (len(runningPanelCols)-1)*2
+		if avail >= 5*len(runningPanelCols)+5 && total > avail {
+			t.Fatalf("inner %d: columns %d wider than %d", inner, total, avail)
+		}
+	}
+}
+
+func TestStepShownForRunningJob(t *testing.T) {
+	m := newTestModel(t)
+	m.jobs = []scan.Job{{Status: "in_progress", Runner: "r1", Repo: "repo-a", Name: "build", Step: scan.Step{Num: 4, Total: 7, Name: "Run tests"}}}
+	m.refresh()
+	if !strings.Contains(m.runTable.View(), "4/7") {
+		t.Fatalf("running table missing step:\n%s", m.runTable.View())
+	}
+	if !strings.Contains(ansi.Strip(m.detailPanel(80, 30)), "Step       4/7 · Run tests") {
+		t.Fatalf("detail missing step:\n%s", ansi.Strip(m.detailPanel(80, 30)))
+	}
+}
+
 func TestScanDoneSavesCache(t *testing.T) {
 	calls := stubSaveCache(t)
 	m := newTestModel(t)
@@ -867,7 +938,7 @@ func TestScanDoneSavesCache(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("scanDoneMsg returned no save command")
 	}
-	cmd()
+	runBatch(cmd)
 	if *calls != 1 {
 		t.Fatalf("save calls after scan = %d, want 1", *calls)
 	}
