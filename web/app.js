@@ -24,6 +24,8 @@ const KDF_ITERATIONS = 600000
 
 const REPO_TTL = 12 * 60 * 1000
 
+const FULL_SWEEP_EVERY = 4
+
 const CACHE_VERSION = 1
 
 const RUNS_PER_STATUS = 20
@@ -41,6 +43,8 @@ const CONNECT_HINTS = [['enter', 'start'], ['space', 'tick'], ['tab', 'next fiel
 const state = {
   targets: [],
   pending: null,
+  repoCount: -1,
+  stale: false,
   days: 7,
   interval: INTERVAL,
   jobs: [],
@@ -75,6 +79,8 @@ const repoChoices = new Map()
 
 let openOwner = ''
 
+let lastResults = null
+
 let repoFilter = ''
 
 let daysTimer = 0
@@ -84,6 +90,10 @@ const etags = new Map()
 const repoCache = new Map()
 
 const usedUrls = new Set()
+
+const seenRepos = new Map()
+
+let roundCount = 0
 
 const $ = id => document.getElementById(id)
 
@@ -179,12 +189,20 @@ async function reposURL(owner, get) {
   return `${API}/users/${name}/repos?per_page=100&sort=pushed&direction=desc&type=owner`
 }
 
-async function listRepos(org, days, cost, scan) {
-  const key = org + '\u0000' + days
-  const hit = repoCache.get(key)
-  if (hit && hit.expires > Date.now()) return hit.names
+function cachedRepos(owner, days) {
+  const hit = repoCache.get(owner.toLowerCase())
+  if (!hit || Date.now() - hit.fetched > REPO_TTL || !(hit.days === 0 || (days > 0 && days <= hit.days))) return null
   const cutoff = Date.now() - days * 24 * 3600 * 1000
-  const names = []
+  return hit.repos.filter(r => days <= 0 || r.pushed > cutoff)
+}
+
+function storeRepos(owner, days, repos) {
+  repoCache.set(owner.toLowerCase(), { repos, days, fetched: Date.now() })
+}
+
+async function fetchRepos(org, days, cost, scan) {
+  const cutoff = Date.now() - days * 24 * 3600 * 1000
+  const repos = []
   let next = await reposURL(org, async url => {
     const page = await getJSON(url, cost, scan)
     return page && page.data
@@ -196,21 +214,18 @@ async function listRepos(org, days, cost, scan) {
     let older = false
     for (const r of page.data) {
       if (r.archived) continue
-      if (days <= 0) {
-        names.push(r.name)
-        continue
-      }
-      if (!r.pushed_at) continue
-      if (Date.parse(r.pushed_at) <= cutoff) {
+      const pushed = r.pushed_at ? Date.parse(r.pushed_at) : 0
+      if (days > 0 && !pushed) continue
+      if (days > 0 && pushed <= cutoff) {
         older = true
         break
       }
-      names.push(r.name)
+      repos.push({ name: r.name, pushed })
     }
     next = older ? '' : page.next
   }
-  repoCache.set(key, { names, expires: Date.now() + REPO_TTL })
-  return names
+  storeRepos(org, days, repos)
+  return repos
 }
 
 async function scanRepo(org, repo, cost, scan) {
@@ -265,25 +280,47 @@ function windowTitle(jobs) {
   return queued ? `(${queued} queued) gh-runner` : 'gh-runner'
 }
 
+function needsScan(key, pushed, full) {
+  const m = seenRepos.get(key)
+  return full || !m || m.active || !pushed || pushed > m.pushed
+}
+
+function replaceRepoJobs(jobs, owner, repo, fresh) {
+  const same = j => j.owner.toLowerCase() === owner.toLowerCase() && j.repo.toLowerCase() === repo.toLowerCase()
+  return [...jobs.filter(j => !same(j)), ...fresh]
+}
+
 async function scanTargets(targets, days, scan) {
   const cost = { requests: 0, free: 0, failed: {}, message: '' }
   state.progress = { done: 0, total: -1 }
   render()
+  const full = roundCount++ % FULL_SWEEP_EVERY === 0
   const pairs = []
   for (const t of targets) {
-    const names = t.all ? await listRepos(t.owner, days, cost, scan) : t.repos
-    for (const repo of names) pairs.push([t.owner, repo])
+    if (!t.all) {
+      for (const repo of t.repos) pairs.push({ owner: t.owner, repo, pushed: 0 })
+      continue
+    }
+    for (const r of await fetchRepos(t.owner, days, cost, scan)) pairs.push({ owner: t.owner, repo: r.name, pushed: r.pushed })
   }
-  state.progress = { done: 0, total: pairs.length }
+  const todo = pairs.filter(p => needsScan(`${p.owner}/${p.repo}`.toLowerCase(), p.pushed, full))
+  state.progress = { done: pairs.length - todo.length, total: pairs.length }
+  state.repoCount = pairs.length
   render()
   const results = []
   let index = 0
   let limited = null
   const worker = async () => {
-    while (index < pairs.length) {
-      const [owner, repo] = pairs[index++]
+    while (index < todo.length) {
+      const { owner, repo, pushed } = todo[index++]
       try {
-        results.push(...await scanRepo(owner, repo, cost, scan))
+        const jobs = await scanRepo(owner, repo, cost, scan)
+        results.push(...jobs)
+        if (scan === state.scanId && !limited) seenRepos.set(`${owner}/${repo}`.toLowerCase(), { pushed, active: jobs.length > 0 })
+        if (scan === state.scanId) {
+          state.jobs = replaceRepoJobs(state.jobs, owner, repo, jobs)
+          refresh()
+        }
       } catch (err) {
         if (!(err instanceof RateLimited)) throw err
         limited = err
@@ -310,6 +347,8 @@ async function startScan() {
     document.title = windowTitle(jobs)
     state.cost = cost
     state.error = limited ? limited.message : ''
+    state.stale = false
+    if (!limited) lastResults = { key: viewKey(), at: Date.now(), jobs }
   } catch (err) {
     if (scan !== state.scanId) return
     if (err instanceof AuthError) return logout(err.message)
@@ -777,7 +816,8 @@ async function saveCache() {
     const now = Date.now()
     const payload = {
       etags: [...etags].filter(([url]) => usedUrls.has(url)),
-      repos: [...repoCache].filter(([, entry]) => entry.expires > now),
+      repos: [...repoCache].filter(([, entry]) => now - entry.fetched <= REPO_TTL),
+      last: lastResults,
     }
     await sealRecord('api', payload)
   } catch {}
@@ -792,11 +832,15 @@ async function loadCache() {
     for (const [url, entry] of payload.etags || [])
       if (typeof url === 'string' && url.startsWith(API + '/') && entry && typeof entry.etag === 'string') etags.set(url, entry)
     for (const [key, entry] of payload.repos || [])
-      if (typeof key === 'string' && entry && entry.expires > now && Array.isArray(entry.names)) repoCache.set(key, entry)
+      if (typeof key === 'string' && entry && now - entry.fetched <= REPO_TTL && Number.isInteger(entry.days) && Array.isArray(entry.repos)) repoCache.set(key, entry)
+    const last = payload.last
+    if (last && typeof last.key === 'string' && Number.isFinite(last.at) && Array.isArray(last.jobs)) lastResults = last
   } catch {}
 }
 
 function dropCache() {
+  seenRepos.clear()
+  lastResults = null
   etags.clear()
   repoCache.clear()
   usedUrls.clear()
@@ -995,9 +1039,10 @@ async function loadRepoChoices(owner) {
   repoChoices.set(key, choice)
   renderAccounts()
   const cutoff = Date.now() - days * 24 * 3600 * 1000
-  const repos = []
+  const hit = cachedRepos(owner, days)
+  const repos = hit ? [...hit] : []
   let failure = ''
-  try {
+  if (!hit) try {
     let next = await reposURL(owner, async url => (await connectGet(url)).data)
     while (next) {
       const page = await connectGet(next)
@@ -1020,7 +1065,7 @@ async function loadRepoChoices(owner) {
     if (seq !== repoSeq) return
     failure = err.message
   }
-  if (!failure) repoCache.set(owner + '\u0000' + days, { names: repos.map(r => r.name), expires: Date.now() + REPO_TTL })
+  if (!failure && !hit) storeRepos(owner, days, repos)
   choice.repos = repos
   choice.done = !failure
   if (failure) {
@@ -1160,7 +1205,9 @@ function renderStatus() {
   }
   const owners = el('div', 'line cyan bold', targetLabel(state.targets))
   owners.title = targetLabel(state.targets)
-  const first = el('div', 'line dim', `${state.progress.total >= 0 ? state.progress.total + ' repos' : '…'} · scanned ${state.lastScan || '-'}`)
+  const first = state.stale
+    ? el('div', 'line yellow', `last results from ${state.lastScan}`)
+    : el('div', 'line dim', `${state.repoCount >= 0 ? state.repoCount + ' repos' : '…'} · scanned ${state.lastScan || '-'}`)
   let second
   if (state.scanning && state.progress.total < 0) second = el('div', 'line dim', 'listing repos…')
   else if (state.scanning) second = el('div', 'line dim', `scanning ${state.progress.done}/${state.progress.total} repos`)
@@ -1384,12 +1431,18 @@ function sameView(a, b) {
   return a.days === b.days && JSON.stringify(a.targets) === JSON.stringify(b.targets)
 }
 
+function viewKey() {
+  return JSON.stringify(state.targets) + '|' + state.days
+}
+
 function applyPending() {
   const p = state.pending
   state.pending = null
   state.targets = p.targets
   state.days = p.days
   state.jobs = []
+  state.stale = false
+  state.repoCount = -1
   state.cost = null
   state.lastScan = ''
   state.error = ''
@@ -1415,6 +1468,14 @@ async function start() {
   state.scanning = false
   state.nextIn = state.interval
   state.usage = { limit: 0, remaining: 0, reset: 0 }
+  applyPending()
+  if (lastResults && lastResults.key === viewKey()) {
+    state.jobs = lastResults.jobs
+    state.lastScan = clock(lastResults.at, true)
+    state.stale = true
+    document.title = windowTitle(state.jobs)
+    refresh()
+  }
   startScan()
 }
 
