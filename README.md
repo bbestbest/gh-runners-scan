@@ -167,7 +167,8 @@ curl -s -D- -o /dev/null -H "Authorization: token $(gh auth token)" \
 
 `web/` is a read-only browser version of the TUI, deployed to GitHub Pages by `.github/workflows/pages.yml` on every push to `main` that touches `web/`. It has no build step and no third-party code.
 
-- A floating Connect box over the dashboard asks for the organisation, an optional repo and a token. With a repo (`owner/repo` or a name in the organisation) only that repo is scanned and the repo listing is skipped. `O` reopens the box; leave Token empty there to keep the current one, `esc` closes it.
+- A floating Connect box over the dashboard works in two steps. Step 1 asks only for the token and lists the permissions it needs; the page checks it with `GET /user`. Step 2 lists the organisations it can see (`/user/orgs`, plus your own account) and that organisation's repositories, with days and refresh settings. Pick a repository to scan only that one, or keep "All repositories". `O` reopens the box with the token kept, "change token" goes back to step 1, `esc` closes it.
+- Permissions: a fine-grained token whose resource owner is the organisation, with repository permission **Actions: Read-only** (Metadata is added automatically). A classic token needs `repo`, plus `read:org` to list organisations; the page warns when a classic token has no `repo` scope.
 - The token lives only in the tab's memory: it is never written to storage or the URL, and a reload or closing the tab drops it. A `401` clears it and reopens the box.
 - Use a fine-grained token with **Actions: read** on the organisation's repositories. The page never cancels or changes anything.
 - A Content-Security-Policy limits the page to its own files and lets it connect only to `https://api.github.com`. API text is inserted as plain text, and only job links starting with `https://github.com/` are opened.

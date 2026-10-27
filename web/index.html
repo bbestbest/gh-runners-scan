@@ -22,17 +22,41 @@
   </div>
   <div class="keybar"><span id="hints"></span><input id="filter" placeholder="/ filter" spellcheck="false"><span id="info"></span></div>
   <form id="login" class="connect" autocomplete="off">
-    <h2>Connect</h2>
-    <label>Organisation <input id="org" name="org" required spellcheck="false"></label>
-    <label>Repo <input id="repo" name="repo" spellcheck="false" placeholder="optional: owner/repo or name"></label>
-    <label>Token <input id="token" name="token" type="password" required spellcheck="false" autocomplete="off"></label>
-    <div class="pair">
-      <label>Days <input id="days" name="days" type="number" min="0" value="7"></label>
-      <label>Refresh (s) <input id="interval" name="interval" type="number" min="5" value="15"></label>
+    <h2 id="connectTitle">Connect · 1/2 token</h2>
+    <div id="stepToken" class="step">
+      <label>Token <input id="token" name="token" type="password" spellcheck="false" autocomplete="off"></label>
+      <div class="perms">
+        <div class="cyan bold">Permissions needed</div>
+        <div><span class="green">Fine-grained token</span> <span class="dim">(recommended)</span></div>
+        <ul>
+          <li>Resource owner: <b>the organisation</b>, not your user</li>
+          <li>Repository access: <b>All repositories</b> (or the ones to watch)</li>
+          <li>Repository permissions → <b>Actions: Read-only</b></li>
+          <li><b>Metadata: Read-only</b> is added automatically</li>
+          <li>The organisation may have to approve it</li>
+        </ul>
+        <div><span class="yellow">Classic token</span> <span class="dim">(broader: full access to private repos)</span></div>
+        <ul>
+          <li><b>repo</b> scope; add <b>read:org</b> to list your organisations</li>
+          <li>If the organisation uses SSO: Configure SSO → Authorize</li>
+        </ul>
+        <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">Create a fine-grained token ↗</a>
+      </div>
+      <p class="dim">Kept in this tab's memory only and sent only to api.github.com.</p>
     </div>
-    <p class="dim">Fine-grained token, <b>Actions: read</b>. Kept in this tab's memory only and sent only to api.github.com. Leave Repo empty to scan the whole organisation.</p>
+    <div id="stepConfig" class="step" hidden>
+      <div class="who"><span id="whoami" class="dim"></span><button type="button" id="changeToken" class="link">change token</button></div>
+      <label>Organisation <input id="org" name="org" list="orgList" spellcheck="false" placeholder="pick or type"></label>
+      <datalist id="orgList"></datalist>
+      <label>Repo <select id="repo" name="repo"><option value="">All repositories</option></select></label>
+      <p id="repoNote" class="dim"></p>
+      <div class="pair">
+        <label>Days <input id="days" name="days" type="number" min="0" value="7"></label>
+        <label>Refresh (s) <input id="interval" name="interval" type="number" min="5" value="15"></label>
+      </div>
+    </div>
     <p id="loginError" class="red"></p>
-    <button type="submit">enter: start</button>
+    <button type="submit" id="submit">enter: continue</button>
   </form>
 </main>
 </body>

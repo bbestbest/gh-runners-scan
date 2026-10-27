@@ -47,6 +47,10 @@ const state = {
 
 let token = ''
 
+let account = {}
+
+let repoSeq = 0
+
 const etags = new Map()
 
 const repoCache = new Map()
@@ -137,7 +141,9 @@ async function listRepos(org, days, cost, scan) {
   if (hit && hit.expires > Date.now()) return hit.names
   const cutoff = Date.now() - days * 24 * 3600 * 1000
   const names = []
-  let next = `${API}/orgs/${encodeURIComponent(org)}/repos?per_page=100&sort=pushed&direction=desc`
+  let next = org === account.login
+    ? `${API}/user/repos?per_page=100&sort=pushed&affiliation=owner`
+    : `${API}/orgs/${encodeURIComponent(org)}/repos?per_page=100&sort=pushed&direction=desc`
   while (next) {
     const page = await getJSON(next, cost, scan)
     if (!page) throw new Error(`cannot list repos of ${org}: ${cost.message}`)
@@ -238,19 +244,38 @@ function logout(message) {
   token = ''
   state.scanId++
   state.scanning = false
+  account = {}
   openConnect(message)
 }
 
 function openConnect(message) {
   $('login').hidden = false
   $('loginError').textContent = message || ''
-  $('org').value = state.org
-  $('repo').value = state.repo && `${state.org}/${state.repo}`
-  $('token').value = ''
-  $('token').required = !token
-  $('token').placeholder = token ? 'keep current token' : ''
+  if (token) showConfig()
+  else showTokenStep()
   renderHints()
-  ;(state.org && token ? $('repo') : state.org ? $('token') : $('org')).focus()
+}
+
+function showTokenStep() {
+  $('stepToken').hidden = false
+  $('stepConfig').hidden = true
+  $('connectTitle').textContent = 'Connect · 1/2 token'
+  $('submit').textContent = 'enter: continue'
+  $('token').value = ''
+  $('token').focus()
+}
+
+function showConfig() {
+  $('stepToken').hidden = true
+  $('stepConfig').hidden = false
+  $('connectTitle').textContent = 'Connect · 2/2 organisation and settings'
+  $('submit').textContent = 'enter: start'
+  $('whoami').textContent = account.login ? `signed in as ${account.login}${account.scopes ? ` · scopes: ${account.scopes}` : ''}` : ''
+  $('whoami').className = account.scopes && !account.scopes.split(/,\s*/).includes('repo') ? 'yellow' : 'dim'
+  if ($('whoami').className === 'yellow') $('whoami').textContent += ' · no repo scope: private repos stay hidden'
+  $('org').value = state.org
+  if (state.org) loadRepos(state.org, state.repo)
+  $('org').focus()
 }
 
 function closeConnect() {
@@ -258,17 +283,74 @@ function closeConnect() {
   renderHints()
 }
 
-function target() {
-  return state.repo ? `${state.org}/${state.repo}` : state.org
+async function connectGet(url) {
+  if (!url.startsWith(API + '/')) throw new Error('refusing non-GitHub URL')
+  const res = await fetch(url, {
+    headers: { Accept: 'application/vnd.github+json', Authorization: 'Bearer ' + token, 'X-GitHub-Api-Version': '2022-11-28' },
+    cache: 'no-store',
+    credentials: 'omit',
+    referrerPolicy: 'no-referrer',
+  })
+  recordUsage(res)
+  if (res.status === 401) throw new AuthError('token rejected (401): check it was copied whole and has not expired')
+  if (!res.ok) throw new Error(await refusal(res))
+  return { res, data: await res.json(), next: nextLink(res.headers.get('link')) }
 }
 
-function splitRepo(org, value) {
-  const repo = value.trim().replace(/^\/+|\/+$/g, '')
-  const slash = repo.indexOf('/')
-  if (slash < 0) return [org, repo]
-  const owner = repo.slice(0, slash).trim()
-  const name = repo.slice(slash + 1).trim()
-  return [owner || org, name]
+async function verifyToken() {
+  const value = $('token').value.trim()
+  if (!value) return
+  token = value
+  $('token').value = ''
+  $('loginError').textContent = ''
+  $('submit').disabled = true
+  try {
+    const { res, data } = await connectGet(`${API}/user`)
+    account = { login: data.login, scopes: res.headers.get('x-oauth-scopes') || '' }
+    const orgs = new Set([data.login])
+    try {
+      const { data: list } = await connectGet(`${API}/user/orgs?per_page=100`)
+      for (const o of list) orgs.add(o.login)
+    } catch {}
+    $('orgList').replaceChildren(...[...orgs].map(o => Object.assign(document.createElement('option'), { value: o })))
+    showConfig()
+  } catch (err) {
+    token = ''
+    account = {}
+    $('loginError').textContent = err.message
+    $('token').focus()
+  }
+  $('submit').disabled = false
+}
+
+async function loadRepos(org, keep) {
+  const select = $('repo')
+  const seq = ++repoSeq
+  select.replaceChildren(new Option('All repositories', ''))
+  $('repoNote').textContent = org ? 'loading repositories…' : ''
+  if (!org) return
+  const names = []
+  try {
+    let next = `${API}/orgs/${encodeURIComponent(org)}/repos?per_page=100&sort=pushed&direction=desc`
+    if (org === account.login) next = `${API}/user/repos?per_page=100&sort=pushed&affiliation=owner`
+    while (next) {
+      const page = await connectGet(next)
+      if (seq !== repoSeq) return
+      for (const r of page.data) if (!r.archived) names.push(r.name)
+      next = page.next
+    }
+  } catch (err) {
+    if (seq !== repoSeq) return
+    $('repoNote').textContent = `cannot list repositories: ${err.message}`
+    return
+  }
+  select.append(...names.map(n => new Option(n, n)))
+  if (keep && names.includes(keep)) select.value = keep
+  $('repoNote').textContent = names.length ? `${names.length} repositories visible to this token` : 'this token sees no repositories here; check the token\'s resource owner'
+}
+
+function target() {
+  return state.repo ? `${state.org}/${state.repo}` : state.org
 }
 
 function filterJobs(jobs, needle) {
@@ -538,7 +620,7 @@ function onKey(e) {
 }
 
 function tick() {
-  if (!token || state.scanning) return
+  if (!token || state.scanning || !$('login').hidden) return
   state.nextIn--
   if (state.nextIn <= 0) return startScan()
   renderInfo()
@@ -546,13 +628,16 @@ function tick() {
   renderDetail()
 }
 
-function start(e) {
+function submitConnect(e) {
   e.preventDefault()
-  const value = $('token').value.trim() || token
-  const [org, repo] = splitRepo($('org').value.trim(), $('repo').value)
-  if (!org || !value) return
-  token = value
-  $('token').value = ''
+  if (!$('stepToken').hidden) return verifyToken()
+  start()
+}
+
+function start() {
+  const org = $('org').value.trim()
+  const repo = $('repo').value
+  if (!org || !token) return
   state.scanId++
   state.scanning = false
   state.org = org
@@ -588,7 +673,9 @@ function saveSettings() {
 function init() {
   loadSettings()
   renderHints()
-  $('login').addEventListener('submit', start)
+  $('login').addEventListener('submit', submitConnect)
+  $('changeToken').addEventListener('click', showTokenStep)
+  $('org').addEventListener('change', () => loadRepos($('org').value.trim()))
   $('filter').addEventListener('input', () => {
     state.filter = $('filter').value
     refresh()
