@@ -231,6 +231,7 @@ async function scanRepo(org, repo, cost, scan) {
             startedAt: j.started_at ? Date.parse(j.started_at) : 0,
             createdAt: j.created_at ? Date.parse(j.created_at) : 0,
             url: j.html_url || '',
+            step: currentStep(j.steps || []),
           })
         }
         next = page.next
@@ -238,6 +239,22 @@ async function scanRepo(org, repo, cost, scan) {
     }
   }
   return jobs
+}
+
+function currentStep(steps) {
+  const i = steps.findIndex(s => s.status !== 'completed')
+  if (i >= 0) return { num: i + 1, total: steps.length, name: steps[i].name || '' }
+  if (!steps.length) return { num: 0, total: 0, name: '' }
+  return { num: steps.length, total: steps.length, name: steps[steps.length - 1].name || '' }
+}
+
+function stepFraction(step) {
+  return step && step.total ? `${step.num}/${step.total}` : '-'
+}
+
+function windowTitle(jobs) {
+  const queued = jobs.filter(j => j.status !== 'in_progress').length
+  return queued ? `(${queued} queued) gh-runner` : 'gh-runner'
 }
 
 async function scanTargets(targets, days, scan) {
@@ -282,6 +299,7 @@ async function startScan() {
     const { jobs, cost, limited } = await scanTargets(state.targets, state.days, scan)
     if (scan !== state.scanId) return
     state.jobs = jobs
+    document.title = windowTitle(jobs)
     state.cost = cost
     state.error = limited ? limited.message : ''
   } catch (err) {
@@ -1121,8 +1139,8 @@ function renderLists() {
   $('qPanel').classList.toggle('focused', state.focus === 1)
   $('runFoot').textContent = state.running.length ? `${state.cursor[0] + 1} of ${state.running.length}` : ''
   $('qFoot').textContent = state.queued.length ? `${state.cursor[1] + 1} of ${state.queued.length}` : ''
-  renderTable('runTable', 0, [['Runner', '28%'], ['Repo', '26%'], ['Job', '32%'], ['Elapsed', '14%']], j => [
-    [j.runner, 'green'], [repoName(j), ''], [j.name, ''], [j.startedAt ? fmtElapsed(now - j.startedAt) : '-', ''],
+  renderTable('runTable', 0, [['Runner', '24%'], ['Repo', '24%'], ['Job', '30%'], ['Step', '9%'], ['Elapsed', '13%']], j => [
+    [j.runner, 'green'], [repoName(j), ''], [j.name, ''], [stepFraction(j.step), ''], [j.startedAt ? fmtElapsed(now - j.startedAt) : '-', ''],
   ])
   renderTable('qTable', 1, [['Wait', '12%'], ['Repo', '26%'], ['Job', '32%'], ['Labels', '30%']], j => {
     const mins = j.createdAt ? Math.floor((now - j.createdAt) / 60000) : -1
@@ -1147,6 +1165,7 @@ function renderDetail() {
   const rows = [['Status', j.status === 'in_progress' ? 'running' : j.status, j.status === 'in_progress' ? 'green bold' : 'yellow bold']]
   if (j.status === 'in_progress') {
     rows.push(['Runner', j.runner || '-', 'green'])
+    if (j.step && j.step.total) rows.push(['Step', `${stepFraction(j.step)} · ${j.step.name}`])
     rows.push(['Elapsed', j.startedAt ? `${fmtElapsed(now - j.startedAt)}  (since ${clock(j.startedAt)})` : '-'])
   } else {
     const mins = j.createdAt ? Math.floor((now - j.createdAt) / 60000) : -1
