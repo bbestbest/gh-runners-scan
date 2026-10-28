@@ -161,6 +161,18 @@ func priorityOf(ctx context.Context) int {
 	return prio
 }
 
+type failedKey struct{}
+
+func withFailed(ctx context.Context, failed *atomic.Bool) context.Context {
+	return context.WithValue(ctx, failedKey{}, failed)
+}
+
+func markFailed(ctx context.Context) {
+	if failed, ok := ctx.Value(failedKey{}).(*atomic.Bool); ok {
+		failed.Store(true)
+	}
+}
+
 func (p *slotPool) acquire(ctx context.Context) bool {
 	p.mu.Lock()
 	if p.free > 0 && len(p.wait) == 0 {
@@ -226,6 +238,10 @@ func getJSON(ctx context.Context, limited *atomic.Bool, out any, path string) (s
 			return link, true
 		}
 		if !isRateLimit(err) {
+			var se *statusError
+			if !errors.As(err, &se) || se.code >= 500 {
+				markFailed(ctx)
+			}
 			return "", false
 		}
 		if attempt >= rateLimitAttempts-1 {
@@ -908,14 +924,15 @@ func ScanRound(ctx context.Context, targets []Target, days int, rounds *Rounds, 
 	g.SetLimit(repoWorkers)
 	for i, p := range todo {
 		g.Go(func() error {
-			gctx := withPriority(gctx, i)
+			var failed atomic.Bool
+			gctx := withFailed(withPriority(gctx, i), &failed)
 			var jobs []Job
 			if rounds == nil || rounds.hasWorkflows(gctx, &limited, p.owner, p.repo, p.pushed) {
 				jobs = scanRepo(gctx, &limited, p.owner, p.repo, rounds != nil)
 			}
 			results[i] = jobs
 			if rounds != nil && !limited.Load() && gctx.Err() == nil {
-				rounds.mark(strings.ToLower(p.owner+"/"+p.repo), p.pushed, Active(jobs) > 0)
+				rounds.mark(strings.ToLower(p.owner+"/"+p.repo), p.pushed, Active(jobs) > 0 || failed.Load())
 			}
 			if onRepo != nil {
 				onRepo(p.owner, p.repo, jobs)

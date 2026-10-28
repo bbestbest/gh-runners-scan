@@ -169,7 +169,7 @@ function giveSlot() {
   else freeSlots++
 }
 
-async function getJSON(url, cost, scan, prio) {
+async function getJSON(url, cost, scan, prio, fail) {
   if (!url.startsWith(API + '/')) throw new Error('refusing non-GitHub URL')
   for (let attempt = 0; ; attempt++) {
     const headers = {
@@ -208,6 +208,7 @@ async function getJSON(url, cost, scan, prio) {
     const limited = res.status === 429 || (res.status === 403 && (res.headers.get('x-ratelimit-remaining') === '0' || res.headers.get('retry-after')))
     if (!limited) {
       cost.failed[res.status] = (cost.failed[res.status] || 0) + 1
+      if (fail && res.status >= 500) fail.failed = true
       if (!cost.message) cost.message = await refusal(res)
       return null
     }
@@ -420,17 +421,17 @@ async function fetchRepos(org, days, cost, scan) {
   return repos
 }
 
-async function scanRepo(org, repo, cost, scan, prio) {
+async function scanRepo(org, repo, cost, scan, prio, fail) {
   const base = `${API}/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/actions/runs`
-  const done = finishedRuns(org, repo, `${base}?status=completed&per_page=${FINISHED_PER_REPO}`, cost, scan, prio)
-  const lists = await Promise.all(['in_progress', 'queued'].map(status => getJSON(`${base}?status=${status}&per_page=${RUNS_PER_STATUS}`, cost, scan, prio)))
+  const done = finishedRuns(org, repo, `${base}?status=completed&per_page=${FINISHED_PER_REPO}`, cost, scan, prio, fail)
+  const lists = await Promise.all(['in_progress', 'queued'].map(status => getJSON(`${base}?status=${status}&per_page=${RUNS_PER_STATUS}`, cost, scan, prio, fail)))
   const runs = lists.flatMap(page => (page && page.data.workflow_runs) || [])
-  const perRun = await Promise.all(runs.map(run => runJobs(org, repo, `${base}/${encodeURIComponent(run.id)}/jobs?per_page=100`, cost, scan, prio)))
+  const perRun = await Promise.all(runs.map(run => runJobs(org, repo, `${base}/${encodeURIComponent(run.id)}/jobs?per_page=100`, cost, scan, prio, fail)))
   return [...perRun.flat(), ...await done]
 }
 
-async function finishedRuns(org, repo, url, cost, scan, prio) {
-  const page = await getJSON(url, cost, scan, prio)
+async function finishedRuns(org, repo, url, cost, scan, prio, fail) {
+  const page = await getJSON(url, cost, scan, prio, fail)
   const now = Date.now()
   return ((page && page.data.workflow_runs) || []).flatMap(r => {
     const at = r.updated_at ? Date.parse(r.updated_at) : 0
@@ -458,10 +459,10 @@ function activeCount(jobs) {
   return jobs.filter(j => j.status !== 'completed').length
 }
 
-async function runJobs(org, repo, next, cost, scan, prio) {
+async function runJobs(org, repo, next, cost, scan, prio, fail) {
   const jobs = []
   while (next) {
-    const page = await getJSON(next, cost, scan, prio)
+    const page = await getJSON(next, cost, scan, prio, fail)
     if (!page) break
     for (const j of page.data.jobs || []) {
       if (j.status === 'completed') continue
@@ -515,13 +516,13 @@ function needsScan(key, pushed, round) {
   return m.active || !pushed || pushed > m.pushed || inBucket
 }
 
-async function hasWorkflows(owner, repo, pushed, cost, scan, prio) {
+async function hasWorkflows(owner, repo, pushed, cost, scan, prio, fail) {
   const key = `${owner}/${repo}`.toLowerCase()
   const w = repoWorkflows.get(key)
   if (w && Date.now() - w.checked <= WORKFLOWS_TTL && !(pushed > w.checked)) return w.count > 0
   let count = 1
   try {
-    const page = await getJSON(`${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows?per_page=1`, cost, scan, prio)
+    const page = await getJSON(`${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows?per_page=1`, cost, scan, prio, fail)
     if (page && Number.isInteger(page.data.total_count)) count = page.data.total_count
   } catch (err) {
     if (err instanceof RateLimited) return true
@@ -569,10 +570,11 @@ async function scanTargets(targets, days, scan) {
     while (index < todo.length) {
       const prio = index
       const { owner, repo, pushed } = todo[index++]
+      const fail = { failed: false }
       try {
-        const jobs = (await hasWorkflows(owner, repo, pushed, cost, scan, prio)) ? await scanRepo(owner, repo, cost, scan, prio) : []
+        const jobs = (await hasWorkflows(owner, repo, pushed, cost, scan, prio, fail)) ? await scanRepo(owner, repo, cost, scan, prio, fail) : []
         results.push(...jobs)
-        if (scan === state.scanId && !limited) seenRepos.set(`${owner}/${repo}`.toLowerCase(), { pushed, active: activeCount(jobs) > 0 })
+        if (scan === state.scanId && !limited) seenRepos.set(`${owner}/${repo}`.toLowerCase(), { pushed, active: activeCount(jobs) > 0 || fail.failed })
         if (scan === state.scanId) {
           state.jobs = replaceRepoJobs(state.jobs, owner, repo, jobs)
           refresh()

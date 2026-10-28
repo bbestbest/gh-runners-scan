@@ -782,6 +782,83 @@ func TestScanRoundSkipsQuietRepos(t *testing.T) {
 	}
 }
 
+func TestScanRoundRetriesRepoAfterFailedFetch(t *testing.T) {
+	resetRepoCache(t)
+	pushed := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339)
+	var mu sync.Mutex
+	fail := 0
+	scanned := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/users/org-a":
+			fmt.Fprint(w, `{"login":"org-a","type":"Organization"}`)
+		case r.URL.Path == "/orgs/org-a/repos":
+			fmt.Fprintf(w, `[{"name":"busy","pushed_at":%q}]`, pushed)
+		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
+			fmt.Fprint(w, `{"total_count":1}`)
+		case strings.HasSuffix(r.URL.Path, "/actions/runs"):
+			if r.URL.Query().Get("status") == "queued" {
+				scanned++
+				if fail != 0 {
+					w.WriteHeader(fail)
+					return
+				}
+				fmt.Fprint(w, `{"workflow_runs":[{"id":7}]}`)
+				return
+			}
+			fmt.Fprint(w, `{"workflow_runs":[]}`)
+		case strings.HasSuffix(r.URL.Path, "/jobs"):
+			fmt.Fprint(w, `{"jobs":[{"run_id":7,"status":"queued","name":"build"}]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	rounds := NewRounds()
+	rounds.Hint("org-a", "busy")
+	targets := []Target{{Owner: "org-a", All: true}}
+	round := func() (int, []Job) {
+		mu.Lock()
+		scanned = 0
+		mu.Unlock()
+		jobs, err := ScanRound(context.Background(), targets, 7, rounds, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return scanned, jobs
+	}
+
+	if n, jobs := round(); n != 1 || len(jobs) != 1 {
+		t.Fatalf("first round scanned %d jobs %d, want the busy repo and its job", n, len(jobs))
+	}
+	failOnce := func(code int) (int, []Job) {
+		for sweepBucket("org-a/busy") == (rounds.count+1)%sweepBuckets {
+			round()
+		}
+		mu.Lock()
+		fail = code
+		mu.Unlock()
+		round()
+		mu.Lock()
+		fail = 0
+		mu.Unlock()
+		return round()
+	}
+	if n, jobs := failOnce(http.StatusBadGateway); n != 1 || len(jobs) != 1 {
+		t.Fatalf("round after a 502 scanned %d jobs %d, want the repo checked again", n, len(jobs))
+	}
+	if n, _ := failOnce(http.StatusForbidden); n != 0 {
+		t.Fatalf("round after a 403 scanned %d, want the repo left to its sweep bucket", n)
+	}
+}
+
 func TestRoundsSaveAndLoad(t *testing.T) {
 	useCacheDir(t)
 	useClient(t, cacheClient("tok-a"))

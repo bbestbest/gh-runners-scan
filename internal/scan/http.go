@@ -281,7 +281,7 @@ func (c *client) fetch(ctx context.Context, url string) ([]byte, string, string,
 
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(io.Discard, resp.Body)
-		return nil, "", "", fmt.Errorf("github api: %s for %s", resp.Status, req.URL.Path)
+		return nil, "", "", &statusError{code: resp.StatusCode, msg: fmt.Sprintf("github api: %s for %s", resp.Status, req.URL.Path)}
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -391,6 +391,13 @@ type rateLimitError struct {
 }
 
 func (e *rateLimitError) Error() string { return "github api rate limited" }
+
+type statusError struct {
+	code int
+	msg  string
+}
+
+func (e *statusError) Error() string { return e.msg }
 
 func nextPageURL(link string) string {
 	for _, part := range strings.Split(link, ",") {
