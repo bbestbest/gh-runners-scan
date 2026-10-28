@@ -98,19 +98,21 @@ func TestRowCountsAndOrder(t *testing.T) {
 }
 
 func TestHLMoveFocus(t *testing.T) {
-	for _, k := range []string{"h", "l"} {
+	cases := map[string][]int{"l": {1, 2, 0}, "h": {2, 1, 0}}
+	for k, want := range cases {
 		m := newTestModel(t)
 		if m.focus != 0 {
 			t.Fatalf("initial focus = %d, want 0", m.focus)
 		}
-		m = send(m, key(k))
-		if m.focus != 1 {
-			t.Errorf("focus after %s = %d, want 1", k, m.focus)
+		for i, w := range want {
+			m = send(m, key(k))
+			if m.focus != w {
+				t.Errorf("focus after %d× %s = %d, want %d", i+1, k, m.focus, w)
+			}
 		}
-		m = send(m, key(k))
-		if m.focus != 0 {
-			t.Errorf("focus after second %s = %d, want 0", k, m.focus)
-		}
+	}
+	if m := send(newTestModel(t), key("3")); m.focus != 2 {
+		t.Errorf("focus after 3 = %d, want 2", m.focus)
 	}
 }
 
@@ -196,7 +198,7 @@ func scrollModel(t *testing.T, n int) model {
 	m := newModel(options{org: "org-c", interval: 30})
 	m.jobs = manyJobs(n)
 	m.refresh()
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 43})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 60})
 	return next.(model)
 }
 
@@ -431,7 +433,7 @@ func TestCancelOutcomes(t *testing.T) {
 	}{
 		{"accepted", nil, "cancel accepted", true},
 		{"finished", scan.ErrRunFinished, "run already finished", true},
-		{"no permission", scan.ErrNoCancelPermission, "no permission to cancel", false},
+		{"no permission", scan.ErrNoPermission, "no permission to cancel", false},
 		{"rate limited", scan.ErrRateLimited, "rate limited", false},
 		{"other", errors.New("boom"), "cancel failed", false},
 	}
@@ -1398,5 +1400,203 @@ func TestNarrowTerminalHidesDetail(t *testing.T) {
 	}
 	if !strings.Contains(layoutModel(t, 100, 30).View(), "╭─Job") {
 		t.Error("detail panel missing at 100 columns")
+	}
+}
+
+type rerunCall struct {
+	runID      int64
+	failedOnly bool
+}
+
+func stubRerun(t *testing.T, result error) *[]rerunCall {
+	t.Helper()
+	var calls []rerunCall
+	prev := rerunRun
+	rerunRun = func(_ context.Context, owner, repo string, runID int64, failedOnly bool) error {
+		calls = append(calls, rerunCall{runID, failedOnly})
+		return result
+	}
+	t.Cleanup(func() { rerunRun = prev })
+	return &calls
+}
+
+func finishedModel(t *testing.T) model {
+	t.Helper()
+	m := scrollModel(t, 3)
+	now := time.Now().UTC()
+	m.jobs = append(m.jobs,
+		scan.Job{Owner: "org-a", Repo: "repo", RunID: 2002, Status: "completed", Workflow: "Deploy", Conclusion: "success", FinishedAt: now.Add(-time.Hour)},
+		scan.Job{Owner: "org-a", Repo: "repo", RunID: 2001, Status: "completed", Workflow: "CI", Conclusion: "failure", FinishedAt: now.Add(-5 * time.Minute)},
+	)
+	m.refresh()
+	return send(m, key("3"))
+}
+
+func TestFinishedPanelListsRunsNewestFirst(t *testing.T) {
+	m := finishedModel(t)
+	if len(m.running)+len(m.queued) != 3 || len(m.finished) != 2 || m.finished[0].RunID != 2001 {
+		t.Fatalf("running %d queued %d finished %+v", len(m.running), len(m.queued), m.finished)
+	}
+	view := m.View()
+	for _, want := range []string{"[3] Finished · 24h (2)", "failure", "success", "Result", "R re-run"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing %q:\n%s", want, view)
+		}
+	}
+	if windowTitle(m.jobs) != windowTitle(m.jobs[:3]) {
+		t.Fatal("finished runs counted in the window title")
+	}
+}
+
+func TestRerunFailedRunOffersFailedAndAll(t *testing.T) {
+	for _, tc := range []struct {
+		key        string
+		failedOnly bool
+	}{{"f", true}, {"a", false}} {
+		t.Run(tc.key, func(t *testing.T) {
+			calls := stubRerun(t, nil)
+			m := finishedModel(t)
+			m, cmd := sendCmd(m, key("R"))
+			if cmd != nil || !m.rerunning {
+				t.Fatalf("R: rerunning=%v cmd=%v", m.rerunning, cmd)
+			}
+			view := m.View()
+			if !strings.Contains(view, "Re-run run #2001 of repo › CI?") || !strings.Contains(view, "failed jobs") {
+				t.Fatalf("prompt missing:\n%s", view)
+			}
+			m, cmd = sendCmd(m, key(tc.key))
+			if cmd == nil || m.rerunning {
+				t.Fatalf("%s: rerunning=%v cmd=%v", tc.key, m.rerunning, cmd)
+			}
+			msg := cmd()
+			if len(*calls) != 1 || (*calls)[0] != (rerunCall{2001, tc.failedOnly}) {
+				t.Fatalf("calls = %+v", *calls)
+			}
+			if !strings.Contains(m.fTable.View(), "re-running") {
+				t.Fatal("row not marked re-running")
+			}
+			if m, _ = sendCmd(m, key("R")); m.rerunning || !strings.Contains(m.notice, "already requested") {
+				t.Fatalf("second R while in flight: rerunning=%v notice=%q", m.rerunning, m.notice)
+			}
+			next, _ := m.Update(msg)
+			m = next.(model)
+			if !strings.Contains(m.notice, "requested") || m.noticeErr {
+				t.Fatalf("notice = %q", m.notice)
+			}
+		})
+	}
+}
+
+func TestRerunSucceededRunHasNoFailedOption(t *testing.T) {
+	calls := stubRerun(t, nil)
+	m := send(finishedModel(t), key("j"))
+	m = send(m, key("R"))
+	if strings.Contains(m.View(), "failed jobs") {
+		t.Fatal("failed jobs offered for a successful run")
+	}
+	m, cmd := sendCmd(m, key("f"))
+	if cmd != nil || m.rerunning || len(*calls) != 0 {
+		t.Fatalf("f on a successful run: cmd=%v rerunning=%v calls=%v", cmd, m.rerunning, *calls)
+	}
+}
+
+func TestRerunOtherKeysSendNothing(t *testing.T) {
+	calls := stubRerun(t, nil)
+	for _, k := range []string{"n", "y", "esc", "enter", "r"} {
+		m := send(finishedModel(t), key("R"))
+		m, cmd := sendCmd(m, key(k))
+		if cmd != nil || m.rerunning || len(m.reruns) != 0 {
+			t.Fatalf("%s: cmd=%v rerunning=%v reruns=%v", k, cmd, m.rerunning, m.reruns)
+		}
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("calls = %+v", *calls)
+	}
+}
+
+func TestRerunAndCancelOnlyOnTheirPanels(t *testing.T) {
+	stubRerun(t, nil)
+	stubCancel(t, nil)
+	m := send(scrollModel(t, 3), key("R"))
+	if m.rerunning || !strings.Contains(m.notice, "finished runs") {
+		t.Fatalf("R on a running job: rerunning=%v notice=%q", m.rerunning, m.notice)
+	}
+	m = send(finishedModel(t), key("c"))
+	if m.confirming || !strings.Contains(m.notice, "already finished") {
+		t.Fatalf("c on a finished run: confirming=%v notice=%q", m.confirming, m.notice)
+	}
+}
+
+func TestRerunOutcomes(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantNotice string
+		wantMarked bool
+	}{
+		{"accepted", nil, "re-run of failed jobs requested", true},
+		{"no permission", scan.ErrNoPermission, "no permission to re-run", false},
+		{"rate limited", scan.ErrRateLimited, "rate limited", false},
+		{"github refuses", errors.New("created over a month ago"), "re-run failed · created over a month ago", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := send(finishedModel(t), key("R"))
+			job := m.rerunJob
+			m = send(m, key("f"))
+			next, _ := m.Update(rerunDoneMsg{job: job, failedOnly: true, err: tc.err})
+			m = next.(model)
+			if !strings.Contains(m.notice, tc.wantNotice) {
+				t.Fatalf("notice = %q, want %q", m.notice, tc.wantNotice)
+			}
+			if m.reruns[job.RunID] != tc.wantMarked {
+				t.Fatalf("marked = %v, want %v", m.reruns[job.RunID], tc.wantMarked)
+			}
+		})
+	}
+}
+
+func TestRerunWakesRepoAndClearsWhenRunIsBack(t *testing.T) {
+	stubRerun(t, nil)
+	var woken []string
+	prev := wakeRepo
+	wakeRepo = func(_ *scan.Rounds, owner, repo string) { woken = append(woken, owner+"/"+repo) }
+	t.Cleanup(func() { wakeRepo = prev })
+	m := send(finishedModel(t), key("R"))
+	job := m.rerunJob
+	m = send(m, key("a"))
+	next, _ := m.Update(rerunDoneMsg{job: job})
+	m = next.(model)
+	if len(woken) != 1 || woken[0] != "org-a/repo" {
+		t.Fatalf("woken = %v, want org-a/repo for the next round", woken)
+	}
+	next, _ = m.Update(scanDoneMsg{id: m.scanID, jobs: m.jobs})
+	m = next.(model)
+	if !m.reruns[job.RunID] {
+		t.Fatal("re-run mark dropped while the run still shows as finished")
+	}
+	back := append([]scan.Job{}, m.jobs[:3]...)
+	back = append(back, scan.Job{Owner: "org-a", Repo: "repo", RunID: job.RunID, Status: "queued", Name: "build"})
+	next, _ = m.Update(scanDoneMsg{id: m.scanID, jobs: back})
+	m = next.(model)
+	if m.reruns[job.RunID] {
+		t.Fatal("re-run mark kept after the run is queued again")
+	}
+}
+
+func TestRerunPopupFitsTerminal(t *testing.T) {
+	for _, size := range [][2]int{{160, 40}, {120, 40}, {90, 30}, {80, 24}} {
+		m := finishedModel(t)
+		next, _ := m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		m = send(next.(model), key("R"))
+		lines := strings.Split(m.View(), "\n")
+		if len(lines) != size[1] {
+			t.Fatalf("%dx%d: %d lines", size[0], size[1], len(lines))
+		}
+		for i, l := range lines {
+			if w := ansi.StringWidth(l); w != size[0] {
+				t.Fatalf("%dx%d: line %d width %d: %q", size[0], size[1], i, w, ansi.Strip(l))
+			}
+		}
 	}
 }

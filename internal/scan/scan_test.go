@@ -350,7 +350,7 @@ func TestScanRepoMapsRESTEndpoints(t *testing.T) {
 	withClient(t, srv.URL)
 
 	var limited atomic.Bool
-	jobs := scanRepo(context.Background(), &limited, "org-a", "web")
+	jobs := scanRepo(context.Background(), &limited, "org-a", "web", false)
 	if len(jobs) != 1 {
 		t.Fatalf("jobs = %+v, want 1 non-completed", jobs)
 	}
@@ -391,9 +391,9 @@ func TestScanRepoSecondPassIsConditional(t *testing.T) {
 	withClient(t, srv.URL)
 
 	var limited atomic.Bool
-	scanRepo(context.Background(), &limited, "org-a", "web")
+	scanRepo(context.Background(), &limited, "org-a", "web", false)
 	firstFull := full.Load()
-	scanRepo(context.Background(), &limited, "org-a", "web")
+	scanRepo(context.Background(), &limited, "org-a", "web", false)
 
 	if full.Load() != firstFull {
 		t.Fatalf("second scan issued %d extra full responses, expected all 304", full.Load()-firstFull)
@@ -524,8 +524,8 @@ func TestScanRepoSkipsRepoListing(t *testing.T) {
 	mu.Lock()
 	n := len(paths)
 	mu.Unlock()
-	if n != 3 {
-		t.Fatalf("issued %d requests (%v), want 3", n, paths)
+	if n != 4 {
+		t.Fatalf("issued %d requests (%v), want 4", n, paths)
 	}
 	want := []progressCall{{0, 1}, {1, 1}}
 	if !reflect.DeepEqual(got, want) {
@@ -651,7 +651,7 @@ func TestScanRepoFollowsJobsPagination(t *testing.T) {
 	withClient(t, srv.URL)
 
 	var limited atomic.Bool
-	jobs := scanRepo(context.Background(), &limited, "org-a", "web")
+	jobs := scanRepo(context.Background(), &limited, "org-a", "web", false)
 	if len(jobs) != 2 || jobs[0].Name != "first-page" || jobs[1].Name != "second-page" {
 		t.Fatalf("jobs = %+v, want first-page and second-page", jobs)
 	}
@@ -1046,5 +1046,104 @@ func TestNoWorkflowRepoIsSkippedUntilPushed(t *testing.T) {
 	defer mu.Unlock()
 	if asked["workflows"] != 2 {
 		t.Fatalf("after a push asked %v, want the workflows checked again", asked)
+	}
+}
+
+func TestFinishedRunsListedWithoutKeepingRepoActive(t *testing.T) {
+	resetRepoCache(t)
+	now := time.Now().UTC()
+	var mu sync.Mutex
+	var scanned []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/users/org-a":
+			fmt.Fprint(w, `{"login":"org-a","type":"Organization"}`)
+		case r.URL.Path == "/orgs/org-a/repos":
+			fmt.Fprintf(w, `[{"name":"done","pushed_at":%q}]`, now.Add(-2*time.Hour).Format(time.RFC3339))
+		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
+			fmt.Fprint(w, `{"total_count":1}`)
+		case r.URL.Path == "/repos/org-a/done/actions/runs":
+			status := r.URL.Query().Get("status")
+			if status != "completed" {
+				fmt.Fprint(w, `{"workflow_runs":[]}`)
+				return
+			}
+			scanned = append(scanned, "done")
+			if r.URL.Query().Get("per_page") != fmt.Sprint(finishedPerRepo) {
+				t.Errorf("finished per_page = %s", r.URL.Query().Get("per_page"))
+			}
+			fmt.Fprintf(w, `{"workflow_runs":[{"id":1,"name":"CI","head_branch":"main","conclusion":"failure","updated_at":%q,"html_url":"https://gh/r/1"},{"id":2,"name":"Old","conclusion":"success","updated_at":%q}]}`,
+				now.Add(-time.Hour).Format(time.RFC3339), now.Add(-finishedWindow-time.Hour).Format(time.RFC3339))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	rounds := NewRounds()
+	targets := []Target{{Owner: "org-a", All: true}}
+	round := func() (int, []Job) {
+		mu.Lock()
+		scanned = nil
+		mu.Unlock()
+		jobs, err := ScanRound(context.Background(), targets, 7, rounds, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return len(scanned), jobs
+	}
+
+	n, jobs := round()
+	if n != 1 || len(jobs) != 1 {
+		t.Fatalf("first round scanned %d jobs %+v, want one finished run inside the window", n, jobs)
+	}
+	j := jobs[0]
+	if j.Status != "completed" || j.RunID != 1 || j.Conclusion != "failure" || j.Workflow != "CI" || j.FinishedAt.IsZero() || Active(jobs) != 0 {
+		t.Fatalf("finished run = %+v", j)
+	}
+	if running, queued := SplitJobs(jobs); len(running) != 0 || len(queued) != 0 {
+		t.Fatalf("finished run split into running %v queued %v", running, queued)
+	}
+	swept := 0
+	for r := 0; r < sweepBuckets; r++ {
+		if n, _ := round(); n > 0 {
+			swept++
+		}
+	}
+	if swept != 1 {
+		t.Fatalf("repo with only finished runs scanned %d times in %d rounds, want once", swept, sweepBuckets)
+	}
+	for r := 0; r < sweepBuckets; r++ {
+		if sweepBucket("org-a/done") != rounds.count%sweepBuckets {
+			break
+		}
+		round()
+	}
+	rounds.Wake("org-a", "done")
+	if n, _ := round(); n != 1 {
+		t.Fatal("woken repo not scanned in the next round")
+	}
+}
+
+func TestFinishedJobsNewestFirst(t *testing.T) {
+	now := time.Now()
+	jobs := []Job{
+		{RunID: 1, Status: "completed", FinishedAt: now.Add(-2 * time.Hour)},
+		{RunID: 2, Status: "queued"},
+		{RunID: 3, Status: "completed", FinishedAt: now.Add(-time.Minute)},
+		{RunID: 4, Status: "in_progress"},
+	}
+	got := FinishedJobs(jobs)
+	if len(got) != 2 || got[0].RunID != 3 || got[1].RunID != 1 {
+		t.Fatalf("finished = %+v", got)
+	}
+	if Active(jobs) != 2 {
+		t.Fatalf("active = %d, want 2", Active(jobs))
 	}
 }

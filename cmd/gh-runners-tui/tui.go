@@ -44,6 +44,7 @@ var (
 var keyHints = [][2]string{
 	{"enter", "open"},
 	{"c", "cancel run"},
+	{"R", "re-run"},
 	{"/", "filter"},
 	{"h/l", "panel"},
 	{"r", "rescan"},
@@ -58,6 +59,8 @@ var queuedCols = []string{"Waiting", "Repo", "Workflow", "Branch", "Job", "Label
 var runningPanelCols = []string{"Runner", "Repo", "Job", "Step", "Elapsed"}
 
 var queuedPanelCols = []string{"Wait", "Repo", "Job", "Labels"}
+
+var finishedPanelCols = []string{"Done", "Repo", "Workflow", "Result"}
 
 type repoCount struct {
 	name    string
@@ -86,6 +89,12 @@ type scanCost struct {
 type cancelDoneMsg struct {
 	job scan.Job
 	err error
+}
+
+type rerunDoneMsg struct {
+	job        scan.Job
+	failedOnly bool
+	err        error
 }
 
 type tickMsg time.Time
@@ -118,15 +127,18 @@ type pickRow struct {
 type model struct {
 	opts options
 
-	jobs    []scan.Job
-	running []scan.Job
-	queued  []scan.Job
-	repos   []repoCount
+	jobs     []scan.Job
+	running  []scan.Job
+	queued   []scan.Job
+	finished []scan.Job
+	repos    []repoCount
 
 	runTable  table.Model
 	qTable    table.Model
+	fTable    table.Model
 	runStyles [][]lipgloss.Style
 	qStyles   [][]lipgloss.Style
+	fStyles   [][]lipgloss.Style
 	focus     int
 
 	filterInput  textinput.Model
@@ -168,6 +180,9 @@ type model struct {
 	cancels    map[int64]bool
 	confirming bool
 	confirmJob scan.Job
+	reruns     map[int64]bool
+	rerunning  bool
+	rerunJob   scan.Job
 	pendingG   bool
 	notice     string
 	noticeErr  bool
@@ -197,6 +212,7 @@ func newModel(opts options) model {
 		progress:  progressMsg{0, scan.TotalUnknown},
 		repoCount: scan.TotalUnknown,
 		cancels:   map[int64]bool{},
+		reruns:    map[int64]bool{},
 	}
 	if len(opts.targets) == 0 {
 		m.openPicker()
@@ -204,6 +220,7 @@ func newModel(opts options) model {
 
 	m.runTable = newTable(runningPanelCols)
 	m.qTable = newTable(queuedPanelCols)
+	m.fTable = newTable(finishedPanelCols)
 
 	in := textinput.New()
 	in.Placeholder = "filter"
@@ -294,6 +311,10 @@ func (m *model) beginScan() tea.Cmd {
 
 var cancelRun = scan.CancelRun
 
+var rerunRun = scan.RerunRun
+
+var wakeRepo = func(r *scan.Rounds, owner, repo string) { r.Wake(owner, repo) }
+
 var usage = scan.Usage
 
 var saveCache = scan.SaveCache
@@ -377,6 +398,12 @@ func quitCmd() tea.Cmd {
 func cancelCmd(j scan.Job) tea.Cmd {
 	return func() tea.Msg {
 		return cancelDoneMsg{job: j, err: cancelRun(context.Background(), j.Owner, j.Repo, j.RunID)}
+	}
+}
+
+func rerunCmd(j scan.Job, failedOnly bool) tea.Cmd {
+	return func() tea.Msg {
+		return rerunDoneMsg{job: j, failedOnly: failedOnly, err: rerunRun(context.Background(), j.Owner, j.Repo, j.RunID, failedOnly)}
 	}
 }
 
@@ -483,6 +510,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastScan = clock(time.Now(), "15:04:05")
 		m.nextIn = m.opts.interval
 		m.stale = false
+		m.dropReruns()
 		m.refresh()
 		rounds := m.opts.rounds
 		cmds := []tea.Cmd{saveCacheCmd, tea.SetWindowTitle(windowTitle(m.jobs)), func() tea.Msg {
@@ -503,7 +531,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.notice = "cancel accepted · " + label
 		case errors.Is(msg.err, scan.ErrRunFinished):
 			m.notice = "run already finished · " + label
-		case errors.Is(msg.err, scan.ErrNoCancelPermission):
+		case errors.Is(msg.err, scan.ErrNoPermission):
 			delete(m.cancels, msg.job.RunID)
 			m.notice = "no permission to cancel · token needs actions:write"
 		case errors.Is(msg.err, scan.ErrRateLimited):
@@ -512,6 +540,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			delete(m.cancels, msg.job.RunID)
 			m.notice = "cancel failed · " + msg.err.Error()
+		}
+		m.refresh()
+		return m, nil
+
+	case rerunDoneMsg:
+		label := msg.job.Workflow + " (" + msg.job.Repo + ")"
+		m.noticeErr = true
+		switch {
+		case msg.err == nil:
+			m.noticeErr = false
+			m.notice = "re-run requested · " + label
+			if msg.failedOnly {
+				m.notice = "re-run of failed jobs requested · " + label
+			}
+			wakeRepo(m.opts.rounds, msg.job.Owner, msg.job.Repo)
+		case errors.Is(msg.err, scan.ErrNoPermission):
+			delete(m.reruns, msg.job.RunID)
+			m.notice = "no permission to re-run · token needs actions:write"
+		case errors.Is(msg.err, scan.ErrRateLimited):
+			delete(m.reruns, msg.job.RunID)
+			m.notice = "rate limited · re-run not sent"
+		default:
+			delete(m.reruns, msg.job.RunID)
+			m.notice = "re-run failed · " + msg.err.Error()
 		}
 		m.refresh()
 		return m, nil
@@ -593,6 +645,24 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.rerunning {
+		m.rerunning = false
+		key := msg.String()
+		job := m.rerunJob
+		switch {
+		case key == "ctrl+c":
+			return m, quitCmd()
+		case key == "f" && hasFailed(job), key == "a":
+			if m.reruns[job.RunID] {
+				return m, nil
+			}
+			m.reruns[job.RunID] = true
+			m.refresh()
+			return m, rerunCmd(job, key == "f")
+		}
+		return m, nil
+	}
+
 	armed := m.pendingG
 	m.pendingG = false
 
@@ -604,6 +674,11 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !ok || job.RunID == 0 {
 			return m, nil
 		}
+		if job.Status == "completed" {
+			m.notice = "run already finished · " + job.Workflow + " (" + job.Repo + ")"
+			m.noticeErr = true
+			return m, nil
+		}
 		if m.cancels[job.RunID] {
 			m.notice = "cancel already requested · " + job.Workflow + " (" + job.Repo + ")"
 			m.noticeErr = true
@@ -611,6 +686,24 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.confirming = true
 		m.confirmJob = job
+		return m, nil
+	case "R":
+		job, ok := m.selected()
+		if !ok || job.RunID == 0 {
+			return m, nil
+		}
+		if job.Status != "completed" {
+			m.notice = "re-run works on finished runs · press 3"
+			m.noticeErr = true
+			return m, nil
+		}
+		if m.reruns[job.RunID] {
+			m.notice = "re-run already requested · " + job.Workflow + " (" + job.Repo + ")"
+			m.noticeErr = true
+			return m, nil
+		}
+		m.rerunning = true
+		m.rerunJob = job
 		return m, nil
 	case "esc":
 		if m.filter != "" {
@@ -638,14 +731,20 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, accountsCmd
 		}
 		return m, nil
-	case "h", "l":
-		m.focus = 1 - m.focus
+	case "h":
+		m.focus = (m.focus + panelCount - 1) % panelCount
+		return m, nil
+	case "l":
+		m.focus = (m.focus + 1) % panelCount
 		return m, nil
 	case "1":
 		m.focus = 0
 		return m, nil
 	case "2":
 		m.focus = 1
+		return m, nil
+	case "3":
+		m.focus = 2
 		return m, nil
 	case "enter", "o":
 		m.open()
@@ -911,8 +1010,11 @@ func (m model) repoName(j scan.Job) string {
 }
 
 func (m *model) focusedTable() *table.Model {
-	if m.focus == 1 {
+	switch m.focus {
+	case 1:
 		return &m.qTable
+	case 2:
+		return &m.fTable
 	}
 	return &m.runTable
 }
@@ -995,9 +1097,13 @@ func (m *model) gotoEdge(bottom bool) {
 func (m *model) selected() (scan.Job, bool) {
 	jobs := m.running
 	cursor := m.runTable.Cursor()
-	if m.focus == 1 {
+	switch m.focus {
+	case 1:
 		jobs = m.queued
 		cursor = m.qTable.Cursor()
+	case 2:
+		jobs = m.finished
+		cursor = m.fTable.Cursor()
 	}
 	if cursor < 0 || cursor >= len(jobs) {
 		return scan.Job{}, false
@@ -1006,25 +1112,64 @@ func (m *model) selected() (scan.Job, bool) {
 }
 
 func (m *model) open() {
-	jobs := m.running
-	cursor := m.runTable.Cursor()
-	if m.focus == 1 {
-		jobs = m.queued
-		cursor = m.qTable.Cursor()
-	}
-	if cursor < 0 || cursor >= len(jobs) {
+	j, ok := m.selected()
+	if !ok {
 		return
 	}
-	if url := jobs[cursor].URL; url != "" {
-		exec.Command("open", url).Start()
+	if j.URL != "" {
+		exec.Command("open", j.URL).Start()
 	}
+}
+
+func (m *model) dropReruns() {
+	finished := map[int64]bool{}
+	for _, j := range m.jobs {
+		if j.Status == "completed" {
+			finished[j.RunID] = true
+		}
+	}
+	for id := range m.reruns {
+		if !finished[id] {
+			delete(m.reruns, id)
+		}
+	}
+}
+
+func hasFailed(j scan.Job) bool {
+	switch j.Conclusion {
+	case "failure", "cancelled", "timed_out", "startup_failure":
+		return true
+	}
+	return false
+}
+
+func conclusionStyle(conclusion string) lipgloss.Style {
+	switch conclusion {
+	case "success":
+		return greenStyle
+	case "cancelled", "skipped", "neutral":
+		return yellowStyle
+	case "failure", "timed_out", "startup_failure", "action_required":
+		return redStyle
+	}
+	return dimStyle
+}
+
+func fmtAgo(d time.Duration) string {
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	return fmt.Sprintf("%dh", int(d.Hours()))
 }
 
 func (m *model) refresh() {
 	runCursor := m.runTable.Cursor()
 	qCursor := m.qTable.Cursor()
+	fCursor := m.fTable.Cursor()
 
-	m.running, m.queued = scan.SplitJobs(scan.FilterJobs(m.jobs, m.filter))
+	visible := scan.FilterJobs(m.jobs, m.filter)
+	m.running, m.queued = scan.SplitJobs(visible)
+	m.finished = scan.FinishedJobs(visible)
 	m.repos = repoCounts(m.running, m.queued, m.repoName)
 
 	now := time.Now().UTC()
@@ -1086,9 +1231,35 @@ func (m *model) refresh() {
 		qStyles = append(qStyles, []lipgloss.Style{waitStyle, rest, rest, rest})
 	}
 
-	m.runStyles, m.qStyles = runStyles, qStyles
+	fcols := m.fTable.Columns()
+	fRows := make([]table.Row, 0, len(m.finished))
+	fStyles := make([][]lipgloss.Style, 0, len(m.finished))
+	fSel := clamp(fCursor, len(m.finished))
+	for i, j := range m.finished {
+		result := j.Conclusion
+		resultStyle := conclusionStyle(j.Conclusion)
+		if m.reruns[j.RunID] {
+			result = "re-running"
+			resultStyle = yellowStyle
+		}
+		rest := m.rowStyle(j.Repo)
+		doneStyle := dimStyle
+		if i == fSel {
+			doneStyle, rest, resultStyle = lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle()
+		}
+		fRows = append(fRows, table.Row{
+			cell(fmtAgo(now.Sub(j.FinishedAt)), fcols, 0),
+			cell(m.repoName(j), fcols, 1),
+			cell(j.Workflow, fcols, 2),
+			cell(result, fcols, 3),
+		})
+		fStyles = append(fStyles, []lipgloss.Style{doneStyle, rest, rest, resultStyle})
+	}
+
+	m.runStyles, m.qStyles, m.fStyles = runStyles, qStyles, fStyles
 	setRows(&m.runTable, runRows, runCursor)
 	setRows(&m.qTable, qRows, qCursor)
+	setRows(&m.fTable, fRows, fCursor)
 	m.layout()
 }
 
@@ -1215,8 +1386,11 @@ func cell(text string, cols []table.Column, i int) string {
 }
 
 func (m model) tableLines(focus int) []string {
-	if focus == 1 {
+	switch focus {
+	case 1:
 		return tableView(m.qTable, m.qStyles)
+	case 2:
+		return tableView(m.fTable, m.fStyles)
 	}
 	return tableView(m.runTable, m.runStyles)
 }
@@ -1293,12 +1467,15 @@ func (m *model) layout() {
 
 	m.runTable.SetColumns(columnWidths(runningPanelCols, inner))
 	m.qTable.SetColumns(columnWidths(queuedPanelCols, inner))
+	m.fTable.SetColumns(columnWidths(finishedPanelCols, inner))
 
-	runBox, qBox := m.listHeights()
+	runBox, qBox, fBox := m.listHeights()
 	setHeight(&m.runTable, tableHeight(runBox))
 	setHeight(&m.qTable, tableHeight(qBox))
+	setHeight(&m.fTable, tableHeight(fBox))
 	m.runTable.SetWidth(inner)
 	m.qTable.SetWidth(inner)
+	m.fTable.SetWidth(inner)
 }
 
 func (m model) columns() (int, int) {
@@ -1332,17 +1509,15 @@ func (m model) reposHeight() int {
 	return n + 2
 }
 
-func (m model) listHeights() (int, int) {
+func (m model) listHeights() (int, int, int) {
 	rest := m.bodyHeight() - statusPanelHeight - m.reposHeight()
-	run := rest / 2
-	queued := rest - run
-	if run < minListBox {
-		run = minListBox
+	finished := rest / panelCount
+	if finished < minListBox {
+		finished = collapsedBox
 	}
-	if queued < minListBox {
-		queued = minListBox
-	}
-	return run, queued
+	run := (rest - finished) / 2
+	queued := rest - finished - run
+	return max(run, minListBox), max(queued, minListBox), finished
 }
 
 func setHeight(t *table.Model, h int) {
@@ -1402,7 +1577,7 @@ func columnWidths(cols []string, inner int) []table.Column {
 }
 
 func colMin(name string) int {
-	if name == "Elapsed" || name == "Wait" {
+	if name == "Elapsed" || name == "Wait" || name == "Result" {
 		return len("cancelling")
 	}
 	return 5
@@ -1410,7 +1585,7 @@ func colMin(name string) int {
 
 func colUnits(name string) int {
 	switch name {
-	case "Branch", "Job", "Labels":
+	case "Branch", "Job", "Labels", "Workflow":
 		return 3
 	case "Runner", "Repo", "Elapsed":
 		return 2
@@ -1434,6 +1609,10 @@ const minBodyHeight = 16
 
 const minListBox = 5
 
+const panelCount = 3
+
+const collapsedBox = 2
+
 func (m model) View() string {
 	return m.bodyView() + "\n" + m.statusView()
 }
@@ -1444,12 +1623,13 @@ func (m model) bodyView() string {
 	}
 
 	left, right := m.columns()
-	runH, qH := m.listHeights()
+	runH, qH, fH := m.listHeights()
 	col := lipgloss.JoinVertical(lipgloss.Left,
 		panel("Status", "", false, left, statusPanelHeight, m.statusPanelLines(left-2)),
 		panel("Repos", m.reposFooter(), false, left, m.reposHeight(), m.repoLines(left-2)),
 		panel(fmt.Sprintf("[1] Running (%d)", len(m.running)), countFooter(m.runTable), m.focus == 0, left, runH, m.tableLines(0)),
 		panel(fmt.Sprintf("[2] Queued (%d)", len(m.queued)), countFooter(m.qTable), m.focus == 1, left, qH, m.tableLines(1)),
+		panel(fmt.Sprintf("[3] Finished · 24h (%d)", len(m.finished)), countFooter(m.fTable), m.focus == 2, left, fH, m.tableLines(2)),
 	)
 	body := col
 	if right > 0 {
@@ -1460,6 +1640,9 @@ func (m model) bodyView() string {
 	}
 	if m.confirming {
 		body = overlay(body, m.cancelPopup(), m.width)
+	}
+	if m.rerunning {
+		body = overlay(body, m.rerunPopup(), m.width)
 	}
 	return body
 }
@@ -1695,6 +1878,9 @@ func (m model) detailPanel(w, h int) string {
 	if !ok {
 		return panel("Job", "", false, w, h, []string{"", " " + dimStyle.Render("no job selected")})
 	}
+	if j.Status == "completed" {
+		return m.runPanel(j, w, h)
+	}
 
 	now := time.Now().UTC()
 	isRunning := j.Status == "in_progress"
@@ -1774,6 +1960,62 @@ func (m model) detailPanel(w, h int) string {
 	}
 	lines = append(lines, " "+hlStyle.Render("enter")+dimStyle.Render(" open in browser    ")+hlStyle.Render("c")+dimStyle.Render(" cancel whole run"))
 	return panel("Job", status, false, w, h, lines)
+}
+
+func (m model) runPanel(j scan.Job, w, h int) string {
+	kv := func(k, v string) string {
+		return " " + dimStyle.Render(fmt.Sprintf("%-10s", k)) + " " + v
+	}
+	result, style := j.Conclusion, conclusionStyle(j.Conclusion).Bold(true)
+	if m.reruns[j.RunID] {
+		result, style = "re-running", yellowStyle.Bold(true)
+	}
+	lines := []string{
+		"",
+		" " + hlStyle.Render(m.repoName(j)) + dimStyle.Render(" › ") + boldStyle.Render(j.Workflow),
+		"",
+		kv("Result", style.Render(result)),
+		kv("Finished", fmtAgo(time.Since(j.FinishedAt))+" ago"+dimStyle.Render("  ("+clock(j.FinishedAt, "15:04")+")")),
+		kv("Branch", j.Branch),
+		kv("Run", "#"+strconv.FormatInt(j.RunID, 10)),
+		kv("URL", accentStyle.Render(strings.TrimPrefix(j.URL, "https://"))),
+	}
+	content := h - 2
+	if len(lines) > content-1 {
+		lines = lines[:content-1]
+	}
+	for len(lines) < content-1 {
+		lines = append(lines, "")
+	}
+	lines = append(lines, " "+hlStyle.Render("enter")+dimStyle.Render(" open in browser    ")+hlStyle.Render("R")+dimStyle.Render(" re-run"))
+	return panel("Run", result, false, w, h, lines)
+}
+
+func (m model) rerunPopup() string {
+	j := m.rerunJob
+	choices := hlStyle.Render("a") + dimStyle.Render(" all jobs      ")
+	if hasFailed(j) {
+		choices = hlStyle.Render("f") + dimStyle.Render(" failed jobs   ") + choices
+	}
+	body := []string{
+		"",
+		"  Re-run run #" + strconv.FormatInt(j.RunID, 10) + " of " + hlStyle.Render(m.repoName(j)+" › "+j.Workflow) + "?",
+		"  " + dimStyle.Render("Result: ") + conclusionStyle(j.Conclusion).Render(j.Conclusion),
+		"",
+		"  " + choices + hlStyle.Render("any other key") + dimStyle.Render(" keep it"),
+		"",
+	}
+	w := 0
+	for _, l := range body {
+		if lw := ansi.StringWidth(l); lw > w {
+			w = lw
+		}
+	}
+	w += 4
+	if w > m.width {
+		w = m.width
+	}
+	return panel("Re-run", "", true, w, len(body)+2, body)
 }
 
 func (m model) cancelPopup() string {

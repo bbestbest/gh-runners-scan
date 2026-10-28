@@ -235,12 +235,12 @@ func TestCancelRunStatusMapping(t *testing.T) {
 	}{
 		{"accepted", http.StatusAccepted, nil, func(err error) bool { return err == nil }},
 		{"conflict", http.StatusConflict, nil, func(err error) bool { return errors.Is(err, ErrRunFinished) }},
-		{"forbidden without rate headers", http.StatusForbidden, nil, func(err error) bool { return errors.Is(err, ErrNoCancelPermission) }},
-		{"not found", http.StatusNotFound, nil, func(err error) bool { return errors.Is(err, ErrNoCancelPermission) }},
+		{"forbidden without rate headers", http.StatusForbidden, nil, func(err error) bool { return errors.Is(err, ErrNoPermission) }},
+		{"not found", http.StatusNotFound, nil, func(err error) bool { return errors.Is(err, ErrNoPermission) }},
 		{"forbidden rate limited", http.StatusForbidden, map[string]string{"X-RateLimit-Remaining": "0"}, isRateLimit},
 		{"too many requests", http.StatusTooManyRequests, map[string]string{"Retry-After": "7"}, isRateLimit},
 		{"server error", http.StatusInternalServerError, nil, func(err error) bool {
-			return err != nil && !isRateLimit(err) && !errors.Is(err, ErrNoCancelPermission) && !errors.Is(err, ErrRunFinished)
+			return err != nil && !isRateLimit(err) && !errors.Is(err, ErrNoPermission) && !errors.Is(err, ErrRunFinished)
 		}},
 	}
 	for _, tc := range cases {
@@ -492,5 +492,45 @@ func TestUsageMissingResetAppliesMinMax(t *testing.T) {
 	got := u.snapshot()
 	if got.Remaining != 3900 || got.Used != 1100 || got.Reset.Unix() != 1900000000 {
 		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+func TestRerunRunPathsAndRefusals(t *testing.T) {
+	cases := []struct {
+		name       string
+		failedOnly bool
+		status     int
+		body       string
+		wantPath   string
+		check      func(error) bool
+	}{
+		{"all jobs created", false, http.StatusCreated, "", "/repos/org-a/web/actions/runs/99/rerun", func(err error) bool { return err == nil }},
+		{"failed jobs created", true, http.StatusCreated, "", "/repos/org-a/web/actions/runs/99/rerun-failed-jobs", func(err error) bool { return err == nil }},
+		{"token without write", false, http.StatusForbidden, `{"message":"Resource not accessible by personal access token"}`, "/repos/org-a/web/actions/runs/99/rerun", func(err error) bool { return errors.Is(err, ErrNoPermission) }},
+		{"github refuses", true, http.StatusForbidden, `{"message":"Unable to re-run this workflow run because it was created over a month ago"}`, "/repos/org-a/web/actions/runs/99/rerun-failed-jobs", func(err error) bool {
+			return err != nil && !errors.Is(err, ErrNoPermission) && strings.Contains(err.Error(), "over a month ago")
+		}},
+		{"unprocessable", false, http.StatusUnprocessableEntity, `{"message":"This workflow run is not completed"}`, "/repos/org-a/web/actions/runs/99/rerun", func(err error) bool {
+			return err != nil && strings.Contains(err.Error(), "not completed")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var method, path string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				method, path = r.Method, r.URL.Path
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer srv.Close()
+
+			err := testClient(srv.URL).rerunRun(context.Background(), "org-a", "web", 99, tc.failedOnly)
+			if !tc.check(err) {
+				t.Fatalf("status %d body %s mapped to %v", tc.status, tc.body, err)
+			}
+			if method != http.MethodPost || path != tc.wantPath {
+				t.Fatalf("sent %s %s, want POST %s", method, path, tc.wantPath)
+			}
+		})
 	}
 }

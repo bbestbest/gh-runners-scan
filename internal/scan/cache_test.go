@@ -286,7 +286,7 @@ func TestCacheStoresOnlyUsedFields(t *testing.T) {
 	a.base = srv.URL
 	useClient(t, a)
 	var limited atomic.Bool
-	jobs := scanRepo(context.Background(), &limited, "o", "alpha")
+	jobs := scanRepo(context.Background(), &limited, "o", "alpha", false)
 	if len(jobs) == 0 {
 		t.Fatal("no jobs")
 	}
@@ -324,7 +324,7 @@ func TestCache304FromTrimmedCacheMatchesOriginal(t *testing.T) {
 	a.base = srv.URL
 	useClient(t, a)
 	var limited atomic.Bool
-	first := scanRepo(context.Background(), &limited, "o", "alpha")
+	first := scanRepo(context.Background(), &limited, "o", "alpha", false)
 	if len(first) != 2 {
 		t.Fatalf("first jobs = %d", len(first))
 	}
@@ -336,7 +336,7 @@ func TestCache304FromTrimmedCacheMatchesOriginal(t *testing.T) {
 	b.base = srv.URL
 	useClient(t, b)
 	conditional = 0
-	second := scanRepo(context.Background(), &limited, "o", "alpha")
+	second := scanRepo(context.Background(), &limited, "o", "alpha", false)
 	if conditional == 0 {
 		t.Fatal("no 304 served")
 	}

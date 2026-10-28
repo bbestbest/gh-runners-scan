@@ -292,9 +292,21 @@ func (c *client) fetch(ctx context.Context, url string) ([]byte, string, string,
 }
 
 var (
-	ErrRunFinished        = errors.New("run already finished or cannot be cancelled")
-	ErrNoCancelPermission = errors.New("cancel refused: token likely lacks actions:write (fine-grained) or repo (classic) scope")
+	ErrRunFinished  = errors.New("run already finished or cannot be cancelled")
+	ErrNoPermission = errors.New("refused: token likely lacks actions:write (fine-grained) or repo (classic) scope")
 )
+
+func refusal(body []byte) error {
+	var resp struct {
+		Message string `json:"message"`
+	}
+	json.Unmarshal(body, &resp)
+	msg := strings.TrimSpace(resp.Message)
+	if msg == "" || strings.Contains(strings.ToLower(msg), "not accessible") {
+		return ErrNoPermission
+	}
+	return errors.New(msg)
+}
 
 func (c *client) post(ctx context.Context, url string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
@@ -311,7 +323,7 @@ func (c *client) post(ctx context.Context, url string) error {
 	}
 	defer resp.Body.Close()
 	c.usage.record(resp)
-	io.Copy(io.Discard, resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 
 	if isRateLimitStatus(resp) {
 		if d, ok := retryAfter(resp); ok {
@@ -321,20 +333,33 @@ func (c *client) post(ctx context.Context, url string) error {
 	}
 
 	switch resp.StatusCode {
-	case http.StatusAccepted:
+	case http.StatusCreated, http.StatusAccepted:
 		return nil
 	case http.StatusConflict:
 		return ErrRunFinished
-	case http.StatusForbidden, http.StatusNotFound:
-		return ErrNoCancelPermission
+	case http.StatusNotFound:
+		return ErrNoPermission
+	case http.StatusForbidden, http.StatusUnprocessableEntity:
+		return refusal(body)
 	}
 	return fmt.Errorf("github api: %s for %s", resp.Status, req.URL.Path)
 }
 
+func runPath(owner, repo string, runID int64) string {
+	return "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repo) +
+		"/actions/runs/" + strconv.FormatInt(runID, 10)
+}
+
 func (c *client) cancelRun(ctx context.Context, owner, repo string, runID int64) error {
-	path := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repo) +
-		"/actions/runs/" + strconv.FormatInt(runID, 10) + "/cancel"
-	return c.post(ctx, c.base+path)
+	return c.post(ctx, c.base+runPath(owner, repo, runID)+"/cancel")
+}
+
+func (c *client) rerunRun(ctx context.Context, owner, repo string, runID int64, failedOnly bool) error {
+	action := "/rerun"
+	if failedOnly {
+		action = "/rerun-failed-jobs"
+	}
+	return c.post(ctx, c.base+runPath(owner, repo, runID)+action)
 }
 
 func CancelRun(ctx context.Context, owner, repo string, runID int64) error {
@@ -343,6 +368,18 @@ func CancelRun(ctx context.Context, owner, repo string, runID int64) error {
 		return err
 	}
 	err = c.cancelRun(ctx, owner, repo, runID)
+	if isRateLimit(err) {
+		return ErrRateLimited
+	}
+	return err
+}
+
+func RerunRun(ctx context.Context, owner, repo string, runID int64, failedOnly bool) error {
+	c, err := sharedClient()
+	if err != nil {
+		return err
+	}
+	err = c.rerunRun(ctx, owner, repo, runID, failedOnly)
 	if isRateLimit(err) {
 		return ErrRateLimited
 	}
