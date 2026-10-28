@@ -38,13 +38,17 @@ const CACHE_VERSION = 1
 
 const RUNS_PER_STATUS = 20
 
+const FINISHED_PER_REPO = 5
+
+const FINISHED_WINDOW = 24 * 60 * 60 * 1000
+
 const RATE_ATTEMPTS = 3
 
 const RATE_BACKOFF = 3000
 
 const MAX_REPO_ROWS = 6
 
-const HINTS = [['enter', 'open'], ['/', 'filter'], ['h/l', 'panel'], ['r', 'rescan'], ['j/k', 'move'], ['O', 'choose']]
+const HINTS = [['enter', 'open'], ['c', 'cancel run'], ['R', 're-run'], ['/', 'filter'], ['h/l', 'panel'], ['r', 'rescan'], ['j/k', 'move'], ['O', 'choose']]
 
 const CONNECT_HINTS = [['enter', 'start'], ['space', 'tick'], ['tab', 'next field']]
 
@@ -59,8 +63,13 @@ const state = {
   jobs: [],
   running: [],
   queued: [],
+  finished: [],
   focus: 0,
-  cursor: [0, 0],
+  cursor: [0, 0, 0],
+  cancels: new Set(),
+  reruns: new Set(),
+  confirm: null,
+  notice: null,
   filter: '',
   scanning: false,
   scanId: 0,
@@ -206,6 +215,150 @@ async function getJSON(url, cost, scan) {
   }
 }
 
+async function postAction(url) {
+  if (!url.startsWith(API + '/')) throw new Error('refusing non-GitHub URL')
+  await takeSlot()
+  let res
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { Accept: 'application/vnd.github+json', Authorization: 'Bearer ' + token, 'X-GitHub-Api-Version': '2022-11-28' },
+      cache: 'no-store',
+      credentials: 'omit',
+      referrerPolicy: 'no-referrer',
+    })
+  } finally {
+    giveSlot()
+  }
+  recordUsage(res)
+  if (res.status === 201 || res.status === 202) return 'ok'
+  if (res.status === 401) throw new AuthError('token rejected (401)')
+  if (res.status === 429 || (res.status === 403 && (res.headers.get('x-ratelimit-remaining') === '0' || res.headers.get('retry-after')))) return 'limited'
+  if (res.status === 409) return 'finished'
+  if (res.status === 404) return 'permission'
+  const message = await refusal(res)
+  if (res.status === 403 && /not accessible/i.test(message)) return 'permission'
+  return message
+}
+
+function runURL(j) {
+  return `${API}/repos/${encodeURIComponent(j.owner)}/${encodeURIComponent(j.repo)}/actions/runs/${encodeURIComponent(j.runId)}`
+}
+
+function wakeRepo(owner, repo) {
+  const key = `${owner}/${repo}`.toLowerCase()
+  const m = seenRepos.get(key)
+  if (m) seenRepos.set(key, { ...m, active: true })
+  else repoHints.add(key)
+}
+
+function hasFailed(j) {
+  return ['failure', 'cancelled', 'timed_out', 'startup_failure'].includes(j.conclusion)
+}
+
+function conclusionClass(conclusion) {
+  if (conclusion === 'success') return 'green'
+  if (['cancelled', 'skipped', 'neutral'].includes(conclusion)) return 'yellow'
+  if (['failure', 'timed_out', 'startup_failure', 'action_required'].includes(conclusion)) return 'red'
+  return 'dim'
+}
+
+function jobLabel(j) {
+  return `${j.workflow} (${j.repo})`
+}
+
+function askCancel() {
+  const j = selected()
+  if (!j || !j.runId) return
+  if (j.status === 'completed') return note(`run already finished · ${jobLabel(j)}`, true)
+  if (state.cancels.has(j.runId)) return note(`cancel already requested · ${jobLabel(j)}`, true)
+  state.confirm = { kind: 'cancel', job: j }
+  renderConfirm()
+}
+
+function askRerun() {
+  const j = selected()
+  if (!j || !j.runId) return
+  if (j.status !== 'completed') return note('re-run works on finished runs · press 3', true)
+  if (state.reruns.has(j.runId)) return note(`re-run already requested · ${jobLabel(j)}`, true)
+  state.confirm = { kind: 'rerun', job: j }
+  renderConfirm()
+}
+
+function note(text, err) {
+  state.notice = text ? { text, err: !!err } : null
+  renderInfo()
+}
+
+async function confirmAction(choice) {
+  const c = state.confirm
+  state.confirm = null
+  renderConfirm()
+  if (!c) return
+  const j = c.job
+  if (c.kind === 'cancel') {
+    if (choice !== 'cancel' || state.cancels.has(j.runId)) return
+    state.cancels.add(j.runId)
+    refresh()
+    const result = await postAction(`${runURL(j)}/cancel`).catch(err => err instanceof AuthError ? logout(err.message) : err.message)
+    if (result === undefined) return
+    if (result === 'ok') note(`cancel accepted · ${jobLabel(j)}`)
+    else if (result === 'finished') note(`run already finished · ${jobLabel(j)}`, true)
+    else {
+      state.cancels.delete(j.runId)
+      note(result === 'permission' ? 'no permission to cancel · token needs Actions: Read and write' : result === 'limited' ? 'rate limited · cancel not sent' : `cancel failed · ${result}`, true)
+    }
+    return refresh()
+  }
+  const failedOnly = choice === 'failed'
+  if (!(failedOnly && hasFailed(j)) && choice !== 'all') return
+  if (state.reruns.has(j.runId)) return
+  state.reruns.add(j.runId)
+  refresh()
+  const result = await postAction(`${runURL(j)}/${failedOnly ? 'rerun-failed-jobs' : 'rerun'}`).catch(err => err instanceof AuthError ? logout(err.message) : err.message)
+  if (result === undefined) return
+  if (result === 'ok') {
+    wakeRepo(j.owner, j.repo)
+    note(`${failedOnly ? 're-run of failed jobs' : 're-run'} requested · ${jobLabel(j)}`)
+  } else {
+    state.reruns.delete(j.runId)
+    note(result === 'permission' ? 'no permission to re-run · token needs Actions: Read and write' : result === 'limited' ? 'rate limited · re-run not sent' : `re-run failed · ${result}`, true)
+  }
+  refresh()
+}
+
+function renderConfirm() {
+  const box = $('confirm')
+  const c = state.confirm
+  box.hidden = !c
+  if (!c) return
+  const j = c.job
+  const cancel = c.kind === 'cancel'
+  $('confirmTitle').textContent = cancel ? 'Cancel run' : 'Re-run'
+  const text = $('confirmText')
+  text.replaceChildren(
+    el('div', '', `${cancel ? 'Cancel' : 'Re-run'} run #${j.runId} of `),
+    el('div', 'cyan bold', `${repoName(j)} › ${j.workflow}?`),
+    cancel ? el('div', 'dim', 'GitHub cancels the whole run, not one job.') : el('div', conclusionClass(j.conclusion), `Result: ${j.conclusion || '-'}`),
+  )
+  const buttons = $('confirmButtons')
+  buttons.replaceChildren()
+  const add = (key, label, choice, cls) => {
+    const b = el('button', cls || '', `${key} ${label}`)
+    b.type = 'button'
+    b.dataset.choice = choice
+    b.addEventListener('click', () => confirmAction(choice))
+    buttons.append(b)
+  }
+  if (cancel) add('y', 'cancel run', 'cancel', 'danger')
+  else {
+    if (hasFailed(j)) add('f', 'failed jobs', 'failed')
+    add('a', 'all jobs', 'all')
+  }
+  add('esc', 'keep it', 'keep', 'ghost')
+  buttons.querySelector('button').focus()
+}
+
 async function refusal(res) {
   if (res.headers.get('x-github-sso'))
     return 'SSO is required: authorise this token for it in GitHub token settings'
@@ -267,10 +420,40 @@ async function fetchRepos(org, days, cost, scan) {
 
 async function scanRepo(org, repo, cost, scan) {
   const base = `${API}/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/actions/runs`
+  const done = finishedRuns(org, repo, `${base}?status=completed&per_page=${FINISHED_PER_REPO}`, cost, scan)
   const lists = await Promise.all(['in_progress', 'queued'].map(status => getJSON(`${base}?status=${status}&per_page=${RUNS_PER_STATUS}`, cost, scan)))
   const runs = lists.flatMap(page => (page && page.data.workflow_runs) || [])
   const perRun = await Promise.all(runs.map(run => runJobs(org, repo, `${base}/${encodeURIComponent(run.id)}/jobs?per_page=100`, cost, scan)))
-  return perRun.flat()
+  return [...perRun.flat(), ...await done]
+}
+
+async function finishedRuns(org, repo, url, cost, scan) {
+  const page = await getJSON(url, cost, scan)
+  const now = Date.now()
+  return ((page && page.data.workflow_runs) || []).flatMap(r => {
+    const at = r.updated_at ? Date.parse(r.updated_at) : 0
+    if (!at || now - at > FINISHED_WINDOW) return []
+    return [{
+      runId: r.id,
+      status: 'completed',
+      owner: org,
+      repo,
+      workflow: r.name || '',
+      branch: r.head_branch || '',
+      name: '',
+      runner: '',
+      labels: '',
+      startedAt: r.run_started_at ? Date.parse(r.run_started_at) : 0,
+      createdAt: 0,
+      url: r.html_url || '',
+      conclusion: r.conclusion || '',
+      finishedAt: at,
+    }]
+  })
+}
+
+function activeCount(jobs) {
+  return jobs.filter(j => j.status !== 'completed').length
 }
 
 async function runJobs(org, repo, next, cost, scan) {
@@ -313,7 +496,7 @@ function stepFraction(step) {
 }
 
 function windowTitle(jobs) {
-  const queued = jobs.filter(j => j.status !== 'in_progress').length
+  const queued = jobs.filter(j => j.status !== 'in_progress' && j.status !== 'completed').length
   return queued ? `(${queued} queued) gh-runner` : 'gh-runner'
 }
 
@@ -382,7 +565,7 @@ async function scanTargets(targets, days, scan) {
       try {
         const jobs = (await hasWorkflows(owner, repo, pushed, cost, scan)) ? await scanRepo(owner, repo, cost, scan) : []
         results.push(...jobs)
-        if (scan === state.scanId && !limited) seenRepos.set(`${owner}/${repo}`.toLowerCase(), { pushed, active: jobs.length > 0 })
+        if (scan === state.scanId && !limited) seenRepos.set(`${owner}/${repo}`.toLowerCase(), { pushed, active: activeCount(jobs) > 0 })
         if (scan === state.scanId) {
           state.jobs = replaceRepoJobs(state.jobs, owner, repo, jobs)
           refresh()
@@ -410,6 +593,7 @@ async function startScan() {
     const { jobs, cost, limited } = await scanTargets(state.targets, state.days, scan)
     if (scan !== state.scanId) return
     state.jobs = jobs
+    dropReruns()
     document.title = windowTitle(jobs)
     state.cost = cost
     state.error = limited ? limited.message : ''
@@ -425,6 +609,11 @@ async function startScan() {
   state.nextIn = state.interval
   refresh()
   saveCache()
+}
+
+function dropReruns() {
+  const finished = new Set(state.jobs.filter(j => j.status === 'completed').map(j => j.runId))
+  for (const id of state.reruns) if (!finished.has(id)) state.reruns.delete(id)
 }
 
 function logout(message) {
@@ -865,7 +1054,12 @@ async function latestView(fallback) {
 function trimBody(data) {
   if (Array.isArray(data)) return data.map(r => ({ name: r.name, pushed_at: r.pushed_at, archived: r.archived }))
   if (data && Array.isArray(data.workflows)) return { total_count: data.total_count }
-  if (data && Array.isArray(data.workflow_runs)) return { workflow_runs: data.workflow_runs.map(r => ({ id: r.id })) }
+  if (data && Array.isArray(data.workflow_runs))
+    return {
+      workflow_runs: data.workflow_runs.map(r => r.status === 'completed'
+        ? { id: r.id, status: r.status, name: r.name, head_branch: r.head_branch, conclusion: r.conclusion, run_started_at: r.run_started_at, updated_at: r.updated_at, html_url: r.html_url }
+        : { id: r.id }),
+    }
   if (data && Array.isArray(data.jobs))
     return {
       jobs: data.jobs.map(j => ({
@@ -1207,8 +1401,9 @@ function filterJobs(jobs, needle) {
 
 function splitJobs(jobs) {
   const running = jobs.filter(j => j.status === 'in_progress').sort((a, b) => a.runner.localeCompare(b.runner))
-  const queued = jobs.filter(j => j.status !== 'in_progress').sort((a, b) => a.createdAt - b.createdAt)
-  return [running, queued]
+  const queued = jobs.filter(j => j.status !== 'in_progress' && j.status !== 'completed').sort((a, b) => a.createdAt - b.createdAt)
+  const finished = jobs.filter(j => j.status === 'completed').sort((a, b) => b.finishedAt - a.finishedAt)
+  return [running, queued, finished]
 }
 
 function repoCounts(running, queued) {
@@ -1264,15 +1459,19 @@ function safeURL(url) {
 }
 
 function refresh() {
-  ;[state.running, state.queued] = splitJobs(filterJobs(state.jobs, state.filter))
+  ;[state.running, state.queued, state.finished] = splitJobs(filterJobs(state.jobs, state.filter))
   state.cursor[0] = Math.min(state.cursor[0], Math.max(0, state.running.length - 1))
   state.cursor[1] = Math.min(state.cursor[1], Math.max(0, state.queued.length - 1))
+  state.cursor[2] = Math.min(state.cursor[2], Math.max(0, state.finished.length - 1))
   render()
 }
 
+function panelList(focus) {
+  return [state.running, state.queued, state.finished][focus]
+}
+
 function selected() {
-  const list = state.focus === 0 ? state.running : state.queued
-  return list[state.cursor[state.focus]]
+  return panelList(state.focus)[state.cursor[state.focus]]
 }
 
 function renderStatus() {
@@ -1312,6 +1511,7 @@ function renderInfo() {
   if (!state.targets.length) return
   const parts = [el('span', 'cyan bold', targetLabel(state.targets)), el('span', '', ` · next ${state.scanning ? '…' : state.nextIn + 's'}`)]
   if (state.pending) parts.push(el('span', '', ' · '), el('span', 'yellow', `next scan: ${targetLabel(state.pending.targets)}`))
+  if (state.notice) parts.unshift(el('span', state.notice.err ? 'yellow' : 'green', state.notice.text), el('span', '', ' · '))
   if (u.limit) {
     const cls = u.remaining < u.limit * 0.1 ? 'red' : u.remaining < u.limit * 0.3 ? 'yellow' : 'green'
     parts.push(el('span', '', ' · '), el('span', cls, `api ${u.remaining}/${u.limit}`), el('span', '', ` · resets ${clock(u.reset * 1000)}`))
@@ -1335,7 +1535,7 @@ function renderRepos() {
 
 function renderTable(id, focus, cols, cells) {
   const table = $(id)
-  const list = focus === 0 ? state.running : state.queued
+  const list = panelList(focus)
   table.replaceChildren()
   const head = el('tr')
   cols.forEach(([name, width]) => {
@@ -1363,17 +1563,33 @@ function renderLists() {
   const now = Date.now()
   $('runTitle').textContent = `[1] Running (${state.running.length})`
   $('qTitle').textContent = `[2] Queued (${state.queued.length})`
+  $('fTitle').textContent = `[3] Finished · 24h (${state.finished.length})`
   $('runPanel').classList.toggle('focused', state.focus === 0)
   $('qPanel').classList.toggle('focused', state.focus === 1)
+  $('fPanel').classList.toggle('focused', state.focus === 2)
   $('runFoot').textContent = state.running.length ? `${state.cursor[0] + 1} of ${state.running.length}` : ''
   $('qFoot').textContent = state.queued.length ? `${state.cursor[1] + 1} of ${state.queued.length}` : ''
+  $('fFoot').textContent = state.finished.length ? `${state.cursor[2] + 1} of ${state.finished.length}` : ''
   renderTable('runTable', 0, [['Runner', '24%'], ['Repo', '24%'], ['Job', '30%'], ['Step', '9%'], ['Elapsed', '13%']], j => [
-    [j.runner, 'green'], [repoName(j), ''], [j.name, ''], [stepFraction(j.step), ''], [j.startedAt ? fmtElapsed(now - j.startedAt) : '-', ''],
+    [j.runner, 'green'], [repoName(j), ''], [j.name, ''], [stepFraction(j.step), ''],
+    state.cancels.has(j.runId) ? ['cancelling', 'yellow'] : [j.startedAt ? fmtElapsed(now - j.startedAt) : '-', ''],
   ])
   renderTable('qTable', 1, [['Wait', '12%'], ['Repo', '26%'], ['Job', '32%'], ['Labels', '30%']], j => {
     const mins = j.createdAt ? Math.floor((now - j.createdAt) / 60000) : -1
-    return [[mins >= 0 ? mins + 'm' : '-', waitClass(mins)], [repoName(j), ''], [j.name, ''], [j.labels, '']]
+    const wait = state.cancels.has(j.runId) ? ['cancelling', 'yellow'] : [mins >= 0 ? mins + 'm' : '-', waitClass(mins)]
+    return [wait, [repoName(j), ''], [j.name, ''], [j.labels, '']]
   })
+  renderTable('fTable', 2, [['Done', '12%'], ['Repo', '28%'], ['Workflow', '38%'], ['Result', '22%']], j => [
+    [age(j.finishedAt), 'dim'], [repoName(j), ''], [j.workflow, ''],
+    state.reruns.has(j.runId) ? ['re-running', 'yellow'] : [j.conclusion || '-', conclusionClass(j.conclusion)],
+  ])
+}
+
+function actionButton(label, run, cls) {
+  const b = el('button', 'act ' + (cls || ''), label)
+  b.type = 'button'
+  b.addEventListener('click', run)
+  return b
 }
 
 function kv(box, rows) {
@@ -1386,7 +1602,9 @@ function renderDetail() {
   const box = $('detail')
   box.replaceChildren()
   const j = selected()
-  $('detailPanel').querySelector('h2').textContent = j ? `Job · ${j.status === 'in_progress' ? 'running' : 'queued'}` : 'Job'
+  if (j && j.status === 'completed') return renderRun(box, j)
+  const cancelling = j && state.cancels.has(j.runId)
+  $('detailPanel').querySelector('h2').textContent = j ? `Job · ${cancelling ? 'cancelling' : j.status === 'in_progress' ? 'running' : 'queued'}` : 'Job'
   if (!j) return box.append(el('div', 'dim', 'no job selected'))
   const now = Date.now()
   box.append(el('div', 'title', `${repoName(j)} › ${j.workflow} › ${j.name}`))
@@ -1401,6 +1619,11 @@ function renderDetail() {
   }
   rows.push(['Branch', j.branch], ['Labels', j.labels.split(',').join(', ')], ['Run', '#' + j.runId], ['URL', safeURL(j.url).replace('https://', ''), 'blue'])
   kv(box, rows)
+  const actions = el('div', 'actions')
+  const cancel = actionButton(cancelling ? 'cancelling…' : 'c cancel whole run', askCancel, 'danger')
+  cancel.disabled = !!cancelling
+  actions.append(cancel)
+  box.append(actions)
   if (j.status !== 'in_progress') {
     const busy = busyRunners(j, state.running)
     const wrap = el('div', 'busy')
@@ -1412,6 +1635,25 @@ function renderDetail() {
     }
     box.append(wrap)
   }
+}
+
+function renderRun(box, j) {
+  const rerunning = state.reruns.has(j.runId)
+  const result = rerunning ? 're-running' : j.conclusion || '-'
+  $('detailPanel').querySelector('h2').textContent = `Run · ${result}`
+  box.append(el('div', 'title', `${repoName(j)} › ${j.workflow}`))
+  kv(box, [
+    ['Result', result, (rerunning ? 'yellow' : conclusionClass(j.conclusion)) + ' bold'],
+    ['Finished', `${age(j.finishedAt)} ago  (${clock(j.finishedAt)})`],
+    ['Branch', j.branch],
+    ['Run', '#' + j.runId],
+    ['URL', safeURL(j.url).replace('https://', ''), 'blue'],
+  ])
+  const actions = el('div', 'actions')
+  const rerun = actionButton(rerunning ? 're-running…' : 'R re-run', askRerun)
+  rerun.disabled = rerunning
+  actions.append(rerun)
+  box.append(actions)
 }
 
 function renderHints() {
@@ -1442,7 +1684,7 @@ function openSelected() {
 }
 
 function move(delta) {
-  const list = state.focus === 0 ? state.running : state.queued
+  const list = panelList(state.focus)
   if (!list.length) return
   state.cursor[state.focus] = Math.max(0, Math.min(list.length - 1, state.cursor[state.focus] + delta))
   render()
@@ -1463,15 +1705,28 @@ function onKey(e) {
     return
   }
   if (e.metaKey || e.ctrlKey || e.altKey) return
+  if (state.confirm) {
+    const c = state.confirm
+    const choice = c.kind === 'cancel'
+      ? { y: 'cancel' }[e.key]
+      : { f: hasFailed(c.job) ? 'failed' : '', a: 'all' }[e.key]
+    if (e.key === 'Tab' || (e.key === 'Enter' && e.target.dataset && e.target.dataset.choice)) return
+    e.preventDefault()
+    return confirmAction(choice || 'keep')
+  }
+  if (state.notice) note('')
   const keys = {
     j: () => move(1), ArrowDown: () => move(1),
     k: () => move(-1), ArrowUp: () => move(-1),
     g: () => move(-Infinity), Home: () => move(-Infinity),
     G: () => move(Infinity), End: () => move(Infinity),
-    h: () => { state.focus = 1 - state.focus; render() },
-    l: () => { state.focus = 1 - state.focus; render() },
+    h: () => { state.focus = (state.focus + 2) % 3; render() },
+    l: () => { state.focus = (state.focus + 1) % 3; render() },
     1: () => { state.focus = 0; render() },
     2: () => { state.focus = 1; render() },
+    3: () => { state.focus = 2; render() },
+    c: askCancel,
+    R: askRerun,
     Enter: openSelected, o: openSelected,
     r: () => startScan(),
     '/': () => $('filter').focus(),

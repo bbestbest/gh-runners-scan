@@ -180,6 +180,13 @@ tr.sel td { background: var(--seldim); color: #f0f6fc; font-weight: 700; }
 .kv .v { overflow-wrap: anywhere; }
 .title { color: var(--cyan); font-weight: 700; margin: 4px 0 8px; overflow-wrap: anywhere; }
 .busy { margin-top: 12px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.actions button { padding: 3px 10px; }
+.actions button.danger { background: transparent; color: var(--red); border-color: var(--red); }
+.actions button.ghost { background: transparent; color: var(--dim); border-color: var(--border); font-weight: 400; }
+.actions button:disabled { opacity: 0.5; cursor: default; }
+.actions button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 1px; }
+.popup { width: min(440px, calc(100vw - 32px)); z-index: 20; }
 .busy .row { display: flex; gap: 12px; white-space: nowrap; }
 .busy .row span:nth-child(2) { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 

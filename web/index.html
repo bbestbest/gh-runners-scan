@@ -18,10 +18,16 @@
       <section class="panel" id="reposPanel"><h2>Repos <span class="foot" id="reposFoot"></span></h2><div class="body" id="repos"></div></section>
       <section class="panel list" id="runPanel"><h2 id="runTitle">[1] Running (0)</h2><div class="body scroll"><table id="runTable"></table></div><span class="foot" id="runFoot"></span></section>
       <section class="panel list" id="qPanel"><h2 id="qTitle">[2] Queued (0)</h2><div class="body scroll"><table id="qTable"></table></div><span class="foot" id="qFoot"></span></section>
+ <section class="panel list" id="fPanel"><h2 id="fTitle">[3] Finished · 24h (0)</h2><div class="body scroll"><table id="fTable"></table></div><span class="foot" id="fFoot"></span></section>
     </div>
     <section class="panel right" id="detailPanel"><h2>Job</h2><div class="body" id="detail"></div></section>
   </div>
   <div class="keybar"><span id="hints"></span><input id="filter" placeholder="/ filter" spellcheck="false"><span id="info"></span><button type="button" id="configBtn" class="kbtn">⚙ config</button></div>
+  <div id="confirm" class="connect popup" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" hidden>
+ <h2 id="confirmTitle">Confirm</h2>
+ <div id="confirmText"></div>
+ <div id="confirmButtons" class="actions"></div>
+  </div>
   <form id="login" class="connect" autocomplete="off" hidden>
     <h2 id="connectTitle">Connect · 1/2 token</h2>
     <input id="pmUser" class="sr-only" name="username" autocomplete="username" value="gh-runner" readonly tabindex="-1" aria-hidden="true">
@@ -33,7 +39,7 @@
         <ul>
           <li>Resource owner: <b>the account that owns the repos</b></li>
           <li>Repository access: <b>All repositories</b> (or the ones to watch)</li>
-          <li>Repository permissions → <b>Actions: Read-only</b></li>
+          <li>Repository permissions → <b>Actions: Read-only</b>, or <b>Read and write</b> to cancel and re-run</li>
           <li><b>Metadata: Read-only</b> is added automatically</li>
           <li>The owner may have to approve it</li>
         </ul>
