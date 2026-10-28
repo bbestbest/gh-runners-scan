@@ -1147,3 +1147,109 @@ func TestFinishedJobsNewestFirst(t *testing.T) {
 		t.Fatalf("active = %d, want 2", Active(jobs))
 	}
 }
+
+func TestReposStreamOneAfterAnother(t *testing.T) {
+	resetRepoCache(t)
+	const n = 40
+	var served atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Millisecond)
+		defer served.Add(1)
+		switch {
+		case r.URL.Path == "/users/o":
+			fmt.Fprint(w, `{"login":"o","type":"Organization"}`)
+		case r.URL.Path == "/orgs/o/repos":
+			var parts []string
+			for i := 0; i < n; i++ {
+				parts = append(parts, fmt.Sprintf(`{"name":"r%02d","pushed_at":%q}`, i, time.Now().Add(-time.Hour).Format(time.RFC3339)))
+			}
+			fmt.Fprint(w, "["+strings.Join(parts, ",")+"]")
+		case strings.HasSuffix(r.URL.Path, "/workflows"):
+			fmt.Fprint(w, `{"total_count":1}`)
+		case strings.HasSuffix(r.URL.Path, "/runs"):
+			if r.URL.Query().Get("status") == "in_progress" {
+				fmt.Fprint(w, `{"workflow_runs":[{"id":1}]}`)
+				return
+			}
+			fmt.Fprint(w, `{"workflow_runs":[]}`)
+		case strings.HasSuffix(r.URL.Path, "/jobs"):
+			fmt.Fprint(w, `{"jobs":[{"run_id":1,"status":"in_progress","name":"b"}]}`)
+		}
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	rounds := NewRounds()
+	rounds.Hint("o", "r39")
+	var mu sync.Mutex
+	var order []string
+	var firstAt int64 = -1
+	_, err := ScanRound(context.Background(), []Target{{Owner: "o", All: true}}, 7, rounds, nil, func(owner, repo string, jobs []Job) {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstAt < 0 {
+			firstAt = served.Load()
+		}
+		order = append(order, repo)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := served.Load()
+	if firstAt*4 > total {
+		t.Fatalf("first repo shown after %d of %d requests, want within the first quarter", firstAt, total)
+	}
+	if i := slices.Index(order, "r39"); i < 0 || i > 2 {
+		t.Fatalf("hinted busy repo streamed at position %d, want among the first 3: %v", i, order[:5])
+	}
+}
+
+func TestSlotPoolServesLowerPriorityFirst(t *testing.T) {
+	p := &slotPool{free: 1}
+	if !p.acquire(context.Background()) {
+		t.Fatal("first acquire failed")
+	}
+	var mu sync.Mutex
+	var got []int
+	var wg sync.WaitGroup
+	waiting := func(n int) {
+		for {
+			p.mu.Lock()
+			queued := len(p.wait)
+			p.mu.Unlock()
+			if queued == n {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	for i, prio := range []int{5, 2, 9, 0} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if p.acquire(withPriority(context.Background(), prio)) {
+				mu.Lock()
+				got = append(got, prio)
+				mu.Unlock()
+				p.release()
+			}
+		}()
+		waiting(i + 1)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelled := make(chan bool)
+	go func() { cancelled <- p.acquire(withPriority(ctx, -1)) }()
+	waiting(5)
+	cancel()
+	if <-cancelled {
+		t.Fatal("cancelled waiter got a slot")
+	}
+	p.release()
+	wg.Wait()
+	if !slices.Equal(got, []int{0, 2, 5, 9}) {
+		t.Fatalf("served %v, want lowest priority first", got)
+	}
+	if p.free != 1 || len(p.wait) != 0 {
+		t.Fatalf("pool left free=%d waiting=%d, want 1 and 0", p.free, len(p.wait))
+	}
+}

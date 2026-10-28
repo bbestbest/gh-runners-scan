@@ -98,7 +98,7 @@ func TestRowCountsAndOrder(t *testing.T) {
 }
 
 func TestHLMoveFocus(t *testing.T) {
-	cases := map[string][]int{"l": {1, 2, 0}, "h": {2, 1, 0}}
+	cases := map[string][]int{"l": {1, 2, focusRepos, 0}, "h": {focusRepos, 2, 1, 0}}
 	for k, want := range cases {
 		m := newTestModel(t)
 		if m.focus != 0 {
@@ -113,6 +113,9 @@ func TestHLMoveFocus(t *testing.T) {
 	}
 	if m := send(newTestModel(t), key("3")); m.focus != 2 {
 		t.Errorf("focus after 3 = %d, want 2", m.focus)
+	}
+	if m := send(newTestModel(t), key("0")); m.focus != focusRepos {
+		t.Errorf("focus after 0 = %d, want repos", m.focus)
 	}
 }
 
@@ -198,7 +201,7 @@ func scrollModel(t *testing.T, n int) model {
 	m := newModel(options{org: "org-c", interval: 30})
 	m.jobs = manyJobs(n)
 	m.refresh()
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 60})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 65})
 	return next.(model)
 }
 
@@ -257,6 +260,9 @@ func TestJumpKeysKeepSelectionVisible(t *testing.T) {
 		{"G then H", []tea.KeyMsg{key("G"), key("H")}, 17},
 		{"G then M", []tea.KeyMsg{key("G"), key("M")}, 23},
 		{"G then L", []tea.KeyMsg{key("G"), key("L")}, 29},
+		{">", []tea.KeyMsg{key(">")}, 29},
+		{"> then <", []tea.KeyMsg{key(">"), key("<")}, 0},
+		{"pgdown then <", []tea.KeyMsg{{Type: tea.KeyPgDown}, key("<")}, 0},
 		{"pgdown then H", []tea.KeyMsg{{Type: tea.KeyPgDown}, key("H")}, 1},
 		{"pgdown then M", []tea.KeyMsg{{Type: tea.KeyPgDown}, key("M")}, 7},
 		{"pgdown then L", []tea.KeyMsg{{Type: tea.KeyPgDown}, key("L")}, 13},
@@ -711,9 +717,9 @@ func TestVimKeysIgnoredWhileFilterActive(t *testing.T) {
 	m := scrollModel(t, 30)
 	m = send(m, key("G"))
 	m = send(m, key("/"))
-	m = typeRunes(m, "ggHML")
-	if got := m.filterInput.Value(); got != "ggHML" {
-		t.Fatalf("filter input = %q, want ggHML", got)
+	m = typeRunes(m, "jo")
+	if got := m.filterInput.Value(); got != "jo" {
+		t.Fatalf("filter input = %q, want jo", got)
 	}
 	for _, k := range []tea.KeyMsg{{Type: tea.KeyCtrlD}, {Type: tea.KeyCtrlU}, {Type: tea.KeyCtrlF}, {Type: tea.KeyCtrlB}} {
 		m = send(m, k)
@@ -1170,20 +1176,31 @@ func TestRepoCounts(t *testing.T) {
 	}
 }
 
-func TestRepoPanelCapsRows(t *testing.T) {
+func TestRepoPanelKeepsItsSizeAndScrolls(t *testing.T) {
+	m := layoutModel(t, 140, 40)
+	few := m.reposHeight()
 	var jobs []scan.Job
 	for i := 0; i < maxRepoRows+3; i++ {
-		jobs = append(jobs, scan.Job{Status: "queued", Repo: "repo-" + strconv.Itoa(i), Name: "j"})
+		jobs = append(jobs, scan.Job{Status: "queued", Repo: fmt.Sprintf("repo-%02d", i), Name: "j"})
 	}
-	m := layoutModel(t, 140, 40)
 	m.jobs = jobs
 	m.refresh()
-	lines := m.repoLines(60)
-	if len(lines) != maxRepoRows {
-		t.Fatalf("repo lines = %d, want %d", len(lines), maxRepoRows)
+	if m.reposHeight() != few || few != maxRepoRows+2 {
+		t.Fatalf("repos box %d with 3 repos, %d with %d, want %d both", few, m.reposHeight(), len(jobs), maxRepoRows+2)
 	}
-	if !strings.Contains(lines[len(lines)-1], "+4 more") {
-		t.Fatalf("last repo line = %q, want +4 more", lines[len(lines)-1])
+	lines := m.repoLines()
+	if len(lines) != maxRepoRows || strings.Contains(ansi.Strip(strings.Join(lines, "\n")), "more") {
+		t.Fatalf("repo lines = %d, want %d rows and no +N more", len(lines), maxRepoRows)
+	}
+	m = send(m, key("0"))
+	m = send(m, key(">"))
+	view := ansi.Strip(m.View())
+	box := ansi.Strip(strings.Join(m.repoLines(), "\n"))
+	if !strings.Contains(box, "repo-08") || strings.Contains(box, "repo-00") || !strings.Contains(view, "9 of 9") {
+		t.Fatalf("> on repos did not scroll to the last repo:\n%s", view)
+	}
+	if !strings.Contains(view, "Queued (1)") || !strings.Contains(view, "╭─Repo─") {
+		t.Fatalf("repo detail missing:\n%s", view)
 	}
 }
 
@@ -1598,5 +1615,54 @@ func TestRerunPopupFitsTerminal(t *testing.T) {
 				t.Fatalf("%dx%d: line %d width %d: %q", size[0], size[1], i, w, ansi.Strip(l))
 			}
 		}
+	}
+}
+
+func TestFilterFloatsAndAppliesWhileTyping(t *testing.T) {
+	m := newTestModel(t)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = send(next.(model), key("/"))
+	m = typeRunes(m, "jobA")
+	if m.filter != "jobA" || len(m.runTable.Rows()) != 1 || len(m.qTable.Rows()) != 0 {
+		t.Fatalf("live filter = %q, running %d queued %d", m.filter, len(m.runTable.Rows()), len(m.qTable.Rows()))
+	}
+	lines := strings.Split(m.View(), "\n")
+	if len(lines) != 40 {
+		t.Fatalf("%d lines, want 40", len(lines))
+	}
+	for i, l := range lines {
+		if w := ansi.StringWidth(l); w != 120 {
+			t.Fatalf("line %d width %d: %q", i, w, ansi.Strip(l))
+		}
+	}
+	top := ansi.Strip(lines[0] + "\n" + lines[1] + "\n" + lines[2])
+	if !strings.HasPrefix(top, "╭─Filter") || !strings.Contains(top, "jobA") || !strings.Contains(top, "1 match") {
+		t.Fatalf("prompt not floating at the top:\n%s", top)
+	}
+	bar := ansi.Strip(lines[39])
+	if !strings.Contains(bar, "enter: keep filter") || strings.Contains(bar, "filter: jobA") {
+		t.Fatalf("key bar while typing: %q", bar)
+	}
+	m = send(m, key("enter"))
+	view := ansi.Strip(m.View())
+	if strings.Contains(view, "╭─Filter") || !strings.Contains(view, "filter: jobA") || m.filter != "jobA" {
+		t.Fatalf("after enter: filter %q view:\n%s", m.filter, view)
+	}
+	m = send(m, key("/"))
+	m = send(m, key("esc"))
+	if m.filter != "" || len(m.runTable.Rows()) != 2 || strings.Contains(ansi.Strip(m.View()), "╭─Filter") {
+		t.Fatalf("esc did not clear: filter %q running %d", m.filter, len(m.runTable.Rows()))
+	}
+}
+
+func TestAngleKeysJumpOnEveryPanel(t *testing.T) {
+	m := finishedModel(t)
+	m = send(m, key(">"))
+	if m.fTable.Cursor() != len(m.finished)-1 {
+		t.Fatalf("> on finished: cursor %d", m.fTable.Cursor())
+	}
+	m = send(m, key("<"))
+	if m.fTable.Cursor() != 0 {
+		t.Fatalf("< on finished: cursor %d", m.fTable.Cursor())
 	}
 }

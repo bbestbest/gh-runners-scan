@@ -53,6 +53,11 @@ var keyHints = [][2]string{
 	{"q", "quit"},
 }
 
+var filterHints = [][2]string{
+	{"enter", "keep filter"},
+	{"esc", "clear"},
+}
+
 var runningCols = []string{"Runner", "Repo", "Workflow", "Branch", "Job", "Elapsed"}
 var queuedCols = []string{"Waiting", "Repo", "Workflow", "Branch", "Job", "Labels"}
 
@@ -61,6 +66,8 @@ var runningPanelCols = []string{"Runner", "Repo", "Job", "Step", "Elapsed"}
 var queuedPanelCols = []string{"Wait", "Repo", "Job", "Labels"}
 
 var finishedPanelCols = []string{"Done", "Repo", "Workflow", "Result"}
+
+var repoPanelCols = []string{"Repo", "Running", "Queued"}
 
 type repoCount struct {
 	name    string
@@ -136,9 +143,11 @@ type model struct {
 	runTable  table.Model
 	qTable    table.Model
 	fTable    table.Model
+	rTable    table.Model
 	runStyles [][]lipgloss.Style
 	qStyles   [][]lipgloss.Style
 	fStyles   [][]lipgloss.Style
+	rStyles   [][]lipgloss.Style
 	focus     int
 
 	filterInput  textinput.Model
@@ -221,6 +230,7 @@ func newModel(opts options) model {
 	m.runTable = newTable(runningPanelCols)
 	m.qTable = newTable(queuedPanelCols)
 	m.fTable = newTable(finishedPanelCols)
+	m.rTable = newTable(repoPanelCols)
 
 	in := textinput.New()
 	in.Placeholder = "filter"
@@ -605,7 +615,6 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.refresh()
 			return m, nil
 		case "enter":
-			m.filter = strings.TrimSpace(m.filterInput.Value())
 			m.filterActive = false
 			m.filterInput.Blur()
 			m.refresh()
@@ -613,6 +622,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.filterInput, cmd = m.filterInput.Update(msg)
+		m.filter = strings.TrimSpace(m.filterInput.Value())
+		m.refresh()
 		return m, cmd
 	}
 
@@ -714,6 +725,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "/":
 		m.filterActive = true
+		m.filterInput.Width = m.width - 10
 		m.filterInput.Focus()
 		m.layout()
 		return m, textinput.Blink
@@ -732,10 +744,13 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "h":
-		m.focus = (m.focus + panelCount - 1) % panelCount
+		m.focus = focusOrder[(slices.Index(focusOrder, m.focus)+len(focusOrder)-1)%len(focusOrder)]
 		return m, nil
 	case "l":
-		m.focus = (m.focus + 1) % panelCount
+		m.focus = focusOrder[(slices.Index(focusOrder, m.focus)+1)%len(focusOrder)]
+		return m, nil
+	case "0":
+		m.focus = focusRepos
 		return m, nil
 	case "1":
 		m.focus = 0
@@ -762,10 +777,10 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.pendingG = true
 		return m, nil
-	case "home":
+	case "home", "<":
 		m.gotoEdge(false)
 		return m, nil
-	case "G", "end":
+	case "G", "end", ">":
 		m.gotoEdge(true)
 		return m, nil
 	case "pgup", "ctrl+b":
@@ -1015,6 +1030,8 @@ func (m *model) focusedTable() *table.Model {
 		return &m.qTable
 	case 2:
 		return &m.fTable
+	case focusRepos:
+		return &m.rTable
 	}
 	return &m.runTable
 }
@@ -1104,6 +1121,8 @@ func (m *model) selected() (scan.Job, bool) {
 	case 2:
 		jobs = m.finished
 		cursor = m.fTable.Cursor()
+	case focusRepos:
+		return scan.Job{}, false
 	}
 	if cursor < 0 || cursor >= len(jobs) {
 		return scan.Job{}, false
@@ -1166,6 +1185,7 @@ func (m *model) refresh() {
 	runCursor := m.runTable.Cursor()
 	qCursor := m.qTable.Cursor()
 	fCursor := m.fTable.Cursor()
+	rCursor := m.rTable.Cursor()
 
 	visible := scan.FilterJobs(m.jobs, m.filter)
 	m.running, m.queued = scan.SplitJobs(visible)
@@ -1260,6 +1280,32 @@ func (m *model) refresh() {
 	setRows(&m.runTable, runRows, runCursor)
 	setRows(&m.qTable, qRows, qCursor)
 	setRows(&m.fTable, fRows, fCursor)
+
+	rRows := make([]table.Row, 0, len(m.repos))
+	rStyles := make([][]lipgloss.Style, 0, len(m.repos))
+	rSel := clamp(rCursor, len(m.repos))
+	rcols := m.rTable.Columns()
+	for i, r := range m.repos {
+		runStyle, qStyle := dimStyle, dimStyle
+		if r.running > 0 {
+			runStyle = greenStyle
+		}
+		if r.queued > 0 {
+			qStyle = yellowStyle
+		}
+		nameStyle := hlStyle
+		if i == rSel {
+			nameStyle, runStyle, qStyle = lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle()
+		}
+		rRows = append(rRows, table.Row{
+			cell(r.name, rcols, 0),
+			cell(fmt.Sprintf("%d running", r.running), rcols, 1),
+			cell(fmt.Sprintf("%d queued", r.queued), rcols, 2),
+		})
+		rStyles = append(rStyles, []lipgloss.Style{nameStyle, runStyle, qStyle})
+	}
+	m.rStyles = rStyles
+	setRows(&m.rTable, rRows, rCursor)
 	m.layout()
 }
 
@@ -1468,14 +1514,23 @@ func (m *model) layout() {
 	m.runTable.SetColumns(columnWidths(runningPanelCols, inner))
 	m.qTable.SetColumns(columnWidths(queuedPanelCols, inner))
 	m.fTable.SetColumns(columnWidths(finishedPanelCols, inner))
+	m.rTable.SetColumns(repoColumns(inner))
 
 	runBox, qBox, fBox := m.listHeights()
 	setHeight(&m.runTable, tableHeight(runBox))
 	setHeight(&m.qTable, tableHeight(qBox))
 	setHeight(&m.fTable, tableHeight(fBox))
+	setHeight(&m.rTable, m.reposHeight())
 	m.runTable.SetWidth(inner)
 	m.qTable.SetWidth(inner)
 	m.fTable.SetWidth(inner)
+	m.rTable.SetWidth(inner)
+}
+
+func repoColumns(inner int) []table.Column {
+	run, queued := len("99 running"), len("99 queued")
+	name := inner - 2 - run - queued - 2*2
+	return []table.Column{{Title: "Repo", Width: max(name, 4)}, {Title: "Running", Width: run}, {Title: "Queued", Width: queued}}
 }
 
 func (m model) columns() (int, int) {
@@ -1499,14 +1554,8 @@ func (m model) bodyHeight() int {
 }
 
 func (m model) reposHeight() int {
-	n := len(m.repos)
-	if n < 1 {
-		n = 1
-	}
-	if n > maxRepoRows {
-		n = maxRepoRows
-	}
-	return n + 2
+	room := m.bodyHeight() - statusPanelHeight - 2*minListBox - collapsedBox
+	return min(maxRepoRows+2, max(room, 3))
 }
 
 func (m model) listHeights() (int, int, int) {
@@ -1611,6 +1660,10 @@ const minListBox = 5
 
 const panelCount = 3
 
+const focusRepos = 3
+
+var focusOrder = []int{focusRepos, 0, 1, 2}
+
 const collapsedBox = 2
 
 func (m model) View() string {
@@ -1626,7 +1679,7 @@ func (m model) bodyView() string {
 	runH, qH, fH := m.listHeights()
 	col := lipgloss.JoinVertical(lipgloss.Left,
 		panel("Status", "", false, left, statusPanelHeight, m.statusPanelLines(left-2)),
-		panel("Repos", m.reposFooter(), false, left, m.reposHeight(), m.repoLines(left-2)),
+		panel("[0] Repos", m.reposFooter(), m.focus == focusRepos, left, m.reposHeight(), m.repoLines()),
 		panel(fmt.Sprintf("[1] Running (%d)", len(m.running)), countFooter(m.runTable), m.focus == 0, left, runH, m.tableLines(0)),
 		panel(fmt.Sprintf("[2] Queued (%d)", len(m.queued)), countFooter(m.qTable), m.focus == 1, left, qH, m.tableLines(1)),
 		panel(fmt.Sprintf("[3] Finished · 24h (%d)", len(m.finished)), countFooter(m.fTable), m.focus == 2, left, fH, m.tableLines(2)),
@@ -1644,7 +1697,19 @@ func (m model) bodyView() string {
 	if m.rerunning {
 		body = overlay(body, m.rerunPopup(), m.width)
 	}
+	if m.filterActive {
+		body = overlayAt(body, m.filterPrompt(), 0, 0)
+	}
 	return body
+}
+
+func (m model) filterPrompt() string {
+	n := len(m.running) + len(m.queued) + len(m.finished)
+	footer := plural(n, "1 match", fmt.Sprintf("%d matches", n))
+	if m.filter == "" {
+		footer = "type to filter"
+	}
+	return panel("Filter", footer, true, m.width, 3, []string{" " + m.filterInput.View()})
 }
 
 func panel(title, footer string, focused bool, w, h int, body []string) string {
@@ -1828,52 +1893,56 @@ func (m model) reposFooter() string {
 	if len(m.repos) == 0 {
 		return ""
 	}
+	if m.focus == focusRepos {
+		return countFooter(m.rTable)
+	}
 	return fmt.Sprintf("%d active", len(m.repos))
 }
 
-func (m model) repoLines(inner int) []string {
+func (m model) repoLines() []string {
 	if len(m.repos) == 0 {
 		return []string{" " + dimStyle.Render("no active repos")}
 	}
-	repos := m.repos
-	more := 0
-	if len(repos) > maxRepoRows {
-		more = len(repos) - maxRepoRows + 1
-		repos = repos[:maxRepoRows-1]
-	}
-	nameW := 0
-	for _, r := range repos {
-		if w := ansi.StringWidth(r.name); w > nameW {
-			nameW = w
-		}
-	}
-	if limit := inner - 24; nameW > limit {
-		nameW = limit
-	}
-	if nameW < 4 {
-		nameW = 4
-	}
+	lines := tableView(m.rTable, m.rStyles)
+	return lines[len(lines)-m.rTable.Height():]
+}
 
-	var lines []string
-	for _, r := range repos {
-		name := ansi.Truncate(r.name, nameW, "…")
-		runStyle, qStyle := dimStyle, dimStyle
-		if r.running > 0 {
-			runStyle = greenStyle
-		}
-		if r.queued > 0 {
-			qStyle = yellowStyle
-		}
-		lines = append(lines, " "+hlStyle.Render(name)+strings.Repeat(" ", nameW-ansi.StringWidth(name)+3)+
-			runStyle.Render(fmt.Sprintf("%d running", r.running))+"   "+qStyle.Render(fmt.Sprintf("%d queued", r.queued)))
+func (m model) repoDetail(w, h int) string {
+	if len(m.repos) == 0 {
+		return panel("Repo", "", false, w, h, []string{"", " " + dimStyle.Render("no active repos")})
 	}
-	if more > 0 {
-		lines = append(lines, " "+dimStyle.Render(fmt.Sprintf("+%d more", more)))
+	r := m.repos[clamp(m.rTable.Cursor(), len(m.repos))]
+	lines := []string{"", " " + hlStyle.Render(r.name), ""}
+	section := func(title string, jobs []scan.Job, style lipgloss.Style, text func(scan.Job) string) {
+		var rows []string
+		for _, j := range jobs {
+			if m.repoName(j) == r.name {
+				rows = append(rows, "   "+text(j))
+			}
+		}
+		lines = append(lines, " "+style.Render(fmt.Sprintf("%s (%d)", title, len(rows))))
+		lines = append(lines, rows...)
+		lines = append(lines, "")
 	}
-	return lines
+	section("Running", m.running, greenStyle.Bold(true), func(j scan.Job) string {
+		return j.Name + dimStyle.Render("  "+j.Workflow+" · "+j.Runner)
+	})
+	section("Queued", m.queued, yellowStyle.Bold(true), func(j scan.Job) string {
+		return j.Name + dimStyle.Render("  "+j.Workflow+" · "+j.Labels)
+	})
+	section("Finished · 24h", m.finished, boldStyle, func(j scan.Job) string {
+		return conclusionStyle(j.Conclusion).Render(fmt.Sprintf("%-10s", j.Conclusion)) + " " + j.Workflow
+	})
+	if len(lines) > h-2 {
+		lines = lines[:h-2]
+	}
+	return panel("Repo", fmt.Sprintf("%d running · %d queued", r.running, r.queued), false, w, h, lines)
 }
 
 func (m model) detailPanel(w, h int) string {
+	if m.focus == focusRepos {
+		return m.repoDetail(w, h)
+	}
 	j, ok := m.selected()
 	if !ok {
 		return panel("Job", "", false, w, h, []string{"", " " + dimStyle.Render("no job selected")})
@@ -2042,17 +2111,15 @@ func (m model) cancelPopup() string {
 }
 
 func overlay(bg, fg string, width int) string {
+	fw := ansi.StringWidth(strings.SplitN(fg, "\n", 2)[0])
+	y := (strings.Count(bg, "\n") - strings.Count(fg, "\n")) / 2
+	return overlayAt(bg, fg, max((width-fw)/2, 0), max(y, 0))
+}
+
+func overlayAt(bg, fg string, x, y int) string {
 	bgLines := strings.Split(bg, "\n")
 	fgLines := strings.Split(fg, "\n")
 	fw := ansi.StringWidth(fgLines[0])
-	x := (width - fw) / 2
-	if x < 0 {
-		x = 0
-	}
-	y := (len(bgLines) - len(fgLines)) / 2
-	if y < 0 {
-		y = 0
-	}
 	for i, l := range fgLines {
 		row := y + i
 		if row >= len(bgLines) {
@@ -2199,10 +2266,6 @@ func (m model) lastScanLabel() string {
 }
 
 func (m model) statusView() string {
-	if m.filterActive {
-		return ansi.Truncate(m.filterInput.View(), m.width, "")
-	}
-
 	var parts []string
 	if m.notice != "" {
 		style := greenStyle
@@ -2217,7 +2280,7 @@ func (m model) statusView() string {
 	if !m.scanning && m.scanErr != nil {
 		parts = append(parts, redStyle.Render("rate limited · incomplete"))
 	}
-	if m.filter != "" {
+	if m.filter != "" && !m.filterActive {
 		parts = append(parts, dimStyle.Render("filter: "+m.filter))
 	}
 	if m.pending != nil {
@@ -2228,7 +2291,11 @@ func (m model) statusView() string {
 
 	budget := m.width - ansi.StringWidth(right) - 1
 	left := " "
-	for i, k := range keyHints {
+	hints := keyHints
+	if m.filterActive {
+		hints = filterHints
+	}
+	for i, k := range hints {
 		part := hlStyle.Render(k[0]) + dimStyle.Render(": "+k[1])
 		if i > 0 {
 			part = dimStyle.Render(" | ") + part

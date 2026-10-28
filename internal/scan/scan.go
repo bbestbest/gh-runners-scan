@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -132,7 +133,78 @@ func backoffFor(err error, attempt int) time.Duration {
 	return time.Duration(attempt+1) * rateLimitBackoff
 }
 
-var requestSlots = make(chan struct{}, workers)
+type slotWaiter struct {
+	prio    int
+	seq     int
+	ready   chan struct{}
+	granted bool
+	gone    bool
+}
+
+type slotPool struct {
+	mu   sync.Mutex
+	free int
+	seq  int
+	wait []*slotWaiter
+}
+
+var requestSlots = &slotPool{free: workers}
+
+type priorityKey struct{}
+
+func withPriority(ctx context.Context, prio int) context.Context {
+	return context.WithValue(ctx, priorityKey{}, prio)
+}
+
+func priorityOf(ctx context.Context) int {
+	prio, _ := ctx.Value(priorityKey{}).(int)
+	return prio
+}
+
+func (p *slotPool) acquire(ctx context.Context) bool {
+	p.mu.Lock()
+	if p.free > 0 && len(p.wait) == 0 {
+		p.free--
+		p.mu.Unlock()
+		return true
+	}
+	w := &slotWaiter{prio: priorityOf(ctx), seq: p.seq, ready: make(chan struct{})}
+	p.seq++
+	i := sort.Search(len(p.wait), func(i int) bool {
+		return p.wait[i].prio > w.prio || (p.wait[i].prio == w.prio && p.wait[i].seq > w.seq)
+	})
+	p.wait = slices.Insert(p.wait, i, w)
+	p.mu.Unlock()
+	select {
+	case <-w.ready:
+		return true
+	case <-ctx.Done():
+		p.mu.Lock()
+		granted := w.granted
+		w.gone = true
+		p.mu.Unlock()
+		if granted {
+			p.release()
+		}
+		return false
+	}
+}
+
+func (p *slotPool) release() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for len(p.wait) > 0 {
+		w := p.wait[0]
+		p.wait = p.wait[1:]
+		if w.gone {
+			continue
+		}
+		w.granted = true
+		close(w.ready)
+		return
+	}
+	p.free++
+}
 
 func getJSON(ctx context.Context, limited *atomic.Bool, out any, path string) (string, bool) {
 	c, err := sharedClient()
@@ -145,13 +217,11 @@ func getJSON(ctx context.Context, limited *atomic.Bool, out any, path string) (s
 		full = c.base + path
 	}
 	for attempt := 0; ; attempt++ {
-		select {
-		case requestSlots <- struct{}{}:
-		case <-ctx.Done():
+		if !requestSlots.acquire(ctx) {
 			return "", false
 		}
 		link, err := c.getInto(ctx, full, out)
-		<-requestSlots
+		requestSlots.release()
 		if err == nil {
 			return link, true
 		}
@@ -708,6 +778,12 @@ func (r *Rounds) hasWorkflows(ctx context.Context, limited *atomic.Bool, owner, 
 	return resp.TotalCount > 0
 }
 
+func (r *Rounds) busy(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.seen[key].Active || r.hints[key]
+}
+
 func (r *Rounds) known(key string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -820,6 +896,11 @@ func ScanRound(ctx context.Context, targets []Target, days int, rounds *Rounds, 
 		progress(skipped, total)
 	}
 
+	if rounds != nil {
+		sort.SliceStable(todo, func(a, b int) bool {
+			return rounds.busy(strings.ToLower(todo[a].owner+"/"+todo[a].repo)) && !rounds.busy(strings.ToLower(todo[b].owner+"/"+todo[b].repo))
+		})
+	}
 	results := make([][]Job, len(todo))
 	done := make(chan int, len(todo))
 
@@ -827,6 +908,7 @@ func ScanRound(ctx context.Context, targets []Target, days int, rounds *Rounds, 
 	g.SetLimit(repoWorkers)
 	for i, p := range todo {
 		g.Go(func() error {
+			gctx := withPriority(gctx, i)
 			var jobs []Job
 			if rounds == nil || rounds.hasWorkflows(gctx, &limited, p.owner, p.repo, p.pushed) {
 				jobs = scanRepo(gctx, &limited, p.owner, p.repo, rounds != nil)
