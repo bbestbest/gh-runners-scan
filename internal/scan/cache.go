@@ -261,3 +261,81 @@ func LoadLastJobs(key string) ([]Job, time.Time, bool) {
 	}
 	return disk.Jobs, disk.At, true
 }
+
+const roundsVersion = 1
+
+const roundsMaxAge = 30 * time.Minute
+
+type diskRounds struct {
+	Version   int                       `json:"version"`
+	TokenHash string                    `json:"token_hash"`
+	Saved     time.Time                 `json:"saved"`
+	Count     int                       `json:"count"`
+	Seen      map[string]repoMemory     `json:"seen"`
+	Workflows map[string]workflowMemory `json:"workflows"`
+}
+
+func (r *Rounds) Save() error {
+	c, err := sharedClient()
+	if err != nil {
+		return err
+	}
+	path := cacheFile("rounds.json")
+	if path == "" {
+		return nil
+	}
+	r.mu.Lock()
+	seen := make(map[string]repoMemory, len(r.seen))
+	for k, v := range r.seen {
+		seen[k] = v
+	}
+	workflows := make(map[string]workflowMemory, len(r.workflows))
+	for k, v := range r.workflows {
+		workflows[k] = v
+	}
+	count := r.count
+	r.mu.Unlock()
+	if len(seen) == 0 && len(workflows) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(diskRounds{Version: roundsVersion, TokenHash: tokenHash(c.token), Saved: time.Now(), Count: count, Seen: seen, Workflows: workflows})
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return writeFileAtomic(dir, path, data)
+}
+
+func LoadRounds() *Rounds {
+	r := NewRounds()
+	c, err := sharedClient()
+	if err != nil {
+		return r
+	}
+	path := cacheFile("rounds.json")
+	if path == "" {
+		return r
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return r
+	}
+	var disk diskRounds
+	if json.Unmarshal(data, &disk) != nil || disk.Version != roundsVersion || disk.TokenHash != tokenHash(c.token) {
+		return r
+	}
+	for k, w := range disk.Workflows {
+		if time.Since(w.Checked) <= workflowsTTL {
+			r.workflows[k] = w
+		}
+	}
+	if time.Since(disk.Saved) > roundsMaxAge || disk.Seen == nil {
+		return r
+	}
+	r.seen = disk.Seen
+	r.count = disk.Count
+	return r
+}

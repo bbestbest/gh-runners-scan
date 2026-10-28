@@ -302,6 +302,10 @@ var saveLastJobs = scan.SaveLastJobs
 
 var loadLastJobs = scan.LoadLastJobs
 
+var loadRounds = scan.LoadRounds
+
+var saveRounds = func(r *scan.Rounds) error { return r.Save() }
+
 var listAccounts = scan.Accounts
 
 var listRepoNames = scan.Repos
@@ -343,6 +347,9 @@ func (m *model) restoreLast() {
 		return
 	}
 	m.jobs = jobs
+	for _, j := range jobs {
+		m.opts.rounds.Hint(j.Owner, j.Repo)
+	}
 	m.lastScan = clock(at, "15:04:05")
 	m.stale = true
 	m.refresh()
@@ -477,7 +484,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.nextIn = m.opts.interval
 		m.stale = false
 		m.refresh()
-		cmds := []tea.Cmd{saveCacheCmd, tea.SetWindowTitle(windowTitle(m.jobs))}
+		rounds := m.opts.rounds
+		cmds := []tea.Cmd{saveCacheCmd, tea.SetWindowTitle(windowTitle(m.jobs)), func() tea.Msg {
+			saveRounds(rounds)
+			return nil
+		}}
 		if msg.err == nil {
 			cmds = append(cmds, saveLastCmd(m.viewKey(), m.jobs))
 		}
@@ -1509,6 +1520,8 @@ func (m model) statusPanelLines(width int) []string {
 		second = " " + m.spin.View() + dimStyle.Render(" listing repos…")
 	case m.scanning:
 		second = " " + m.spin.View() + dimStyle.Render(fmt.Sprintf(" scanning %d/%d repos", m.progress.done, m.progress.total))
+	case m.opts.rounds.Unseen() > 0:
+		second = " " + yellowStyle.Render(fmt.Sprintf("first pass · %d %s not checked yet", m.opts.rounds.Unseen(), plural(m.opts.rounds.Unseen(), "repo", "repos")))
 	case m.lastCost != nil:
 		second = " " + dimStyle.Render(fmt.Sprintf("last scan %d req, %d free (304)", m.lastCost.requests, m.lastCost.free))
 	}
@@ -1992,6 +2005,7 @@ func (m model) statusView() string {
 }
 
 func Run(opts options) error {
+	opts.rounds = loadRounds()
 	m := newModel(opts)
 	m.restoreLast()
 	program = tea.NewProgram(m, tea.WithAltScreen())

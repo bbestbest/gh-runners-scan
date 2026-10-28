@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net/url"
 	"sort"
 	"strconv"
@@ -16,6 +17,8 @@ import (
 )
 
 const workers = 6
+
+const repoWorkers = 4 * workers
 
 const rateLimitAttempts = 3
 
@@ -111,6 +114,8 @@ func backoffFor(err error, attempt int) time.Duration {
 	return time.Duration(attempt+1) * rateLimitBackoff
 }
 
+var requestSlots = make(chan struct{}, workers)
+
 func getJSON(ctx context.Context, limited *atomic.Bool, out any, path string) (string, bool) {
 	c, err := sharedClient()
 	if err != nil {
@@ -122,7 +127,13 @@ func getJSON(ctx context.Context, limited *atomic.Bool, out any, path string) (s
 		full = c.base + path
 	}
 	for attempt := 0; ; attempt++ {
+		select {
+		case requestSlots <- struct{}{}:
+		case <-ctx.Done():
+			return "", false
+		}
 		link, err := c.getInto(ctx, full, out)
+		<-requestSlots
 		if err == nil {
 			return link, true
 		}
@@ -328,46 +339,72 @@ func reposPath(ctx context.Context, limited *atomic.Bool, owner string) (string,
 }
 
 func scanRepo(ctx context.Context, limited *atomic.Bool, org, repo string) []Job {
-	var jobs []Job
-	for _, status := range []string{"in_progress", "queued"} {
-		var runs runsResponse
-		runsPath := "/repos/" + url.PathEscape(org) + "/" + url.PathEscape(repo) +
-			"/actions/runs?status=" + url.QueryEscape(status) + "&per_page=20"
-		if _, ok := getJSON(ctx, limited, &runs, runsPath); !ok {
-			continue
-		}
-		for _, run := range runs.WorkflowRuns {
-			next := "/repos/" + url.PathEscape(org) + "/" + url.PathEscape(repo) +
-				"/actions/runs/" + strconv.FormatInt(run.DatabaseID, 10) + "/jobs?per_page=100"
-			for next != "" {
-				var resp jobsResponse
-				link, ok := getJSON(ctx, limited, &resp, next)
-				if !ok {
-					break
-				}
-				for _, j := range resp.Jobs {
-					if j.Status == "completed" {
-						continue
-					}
-					jobs = append(jobs, Job{
-						Owner:     org,
-						RunID:     j.RunID,
-						Status:    j.Status,
-						Repo:      repo,
-						Workflow:  j.WorkflowName,
-						Branch:    j.HeadBranch,
-						Name:      j.Name,
-						Runner:    j.RunnerName,
-						Labels:    strings.Join(j.Labels, ","),
-						StartedAt: parseTime(j.StartedAt),
-						CreatedAt: parseTime(j.CreatedAt),
-						URL:       j.HTMLURL,
-						Step:      currentStep(j.Steps),
-					})
-				}
-				next = nextPageURL(link)
+	base := "/repos/" + url.PathEscape(org) + "/" + url.PathEscape(repo) + "/actions/runs"
+	statuses := []string{"in_progress", "queued"}
+	lists := make([][]runEntry, len(statuses))
+	var wg sync.WaitGroup
+	for i, status := range statuses {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var runs runsResponse
+			if _, ok := getJSON(ctx, limited, &runs, base+"?status="+url.QueryEscape(status)+"&per_page=20"); ok {
+				lists[i] = runs.WorkflowRuns
 			}
+		}()
+	}
+	wg.Wait()
+
+	var runs []runEntry
+	for _, l := range lists {
+		runs = append(runs, l...)
+	}
+	perRun := make([][]Job, len(runs))
+	for i, run := range runs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			perRun[i] = runJobs(ctx, limited, org, repo, base+"/"+strconv.FormatInt(run.DatabaseID, 10)+"/jobs?per_page=100")
+		}()
+	}
+	wg.Wait()
+
+	var jobs []Job
+	for _, js := range perRun {
+		jobs = append(jobs, js...)
+	}
+	return jobs
+}
+
+func runJobs(ctx context.Context, limited *atomic.Bool, org, repo, next string) []Job {
+	var jobs []Job
+	for next != "" {
+		var resp jobsResponse
+		link, ok := getJSON(ctx, limited, &resp, next)
+		if !ok {
+			break
 		}
+		for _, j := range resp.Jobs {
+			if j.Status == "completed" {
+				continue
+			}
+			jobs = append(jobs, Job{
+				Owner:     org,
+				RunID:     j.RunID,
+				Status:    j.Status,
+				Repo:      repo,
+				Workflow:  j.WorkflowName,
+				Branch:    j.HeadBranch,
+				Name:      j.Name,
+				Runner:    j.RunnerName,
+				Labels:    strings.Join(j.Labels, ","),
+				StartedAt: parseTime(j.StartedAt),
+				CreatedAt: parseTime(j.CreatedAt),
+				URL:       j.HTMLURL,
+				Step:      currentStep(j.Steps),
+			})
+		}
+		next = nextPageURL(link)
 	}
 	return jobs
 }
@@ -530,42 +567,110 @@ func MultiOwner(targets []Target) bool {
 	return len(targets) > 1
 }
 
-const fullSweepEvery = 4
+const sweepBuckets = 8
+
+const workflowsTTL = 24 * time.Hour
+
+const freshWindow = 24 * time.Hour
 
 type repoMemory struct {
-	pushed time.Time
-	active bool
+	Pushed time.Time `json:"pushed"`
+	Active bool      `json:"active"`
+}
+
+type workflowMemory struct {
+	Count   int       `json:"count"`
+	Checked time.Time `json:"checked"`
 }
 
 type Rounds struct {
-	mu    sync.Mutex
-	seen  map[string]repoMemory
-	count int
+	mu        sync.Mutex
+	seen      map[string]repoMemory
+	hints     map[string]bool
+	workflows map[string]workflowMemory
+	count     int
+	unseen    int
 }
 
 func NewRounds() *Rounds {
-	return &Rounds{seen: map[string]repoMemory{}}
+	return &Rounds{seen: map[string]repoMemory{}, hints: map[string]bool{}, workflows: map[string]workflowMemory{}}
 }
 
-func (r *Rounds) next() bool {
+func (r *Rounds) next() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	full := r.count%fullSweepEvery == 0
+	n := r.count
 	r.count++
-	return full
+	return n
 }
 
-func (r *Rounds) needs(key string, pushed time.Time, full bool) bool {
+func sweepBucket(key string) int {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return int(h.Sum32() % sweepBuckets)
+}
+
+func (r *Rounds) needs(key string, pushed time.Time, round int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	m, ok := r.seen[key]
-	return full || !ok || m.active || pushed.IsZero() || pushed.After(m.pushed)
+	inBucket := sweepBucket(key) == round%sweepBuckets
+	if !ok {
+		return r.hints[key] || pushed.IsZero() || time.Since(pushed) <= freshWindow || inBucket
+	}
+	return m.Active || pushed.IsZero() || pushed.After(m.Pushed) || inBucket
+}
+
+func (r *Rounds) hasWorkflows(ctx context.Context, limited *atomic.Bool, owner, repo string, pushed time.Time) bool {
+	key := strings.ToLower(owner + "/" + repo)
+	r.mu.Lock()
+	w, ok := r.workflows[key]
+	r.mu.Unlock()
+	if ok && time.Since(w.Checked) <= workflowsTTL && !pushed.After(w.Checked) {
+		return w.Count > 0
+	}
+	var resp struct {
+		TotalCount int `json:"total_count"`
+	}
+	path := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repo) + "/actions/workflows?per_page=1"
+	if _, ok := getJSON(ctx, limited, &resp, path); !ok {
+		if limited.Load() {
+			return true
+		}
+		resp.TotalCount = 1
+	}
+	r.mu.Lock()
+	r.workflows[key] = workflowMemory{Count: resp.TotalCount, Checked: time.Now()}
+	r.mu.Unlock()
+	return resp.TotalCount > 0
+}
+
+func (r *Rounds) known(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.seen[key]
+	return ok
+}
+
+func (r *Rounds) Hint(owner, repo string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hints[strings.ToLower(owner+"/"+repo)] = true
+}
+
+func (r *Rounds) Unseen() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.unseen
 }
 
 func (r *Rounds) mark(key string, pushed time.Time, active bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.seen[key] = repoMemory{pushed: pushed, active: active}
+	r.seen[key] = repoMemory{Pushed: pushed, Active: active}
 }
 
 func ScanTargets(ctx context.Context, targets []Target, days int, progress func(done, total int)) ([]Job, error) {
@@ -579,7 +684,10 @@ func ScanRound(ctx context.Context, targets []Target, days int, rounds *Rounds, 
 		progress(0, TotalUnknown)
 	}
 
-	full := rounds == nil || rounds.next()
+	round := 0
+	if rounds != nil {
+		round = rounds.next()
+	}
 	type pair struct {
 		owner, repo string
 		pushed      time.Time
@@ -612,11 +720,27 @@ func ScanRound(ctx context.Context, targets []Target, days int, rounds *Rounds, 
 
 	var todo []pair
 	for _, p := range pairs {
-		if rounds == nil || rounds.needs(strings.ToLower(p.owner+"/"+p.repo), p.pushed, full) {
+		if rounds == nil || rounds.needs(strings.ToLower(p.owner+"/"+p.repo), p.pushed, round) {
 			todo = append(todo, p)
 		}
 	}
 	skipped := total - len(todo)
+	if rounds != nil {
+		chosen := make(map[string]bool, len(todo))
+		for _, p := range todo {
+			chosen[strings.ToLower(p.owner+"/"+p.repo)] = true
+		}
+		unseen := 0
+		for _, p := range pairs {
+			key := strings.ToLower(p.owner + "/" + p.repo)
+			if !chosen[key] && !rounds.known(key) {
+				unseen++
+			}
+		}
+		rounds.mu.Lock()
+		rounds.unseen = unseen
+		rounds.mu.Unlock()
+	}
 	if progress != nil {
 		progress(skipped, total)
 	}
@@ -625,10 +749,13 @@ func ScanRound(ctx context.Context, targets []Target, days int, rounds *Rounds, 
 	done := make(chan int, len(todo))
 
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(workers)
+	g.SetLimit(repoWorkers)
 	for i, p := range todo {
 		g.Go(func() error {
-			jobs := scanRepo(gctx, &limited, p.owner, p.repo)
+			var jobs []Job
+			if rounds == nil || rounds.hasWorkflows(gctx, &limited, p.owner, p.repo, p.pushed) {
+				jobs = scanRepo(gctx, &limited, p.owner, p.repo)
+			}
 			results[i] = jobs
 			if rounds != nil && !limited.Load() && gctx.Err() == nil {
 				rounds.mark(strings.ToLower(p.owner+"/"+p.repo), p.pushed, len(jobs) > 0)

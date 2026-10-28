@@ -254,10 +254,13 @@ func useClient(t *testing.T, c *client) {
 
 func sensitiveServer(t *testing.T, conditional *int) *httptest.Server {
 	t.Helper()
+	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", `W/"s1"`)
 		if r.Header.Get("If-None-Match") == `W/"s1"` {
+			mu.Lock()
 			*conditional++
+			mu.Unlock()
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}

@@ -32,6 +32,8 @@ func TestMain(m *testing.M) {
 	os.Setenv("XDG_CACHE_HOME", dir)
 	saveCache = func() error { return nil }
 	saveLastJobs = func(string, []scan.Job) error { return nil }
+	saveRounds = func(*scan.Rounds) error { return nil }
+	loadRounds = scan.NewRounds
 	loadLastJobs = func(string) ([]scan.Job, time.Time, bool) { return nil, time.Time{}, false }
 	code := m.Run()
 	os.RemoveAll(dir)

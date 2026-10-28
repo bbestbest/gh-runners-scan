@@ -2,10 +2,13 @@ package scan
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -697,6 +700,8 @@ func TestScanRoundSkipsQuietRepos(t *testing.T) {
 		case r.URL.Path == "/orgs/org-a/repos":
 			fmt.Fprintf(w, `[{"name":"pushed","pushed_at":%q},{"name":"busy","pushed_at":%q},{"name":"quiet","pushed_at":%q}]`,
 				pushedAt.Format(time.RFC3339), base.Format(time.RFC3339), base.Add(-time.Minute).Format(time.RFC3339))
+		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
+			fmt.Fprint(w, `{"total_count":1}`)
 		case strings.HasSuffix(r.URL.Path, "/actions/runs"):
 			repo := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/repos/"), "/actions/runs")
 			if r.URL.Query().Get("status") == "queued" {
@@ -747,28 +752,299 @@ func TestScanRoundSkipsQuietRepos(t *testing.T) {
 	}
 
 	all := []string{"org-a/busy", "org-a/pushed", "org-a/quiet", "org-b/api"}
-	steady := []string{"org-a/busy", "org-b/api"}
 	got, streamed, _, jobs := round()
 	if !reflect.DeepEqual(got, all) || !reflect.DeepEqual(streamed, all) || len(jobs) != 1 {
 		t.Fatalf("round 1 scanned %v streamed %v jobs %d, want all and 1 job", got, streamed, len(jobs))
 	}
-	got, streamed, calls, jobs := round()
-	if !reflect.DeepEqual(got, steady) || !reflect.DeepEqual(streamed, steady) || len(jobs) != 1 {
-		t.Fatalf("round 2 scanned %v streamed %v jobs %d, want %v", got, streamed, len(jobs), steady)
+	quiet := map[string]int{}
+	for r := 2; r < 2+sweepBuckets; r++ {
+		got, streamed, calls, jobs := round()
+		if !slices.Contains(got, "org-a/busy") || !slices.Contains(got, "org-b/api") || len(jobs) != 1 || !reflect.DeepEqual(got, streamed) {
+			t.Fatalf("round %d scanned %v streamed %v jobs %d, want busy and api every round", r, got, streamed, len(jobs))
+		}
+		if calls[len(calls)-1] != (progressCall{4, 4}) || calls[1].done != 4-len(got) {
+			t.Fatalf("round %d progress = %v, want skipped repos counted as done", r, calls)
+		}
+		for _, g := range got {
+			if g == "org-a/pushed" || g == "org-a/quiet" {
+				quiet[g]++
+			}
+		}
 	}
-	if calls[1] != (progressCall{2, 4}) || calls[len(calls)-1] != (progressCall{4, 4}) {
-		t.Fatalf("round 2 progress = %v, want skipped repos counted as done", calls)
+	if quiet["org-a/pushed"] != 1 || quiet["org-a/quiet"] != 1 {
+		t.Fatalf("quiet repos swept %v over %d rounds, want each exactly once", quiet, sweepBuckets)
 	}
 	mu.Lock()
 	pushedAt = base.Add(time.Minute)
 	mu.Unlock()
-	if got, _, _, _ := round(); !reflect.DeepEqual(got, []string{"org-a/busy", "org-a/pushed", "org-b/api"}) {
-		t.Fatalf("round 3 scanned %v, want busy, pushed and api", got)
+	if got, _, _, _ := round(); !slices.Contains(got, "org-a/pushed") {
+		t.Fatalf("after a push scanned %v, want org-a/pushed", got)
 	}
-	if got, _, _, _ := round(); !reflect.DeepEqual(got, steady) {
-		t.Fatalf("round 4 scanned %v, want %v", got, steady)
+}
+
+func TestRoundsSaveAndLoad(t *testing.T) {
+	useCacheDir(t)
+	useClient(t, cacheClient("tok-a"))
+	r := NewRounds()
+	pushed := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	r.mark("o/busy", pushed, true)
+	r.mark("o/quiet", pushed, false)
+	r.next()
+	if err := r.Save(); err != nil {
+		t.Fatal(err)
 	}
-	if got, _, _, _ := round(); !reflect.DeepEqual(got, all) {
-		t.Fatalf("round 5 scanned %v, want a full sweep %v", got, all)
+	got := LoadRounds()
+	if got.count != 1 || !reflect.DeepEqual(got.seen, r.seen) {
+		t.Fatalf("loaded count %d seen %v, want %v", got.count, got.seen, r.seen)
+	}
+	if !got.needs("o/busy", pushed, 1) || got.needs("o/quiet", pushed, sweepBucket("o/quiet")+1) {
+		t.Fatal("loaded memory not used")
+	}
+	useClient(t, cacheClient("tok-b"))
+	if other := LoadRounds(); len(other.seen) != 0 {
+		t.Fatal("other token loaded the memory")
+	}
+	useClient(t, cacheClient("tok-a"))
+	path := cacheFile("rounds.json")
+	data, _ := os.ReadFile(path)
+	var disk diskRounds
+	json.Unmarshal(data, &disk)
+	disk.Saved = time.Now().Add(-roundsMaxAge - time.Minute)
+	data, _ = json.Marshal(disk)
+	os.WriteFile(path, data, 0o600)
+	if old := LoadRounds(); len(old.seen) != 0 {
+		t.Fatal("memory older than roundsMaxAge loaded")
+	}
+}
+
+func TestScanRequestsRunInParallelUnderTheCap(t *testing.T) {
+	resetRepoCache(t)
+	var open, peak atomic.Int64
+	var jobsOpen, jobsPeak atomic.Int64
+	var names []string
+	for i := 0; i < 12; i++ {
+		names = append(names, fmt.Sprintf(`{"name":"r%d","pushed_at":%q}`, i, time.Now().UTC().Format(time.RFC3339)))
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := open.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		defer open.Add(-1)
+		isJobs := strings.HasSuffix(r.URL.Path, "/jobs")
+		if isJobs {
+			jn := jobsOpen.Add(1)
+			for {
+				p := jobsPeak.Load()
+				if jn <= p || jobsPeak.CompareAndSwap(p, jn) {
+					break
+				}
+			}
+			defer jobsOpen.Add(-1)
+		}
+		time.Sleep(40 * time.Millisecond)
+		switch {
+		case r.URL.Path == "/users/org-a":
+			fmt.Fprint(w, `{"login":"org-a","type":"Organization"}`)
+		case r.URL.Path == "/orgs/org-a/repos":
+			fmt.Fprint(w, "["+strings.Join(names, ",")+"]")
+		case strings.HasSuffix(r.URL.Path, "/actions/runs"):
+			if strings.Contains(r.URL.Path, "/r0/") && r.URL.Query().Get("status") == "queued" {
+				fmt.Fprint(w, `{"workflow_runs":[{"id":1},{"id":2},{"id":3}]}`)
+				return
+			}
+			fmt.Fprint(w, `{"workflow_runs":[]}`)
+		case isJobs:
+			fmt.Fprint(w, `{"jobs":[{"run_id":1,"status":"queued","name":"j"}]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+
+	jobs, err := ScanTargets(context.Background(), []Target{{Owner: "org-a", All: true}}, 7, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("jobs = %d, want 3", len(jobs))
+	}
+	if got := peak.Load(); got > workers {
+		t.Fatalf("peak in-flight requests = %d, want at most %d", got, workers)
+	}
+	if got := peak.Load(); got < workers {
+		t.Fatalf("peak in-flight requests = %d, want the cap %d reached", got, workers)
+	}
+	if got := jobsPeak.Load(); got < 2 {
+		t.Fatalf("one repo's job requests overlapped %d at most, want them in parallel", got)
+	}
+}
+
+func TestRollingSweepSpreadsQuietRepos(t *testing.T) {
+	r := NewRounds()
+	pushed := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	var keys []string
+	for i := 0; i < 40; i++ {
+		key := fmt.Sprintf("org/repo-%d", i)
+		keys = append(keys, key)
+		r.mark(key, pushed, false)
+	}
+	r.mark("org/busy", pushed, true)
+	seen := map[string]int{}
+	for round := 1; round <= sweepBuckets; round++ {
+		n := 0
+		for _, k := range keys {
+			if r.needs(k, pushed, round) {
+				seen[k]++
+				n++
+			}
+		}
+		if n > 2*len(keys)/sweepBuckets {
+			t.Fatalf("round %d swept %d of %d quiet repos, want them spread across rounds", round, n, len(keys))
+		}
+		if !r.needs("org/busy", pushed, round) {
+			t.Fatalf("round %d skipped the busy repo", round)
+		}
+	}
+	for _, k := range keys {
+		if seen[k] != 1 {
+			t.Fatalf("%s swept %d times in %d rounds, want once", k, seen[k], sweepBuckets)
+		}
+	}
+	if !r.needs("org/repo-0", pushed.Add(time.Second), sweepBucket("org/repo-0")+1) {
+		t.Fatal("a newer push did not force a scan")
+	}
+}
+
+func TestFirstPassIsSliced(t *testing.T) {
+	r := NewRounds()
+	old := time.Now().Add(-3 * 24 * time.Hour)
+	var keys []string
+	for i := 0; i < 40; i++ {
+		keys = append(keys, fmt.Sprintf("org/old-%d", i))
+	}
+	r.Hint("Org", "Old-7")
+	fresh := time.Now().Add(-time.Hour)
+	checked := map[string]int{}
+	for round := 0; round < sweepBuckets; round++ {
+		var picked []string
+		for _, k := range keys {
+			if r.needs(k, old, round) {
+				picked = append(picked, k)
+			}
+		}
+		if round == 0 {
+			if !r.needs("org/fresh", fresh, round) {
+				t.Fatal("a repo pushed in the last day was not checked in the first round")
+			}
+			if !slices.Contains(picked, "org/old-7") {
+				t.Fatal("a hinted repo was not checked in the first round")
+			}
+			if len(picked) > 2*len(keys)/sweepBuckets+1 {
+				t.Fatalf("first round checked %d of %d old repos, want a slice", len(picked), len(keys))
+			}
+		}
+		for _, k := range picked {
+			checked[k]++
+			r.mark(k, old, false)
+		}
+	}
+	for _, k := range keys {
+		want := 1
+		if k == "org/old-7" && sweepBucket(k) != 0 {
+			want = 2
+		}
+		if checked[k] != want {
+			t.Fatalf("%s checked %d times in the first %d rounds, want %d", k, checked[k], sweepBuckets, want)
+		}
+	}
+}
+
+func TestScanRoundReportsUnseenUntilFirstPassEnds(t *testing.T) {
+	resetRepoCache(t)
+	old := time.Now().Add(-3 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	var names []string
+	for i := 0; i < 12; i++ {
+		names = append(names, fmt.Sprintf(`{"name":"r%d","pushed_at":%q}`, i, old))
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/users/org-a":
+			fmt.Fprint(w, `{"login":"org-a","type":"Organization"}`)
+		case r.URL.Path == "/orgs/org-a/repos":
+			fmt.Fprint(w, "["+strings.Join(names, ",")+"]")
+		default:
+			fmt.Fprint(w, `{"total_count":1,"workflow_runs":[]}`)
+		}
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+	rounds := NewRounds()
+	var unseen []int
+	for i := 0; i < sweepBuckets; i++ {
+		if _, err := ScanRound(context.Background(), []Target{{Owner: "org-a", All: true}}, 0, rounds, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		unseen = append(unseen, rounds.Unseen())
+	}
+	if unseen[0] == 0 || unseen[0] == 12 || unseen[len(unseen)-1] != 0 {
+		t.Fatalf("unseen per round = %v, want some left after round 1 and none after %d", unseen, sweepBuckets)
+	}
+	for i := 1; i < len(unseen); i++ {
+		if unseen[i] > unseen[i-1] {
+			t.Fatalf("unseen grew: %v", unseen)
+		}
+	}
+}
+
+func TestNoWorkflowRepoIsSkippedUntilPushed(t *testing.T) {
+	resetRepoCache(t)
+	var mu sync.Mutex
+	pushed := time.Now().Add(-3 * 24 * time.Hour)
+	asked := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/users/org-a":
+			fmt.Fprint(w, `{"login":"org-a","type":"Organization"}`)
+		case r.URL.Path == "/orgs/org-a/repos":
+			fmt.Fprintf(w, `[{"name":"docs","pushed_at":%q}]`, pushed.UTC().Format(time.RFC3339))
+		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
+			asked["workflows"]++
+			fmt.Fprint(w, `{"total_count":0}`)
+		case strings.HasSuffix(r.URL.Path, "/actions/runs"):
+			asked["runs"]++
+			fmt.Fprint(w, `{"workflow_runs":[]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	withClient(t, srv.URL)
+	rounds := NewRounds()
+	rounds.Hint("org-a", "docs")
+	for i := 0; i < 2*sweepBuckets; i++ {
+		if _, err := ScanRound(context.Background(), []Target{{Owner: "org-a", All: true}}, 0, rounds, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	if asked["workflows"] != 1 || asked["runs"] != 0 {
+		t.Fatalf("over %d rounds asked %v, want one workflows check and no runs requests", 2*sweepBuckets, asked)
+	}
+	pushed = time.Now().Add(time.Minute)
+	mu.Unlock()
+	if _, err := ScanRound(context.Background(), []Target{{Owner: "org-a", All: true}}, 0, rounds, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if asked["workflows"] != 2 {
+		t.Fatalf("after a push asked %v, want the workflows checked again", asked)
 	}
 }
