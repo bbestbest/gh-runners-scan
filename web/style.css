@@ -162,6 +162,8 @@ main {
 }
 .panel h2 .foot { position: static; padding-left: 12px; }
 .panel.list { flex: 1; }
+.panel.list.fixed { flex: none; height: calc(7 * (1.4em + 2px) + 30px); }
+#statusPanel .body { height: calc(3 * 1.4em); overflow-y: auto; }
 .body { overflow: hidden; }
 .scroll { overflow-y: auto; flex: 1; }
 
@@ -172,8 +174,6 @@ tr.row { cursor: pointer; }
 tr.sel td { background: var(--seldim); color: #f0f6fc; font-weight: 700; }
 .panel.focused tr.sel td { background: var(--sel); }
 
-.repo-row { display: flex; gap: 12px; white-space: nowrap; }
-.repo-row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 
 .kv { display: grid; grid-template-columns: 8em 1fr; gap: 2px 8px; margin: 8px 0; }
 .kv .k { color: var(--dim); }
@@ -193,7 +193,10 @@ tr.sel td { background: var(--seldim); color: #f0f6fc; font-weight: 700; }
 .keybar { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; white-space: nowrap; min-width: 0; }
 .keybar #hints { overflow: hidden; text-overflow: ellipsis; color: var(--dim); }
 .keybar #hints b { color: var(--cyan); }
-.keybar #filter { width: 14em; padding: 1px 6px; }
+.filterbox { position: fixed; top: 4px; left: 4px; right: 4px; z-index: 15; display: flex; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid var(--green); border-radius: 8px; background: var(--bg); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
+.filterbox .label { color: var(--green); font-weight: 700; flex: none; }
+.filterbox #filter { flex: 1; min-width: 0; padding: 2px 6px; }
+.filterbox #filterFoot { flex: none; }
 .keybar #info { margin-left: auto; color: var(--dim); }
 .keybar #info { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .keybar .kbtn { flex: none; padding: 1px 10px; background: transparent; color: var(--cyan); border: 1px solid var(--border); font-weight: 400; }
@@ -203,5 +206,5 @@ tr.sel td { background: var(--seldim); color: #f0f6fc; font-weight: 700; }
 @media (max-width: 900px) {
   .cols { flex-direction: column; overflow-y: auto; }
   .left { flex: none; min-width: 0; }
-  .panel.list { min-height: 220px; }
+  .panel.list { flex: none; height: 220px; }
 }

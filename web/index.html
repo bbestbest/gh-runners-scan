@@ -15,14 +15,15 @@
   <div class="cols">
     <div class="left">
       <section class="panel" id="statusPanel"><h2>Status</h2><div class="body" id="status"></div></section>
-      <section class="panel" id="reposPanel"><h2>Repos <span class="foot" id="reposFoot"></span></h2><div class="body" id="repos"></div></section>
+      <section class="panel list fixed" id="reposPanel"><h2>[0] Repos</h2><div class="body scroll"><table id="rTable"></table></div><span class="foot" id="rFoot"></span></section>
       <section class="panel list" id="runPanel"><h2 id="runTitle">[1] Running (0)</h2><div class="body scroll"><table id="runTable"></table></div><span class="foot" id="runFoot"></span></section>
       <section class="panel list" id="qPanel"><h2 id="qTitle">[2] Queued (0)</h2><div class="body scroll"><table id="qTable"></table></div><span class="foot" id="qFoot"></span></section>
  <section class="panel list" id="fPanel"><h2 id="fTitle">[3] Finished · 24h (0)</h2><div class="body scroll"><table id="fTable"></table></div><span class="foot" id="fFoot"></span></section>
     </div>
     <section class="panel right" id="detailPanel"><h2>Job</h2><div class="body" id="detail"></div></section>
   </div>
-  <div class="keybar"><span id="hints"></span><input id="filter" placeholder="/ filter" spellcheck="false"><span id="info"></span><button type="button" id="configBtn" class="kbtn">⚙ config</button></div>
+  <div id="filterBox" class="filterbox" hidden><span class="label">Filter</span><input id="filter" placeholder="type to filter" spellcheck="false" autocomplete="off" aria-label="filter jobs"><span id="filterFoot" class="dim"></span></div>
+  <div class="keybar"><span id="hints"></span><span id="info"></span><button type="button" id="configBtn" class="kbtn">⚙ config</button></div>
   <div id="confirm" class="connect popup" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" hidden>
  <h2 id="confirmTitle">Confirm</h2>
  <div id="confirmText"></div>

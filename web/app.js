@@ -46,8 +46,6 @@ const RATE_ATTEMPTS = 3
 
 const RATE_BACKOFF = 3000
 
-const MAX_REPO_ROWS = 6
-
 const HINTS = [['enter', 'open'], ['c', 'cancel run'], ['R', 're-run'], ['/', 'filter'], ['h/l', 'panel'], ['r', 'rescan'], ['j/k', 'move'], ['O', 'choose']]
 
 const CONNECT_HINTS = [['enter', 'start'], ['space', 'tick'], ['tab', 'next field']]
@@ -65,7 +63,8 @@ const state = {
   queued: [],
   finished: [],
   focus: 0,
-  cursor: [0, 0, 0],
+  cursor: [0, 0, 0, 0],
+  repos: [],
   cancels: new Set(),
   reruns: new Set(),
   confirm: null,
@@ -153,21 +152,24 @@ let freeSlots = WORKERS
 
 const slotQueue = []
 
-function takeSlot() {
-  if (freeSlots > 0) {
+function takeSlot(prio = 0) {
+  if (freeSlots > 0 && !slotQueue.length) {
     freeSlots--
     return Promise.resolve()
   }
-  return new Promise(resolve => slotQueue.push(resolve))
+  return new Promise(resolve => {
+    const i = slotQueue.findIndex(w => w.prio > prio)
+    slotQueue.splice(i < 0 ? slotQueue.length : i, 0, { prio, resolve })
+  })
 }
 
 function giveSlot() {
   const next = slotQueue.shift()
-  if (next) next()
+  if (next) next.resolve()
   else freeSlots++
 }
 
-async function getJSON(url, cost, scan) {
+async function getJSON(url, cost, scan, prio) {
   if (!url.startsWith(API + '/')) throw new Error('refusing non-GitHub URL')
   for (let attempt = 0; ; attempt++) {
     const headers = {
@@ -178,7 +180,7 @@ async function getJSON(url, cost, scan) {
     const cached = etags.get(url)
     if (cached) usedUrls.add(url)
     if (cached) headers['If-None-Match'] = cached.etag
-    await takeSlot()
+    await takeSlot(prio)
     let res
     try {
       res = await fetch(url, { headers, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer' })
@@ -418,17 +420,17 @@ async function fetchRepos(org, days, cost, scan) {
   return repos
 }
 
-async function scanRepo(org, repo, cost, scan) {
+async function scanRepo(org, repo, cost, scan, prio) {
   const base = `${API}/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/actions/runs`
-  const done = finishedRuns(org, repo, `${base}?status=completed&per_page=${FINISHED_PER_REPO}`, cost, scan)
-  const lists = await Promise.all(['in_progress', 'queued'].map(status => getJSON(`${base}?status=${status}&per_page=${RUNS_PER_STATUS}`, cost, scan)))
+  const done = finishedRuns(org, repo, `${base}?status=completed&per_page=${FINISHED_PER_REPO}`, cost, scan, prio)
+  const lists = await Promise.all(['in_progress', 'queued'].map(status => getJSON(`${base}?status=${status}&per_page=${RUNS_PER_STATUS}`, cost, scan, prio)))
   const runs = lists.flatMap(page => (page && page.data.workflow_runs) || [])
-  const perRun = await Promise.all(runs.map(run => runJobs(org, repo, `${base}/${encodeURIComponent(run.id)}/jobs?per_page=100`, cost, scan)))
+  const perRun = await Promise.all(runs.map(run => runJobs(org, repo, `${base}/${encodeURIComponent(run.id)}/jobs?per_page=100`, cost, scan, prio)))
   return [...perRun.flat(), ...await done]
 }
 
-async function finishedRuns(org, repo, url, cost, scan) {
-  const page = await getJSON(url, cost, scan)
+async function finishedRuns(org, repo, url, cost, scan, prio) {
+  const page = await getJSON(url, cost, scan, prio)
   const now = Date.now()
   return ((page && page.data.workflow_runs) || []).flatMap(r => {
     const at = r.updated_at ? Date.parse(r.updated_at) : 0
@@ -456,10 +458,10 @@ function activeCount(jobs) {
   return jobs.filter(j => j.status !== 'completed').length
 }
 
-async function runJobs(org, repo, next, cost, scan) {
+async function runJobs(org, repo, next, cost, scan, prio) {
   const jobs = []
   while (next) {
-    const page = await getJSON(next, cost, scan)
+    const page = await getJSON(next, cost, scan, prio)
     if (!page) break
     for (const j of page.data.jobs || []) {
       if (j.status === 'completed') continue
@@ -513,13 +515,13 @@ function needsScan(key, pushed, round) {
   return m.active || !pushed || pushed > m.pushed || inBucket
 }
 
-async function hasWorkflows(owner, repo, pushed, cost, scan) {
+async function hasWorkflows(owner, repo, pushed, cost, scan, prio) {
   const key = `${owner}/${repo}`.toLowerCase()
   const w = repoWorkflows.get(key)
   if (w && Date.now() - w.checked <= WORKFLOWS_TTL && !(pushed > w.checked)) return w.count > 0
   let count = 1
   try {
-    const page = await getJSON(`${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows?per_page=1`, cost, scan)
+    const page = await getJSON(`${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows?per_page=1`, cost, scan, prio)
     if (page && Number.isInteger(page.data.total_count)) count = page.data.total_count
   } catch (err) {
     if (err instanceof RateLimited) return true
@@ -547,7 +549,11 @@ async function scanTargets(targets, days, scan) {
     }
     for (const r of await fetchRepos(t.owner, days, cost, scan)) pairs.push({ owner: t.owner, repo: r.name, pushed: r.pushed })
   }
-  const todo = pairs.filter(p => needsScan(`${p.owner}/${p.repo}`.toLowerCase(), p.pushed, round))
+  const busy = p => {
+    const key = `${p.owner}/${p.repo}`.toLowerCase()
+    return !!((seenRepos.get(key) || {}).active || repoHints.has(key))
+  }
+  const todo = pairs.filter(p => needsScan(`${p.owner}/${p.repo}`.toLowerCase(), p.pushed, round)).sort((a, b) => busy(b) - busy(a))
   const chosen = new Set(todo.map(p => `${p.owner}/${p.repo}`.toLowerCase()))
   state.unseen = pairs.filter(p => {
     const key = `${p.owner}/${p.repo}`.toLowerCase()
@@ -561,9 +567,10 @@ async function scanTargets(targets, days, scan) {
   let limited = null
   const worker = async () => {
     while (index < todo.length) {
+      const prio = index
       const { owner, repo, pushed } = todo[index++]
       try {
-        const jobs = (await hasWorkflows(owner, repo, pushed, cost, scan)) ? await scanRepo(owner, repo, cost, scan) : []
+        const jobs = (await hasWorkflows(owner, repo, pushed, cost, scan, prio)) ? await scanRepo(owner, repo, cost, scan, prio) : []
         results.push(...jobs)
         if (scan === state.scanId && !limited) seenRepos.set(`${owner}/${repo}`.toLowerCase(), { pushed, active: activeCount(jobs) > 0 })
         if (scan === state.scanId) {
@@ -1463,15 +1470,28 @@ function refresh() {
   state.cursor[0] = Math.min(state.cursor[0], Math.max(0, state.running.length - 1))
   state.cursor[1] = Math.min(state.cursor[1], Math.max(0, state.queued.length - 1))
   state.cursor[2] = Math.min(state.cursor[2], Math.max(0, state.finished.length - 1))
+  state.repos = repoCounts(state.running, state.queued)
+  state.cursor[3] = Math.min(state.cursor[3], Math.max(0, state.repos.length - 1))
   render()
 }
 
+const FOCUS_REPOS = 3
+
+const FOCUS_ORDER = [FOCUS_REPOS, 0, 1, 2]
+
 function panelList(focus) {
-  return [state.running, state.queued, state.finished][focus]
+  return [state.running, state.queued, state.finished, state.repos][focus]
 }
 
 function selected() {
+  if (state.focus === FOCUS_REPOS) return undefined
   return panelList(state.focus)[state.cursor[state.focus]]
+}
+
+function cycleFocus(step) {
+  const i = FOCUS_ORDER.indexOf(state.focus)
+  state.focus = FOCUS_ORDER[(i + step + FOCUS_ORDER.length) % FOCUS_ORDER.length]
+  render()
 }
 
 function renderStatus() {
@@ -1504,6 +1524,32 @@ function renderStatus() {
   renderInfo()
 }
 
+function openFilter() {
+  $('filterBox').hidden = false
+  $('filter').focus()
+  renderHints()
+  renderFilterFoot()
+}
+
+function closeFilter() {
+  if ($('filterBox').hidden) return
+  $('filterBox').hidden = true
+  if (document.activeElement === $('filter')) $('filter').blur()
+  renderHints()
+  renderInfo()
+}
+
+function setFilter(text) {
+  $('filter').value = text
+  state.filter = text.trim()
+  refresh()
+}
+
+function renderFilterFoot() {
+  const n = state.running.length + state.queued.length + state.finished.length
+  $('filterFoot').textContent = state.filter ? (n === 1 ? '1 match' : `${n} matches`) : 'enter keep · esc clear'
+}
+
 function renderInfo() {
   const info = $('info')
   info.replaceChildren()
@@ -1511,6 +1557,7 @@ function renderInfo() {
   if (!state.targets.length) return
   const parts = [el('span', 'cyan bold', targetLabel(state.targets)), el('span', '', ` · next ${state.scanning ? '…' : state.nextIn + 's'}`)]
   if (state.pending) parts.push(el('span', '', ' · '), el('span', 'yellow', `next scan: ${targetLabel(state.pending.targets)}`))
+  if (state.filter && $('filterBox').hidden) parts.push(el('span', '', ' · '), el('span', 'dim', `filter: ${state.filter}`))
   if (state.notice) parts.unshift(el('span', state.notice.err ? 'yellow' : 'green', state.notice.text), el('span', '', ' · '))
   if (u.limit) {
     const cls = u.remaining < u.limit * 0.1 ? 'red' : u.remaining < u.limit * 0.3 ? 'yellow' : 'green'
@@ -1520,17 +1567,33 @@ function renderInfo() {
 }
 
 function renderRepos() {
-  const repos = repoCounts(state.running, state.queued)
-  const box = $('repos')
-  box.replaceChildren()
-  $('reposFoot').textContent = repos.length ? `${repos.length} active` : ''
-  if (!repos.length) return box.append(el('div', 'dim', 'no active repos'))
-  for (const r of repos.slice(0, MAX_REPO_ROWS)) {
-    const row = el('div', 'repo-row')
-    row.append(el('span', 'name', r.name), el('span', r.running ? 'green' : 'dim', `${r.running} running`), el('span', r.queued ? 'yellow' : 'dim', `${r.queued} queued`))
-    box.append(row)
+  const n = state.repos.length
+  $('reposPanel').classList.toggle('focused', state.focus === FOCUS_REPOS)
+  $('rFoot').textContent = !n ? '' : state.focus === FOCUS_REPOS ? `${state.cursor[3] + 1} of ${n}` : `${n} active`
+  renderTable('rTable', FOCUS_REPOS, [['Repo', '56%'], ['Running', '22%'], ['Queued', '22%']], r => [
+    [r.name, 'cyan bold'], [`${r.running} running`, r.running ? 'green' : 'dim'], [`${r.queued} queued`, r.queued ? 'yellow' : 'dim'],
+  ])
+}
+
+function renderRepoDetail(box) {
+  const r = state.repos[state.cursor[3]]
+  $('detailPanel').querySelector('h2').textContent = r ? `Repo · ${r.running} running · ${r.queued} queued` : 'Repo'
+  if (!r) return box.append(el('div', 'dim', 'no active repos'))
+  box.append(el('div', 'title', r.name))
+  const section = (title, cls, jobs, cells) => {
+    const mine = jobs.filter(j => repoName(j) === r.name)
+    const wrap = el('div', 'busy')
+    wrap.append(el('div', cls + ' bold', `${title} (${mine.length})`))
+    for (const j of mine) {
+      const row = el('div', 'row')
+      row.append(...cells(j))
+      wrap.append(row)
+    }
+    box.append(wrap)
   }
-  if (repos.length > MAX_REPO_ROWS) box.append(el('div', 'dim', `+${repos.length - MAX_REPO_ROWS} more`))
+  section('Running', 'green', state.running, j => [el('span', '', j.name), el('span', 'dim', `${j.workflow} · ${j.runner}`)])
+  section('Queued', 'yellow', state.queued, j => [el('span', '', j.name), el('span', 'dim', `${j.workflow} · ${j.labels}`)])
+  section('Finished · 24h', '', state.finished, j => [el('span', conclusionClass(j.conclusion), j.conclusion || '-'), el('span', '', j.workflow)])
 }
 
 function renderTable(id, focus, cols, cells) {
@@ -1601,6 +1664,7 @@ function kv(box, rows) {
 function renderDetail() {
   const box = $('detail')
   box.replaceChildren()
+  if (state.focus === FOCUS_REPOS) return renderRepoDetail(box)
   const j = selected()
   if (j && j.status === 'completed') return renderRun(box, j)
   const cancelling = j && state.cancels.has(j.runId)
@@ -1663,7 +1727,7 @@ function renderHints() {
   $('configBtn').classList.toggle('on', open)
   $('configBtn').textContent = open ? '✕ close config' : '⚙ config'
   $('configBtn').disabled = open && !token
-  const list = $('login').hidden ? HINTS : token ? [...CONNECT_HINTS, ['esc', 'close']] : CONNECT_HINTS
+  const list = !$('login').hidden ? (token ? [...CONNECT_HINTS, ['esc', 'close']] : CONNECT_HINTS) : $('filterBox').hidden ? HINTS : [['enter', 'keep filter'], ['esc', 'clear']]
   list.forEach(([k, v], i) => {
     if (i) hints.append(' | ')
     hints.append(el('b', '', k), `: ${v}`)
@@ -1675,6 +1739,7 @@ function render() {
   renderRepos()
   renderLists()
   renderDetail()
+  renderFilterFoot()
 }
 
 function openSelected() {
@@ -1696,12 +1761,8 @@ function onKey(e) {
     return
   }
   if (e.target === $('filter')) {
-    if (e.key === 'Escape' || e.key === 'Enter') $('filter').blur()
-    if (e.key === 'Escape') {
-      $('filter').value = ''
-      state.filter = ''
-      refresh()
-    }
+    if (e.key === 'Escape') setFilter('')
+    if (e.key === 'Escape' || e.key === 'Enter') closeFilter()
     return
   }
   if (e.metaKey || e.ctrlKey || e.altKey) return
@@ -1718,10 +1779,11 @@ function onKey(e) {
   const keys = {
     j: () => move(1), ArrowDown: () => move(1),
     k: () => move(-1), ArrowUp: () => move(-1),
-    g: () => move(-Infinity), Home: () => move(-Infinity),
-    G: () => move(Infinity), End: () => move(Infinity),
-    h: () => { state.focus = (state.focus + 2) % 3; render() },
-    l: () => { state.focus = (state.focus + 1) % 3; render() },
+    g: () => move(-Infinity), Home: () => move(-Infinity), '<': () => move(-Infinity),
+    G: () => move(Infinity), End: () => move(Infinity), '>': () => move(Infinity),
+    h: () => cycleFocus(-1),
+    l: () => cycleFocus(1),
+    0: () => { state.focus = FOCUS_REPOS; render() },
     1: () => { state.focus = 0; render() },
     2: () => { state.focus = 1; render() },
     3: () => { state.focus = 2; render() },
@@ -1729,8 +1791,8 @@ function onKey(e) {
     R: askRerun,
     Enter: openSelected, o: openSelected,
     r: () => startScan(),
-    '/': () => $('filter').focus(),
-    Escape: () => { $('filter').value = ''; state.filter = ''; refresh() },
+    '/': openFilter,
+    Escape: () => setFilter(''),
     O: () => openConnect(),
   }
   const fn = keys[e.key]
@@ -1861,10 +1923,8 @@ function init() {
       if (owner) loadRepoChoices(owner.login)
     }, 500)
   })
-  $('filter').addEventListener('input', () => {
-    state.filter = $('filter').value
-    refresh()
-  })
+  $('filter').addEventListener('input', () => setFilter($('filter').value))
+  $('filter').addEventListener('blur', closeFilter)
   document.addEventListener('keydown', onKey)
   setInterval(tick, 1000)
   refresh()
