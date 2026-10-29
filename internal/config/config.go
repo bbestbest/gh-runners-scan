@@ -16,6 +16,7 @@ type Config struct {
 	Scan    []string
 	Days    int
 	DaysSet bool
+	Hints   string
 }
 
 func Path() string {
@@ -61,6 +62,8 @@ func parse(text string) Config {
 			cfg.Orgs = splitOrgs(value)
 		case "scan":
 			cfg.Scan = splitOrgs(value)
+		case "hints":
+			cfg.Hints = value
 		case "days":
 			n, err := strconv.Atoi(value)
 			if err != nil {

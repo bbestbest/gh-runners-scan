@@ -1276,8 +1276,8 @@ func TestReposStreamOneAfterAnother(t *testing.T) {
 	if firstAt*4 > total {
 		t.Fatalf("first repo shown after %d of %d requests, want within the first quarter", firstAt, total)
 	}
-	if i := slices.Index(order, "r39"); i < 0 || i > 2 {
-		t.Fatalf("hinted busy repo streamed at position %d, want among the first 3: %v", i, order[:5])
+	if i := slices.Index(order, "r39"); i < 0 || i >= workers {
+		t.Fatalf("hinted busy repo streamed at position %d, want among the first %d: %v", i, workers, order[:workers+1])
 	}
 }
 

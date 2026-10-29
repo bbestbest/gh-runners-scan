@@ -31,7 +31,7 @@ func main() {
 	flag.CommandLine.Parse(args)
 
 	targets, targetsErr := scan.ResolveTargets(context.Background(), org, *repo, cfg.Scan, cfg.Org)
-	opts := options{targets: targets, label: *label, days: *days, interval: *interval, repo: *repo}
+	opts := options{targets: targets, label: *label, days: *days, interval: *interval, repo: *repo, hints: cfg.Hints}
 	if len(targets) > 0 {
 		opts.org = targets[0].Owner
 	}

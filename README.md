@@ -26,10 +26,11 @@ Token: `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`.
 | `<owner>` | | `scan` in `~/.config/gh-runners/config` (e.g. `scan = my-org/*, other-org/api`, saved by `O`), else `org`, else your own account |
 | `--days N` (repos pushed within N days, 0 = all) | `GH_RUNNERS_DAYS` | 7 |
 | `--label`, `--repo`, `--interval` (TUI), `--select` (fzf) | | |
+| `hints = full` in the config (TUI), "Key hints" in ⚙ config (web): the bottom bar lists every key | | `short`: only `?: help` |
 
 ## Keys
 
-`j`/`k` move · `<`/`>` top/bottom · `h`/`l` switch panel (`0` repos, `1` running, `2` queued, `3` finished) · `/` filter (floats over the top, filters as you type; `enter` keeps it, `esc` clears) · `enter` open · `c` cancel run · `R` re-run a finished run (`f` failed jobs, `a` all jobs) · `r` rescan · `O` choose what to scan: a checklist of accounts (`space` all/none) and their repos (`enter`), `s` saves (applies at the next scan; `r` for now) · `u` API usage · `q` quit
+`j`/`k` move · `<`/`>` top/bottom · `h`/`l` switch panel (`0` repos, `1` running, `2` queued, `3` finished) · `/` filter (floats over the top, filters as you type; `enter` keeps it, `esc` clears) · `enter` open · `c` cancel run · `R` re-run a finished run (`f` failed jobs, `a` all jobs) · `r` rescan · `O` choose what to scan: a checklist of accounts (`space` all/none) and their repos (`enter`), `s` saves (applies at the next scan; `r` for now) · `u` API usage · `?` help (every key, grouped; `esc` closes) · `q` quit
 
 ## Reading it
 
@@ -38,6 +39,8 @@ Times are in your local time zone, labelled like `10:04 UTC+7`, in both the TUI 
 Rescans only look at repos that were pushed since the last round or still have jobs, plus a rolling eighth of the quiet ones, so each quiet repo is re-checked every 8 rounds. Repos with no workflows are checked once a day and otherwise skipped. Rows appear as each repo finishes: repos that had jobs go first, and requests go to the repo that started first, so the first rows show early instead of near the end of the round. Every panel keeps its size and scrolls; `0` focuses Repos and shows that repo's running, queued and finished runs. On a 75-repo account every round takes about 3–4s instead of an 18s full scan, and a restart within 30 minutes picks up where it left off. A first run checks recently pushed repos at once and the rest over the next 7 rounds; Status shows `first pass · N repos not checked yet` until all are covered.
 
 **Finished** lists the last 5 finished runs of each checked repo, from the past 24 hours, with their result. Cancel and re-run ask first; GitHub cancels or re-runs the whole run, never one job. Both need a token that can write Actions (see below).
+
+Rows carry a status mark: `●` running, `○` queued, and on finished runs `✓` success, `✗` failure, `⊘` cancelled, `–` skipped, `↻` re-running.
 
 Queued and running jobs with the same labels: runners are **busy**. Queued with nothing running: runners may be **offline**.
 

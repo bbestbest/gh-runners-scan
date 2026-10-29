@@ -53,6 +53,35 @@ var keyHints = [][2]string{
 	{"q", "quit"},
 }
 
+var helpGroups = []struct {
+	title string
+	keys  [][2]string
+}{
+	{"Navigate", [][2]string{
+		{"j/k ↓/↑", "move"},
+		{"gg/G < >", "top / bottom"},
+		{"ctrl+d/u", "half page down / up"},
+		{"ctrl+f/b", "page down / up"},
+		{"H/M/L", "top / middle / bottom of view"},
+		{"h/l", "previous / next panel"},
+		{"0 1 2 3", "Repos / Running / Queued / Finished"},
+	}},
+	{"Actions", [][2]string{
+		{"enter/o", "open in browser"},
+		{"c", "cancel run"},
+		{"R", "re-run finished run"},
+		{"r", "rescan now"},
+	}},
+	{"View", [][2]string{
+		{"/", "filter · enter keep · esc clear"},
+		{"esc", "clear filter"},
+		{"O", "choose accounts and repos"},
+		{"u", "API usage"},
+		{"?", "this help"},
+		{"q", "quit"},
+	}},
+}
+
 var filterHints = [][2]string{
 	{"enter", "keep filter"},
 	{"esc", "clear"},
@@ -113,6 +142,7 @@ type options struct {
 	days     int
 	interval int
 	repo     string
+	hints    string
 	rounds   *scan.Rounds
 	onRepo   func(owner, repo string, jobs []scan.Job)
 }
@@ -184,6 +214,7 @@ type model struct {
 	saveErr   error
 
 	usageActive bool
+	helpActive  bool
 	lastCost    *scanCost
 
 	cancels    map[int64]bool
@@ -637,6 +668,16 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.helpActive {
+		switch msg.String() {
+		case "ctrl+c":
+			return m, quitCmd()
+		case "esc", "?", "q":
+			m.helpActive = false
+		}
+		return m, nil
+	}
+
 	m.notice = ""
 
 	if m.confirming {
@@ -731,6 +772,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, textinput.Blink
 	case "u":
 		m.usageActive = true
+		return m, nil
+	case "?":
+		m.helpActive = true
 		return m, nil
 	case "r":
 		m.nextIn = m.opts.interval
@@ -1174,6 +1218,20 @@ func conclusionStyle(conclusion string) lipgloss.Style {
 	return dimStyle
 }
 
+func resultGlyph(conclusion string) string {
+	switch conclusion {
+	case "success":
+		return "✓"
+	case "failure", "timed_out", "startup_failure", "action_required":
+		return "✗"
+	case "cancelled":
+		return "⊘"
+	case "skipped", "neutral":
+		return "–"
+	}
+	return "·"
+}
+
 func fmtAgo(d time.Duration) string {
 	if d < time.Hour {
 		return fmt.Sprintf("%dm", int(d.Minutes()))
@@ -1213,7 +1271,7 @@ func (m *model) refresh() {
 			runnerStyle, rest, elapsedStyle = lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle()
 		}
 		runRows = append(runRows, table.Row{
-			cell(j.Runner, cols, 0),
+			cell("● "+j.Runner, cols, 0),
 			cell(m.repoName(j), cols, 1),
 			cell(j.Name, cols, 2),
 			cell(j.Step.Fraction(), cols, 3),
@@ -1243,7 +1301,7 @@ func (m *model) refresh() {
 			waitStyle, rest = lipgloss.NewStyle(), lipgloss.NewStyle()
 		}
 		qRows = append(qRows, table.Row{
-			cell(wait, qcols, 0),
+			cell("○ "+wait, qcols, 0),
 			cell(m.repoName(j), qcols, 1),
 			cell(j.Name, qcols, 2),
 			cell(j.Labels, qcols, 3),
@@ -1256,10 +1314,10 @@ func (m *model) refresh() {
 	fStyles := make([][]lipgloss.Style, 0, len(m.finished))
 	fSel := clamp(fCursor, len(m.finished))
 	for i, j := range m.finished {
-		result := j.Conclusion
+		result := resultGlyph(j.Conclusion) + " " + j.Conclusion
 		resultStyle := conclusionStyle(j.Conclusion)
 		if m.reruns[j.RunID] {
-			result = "re-running"
+			result = "↻ re-running"
 			resultStyle = yellowStyle
 		}
 		rest := m.rowStyle(j.Repo)
@@ -1626,8 +1684,11 @@ func columnWidths(cols []string, inner int) []table.Column {
 }
 
 func colMin(name string) int {
-	if name == "Elapsed" || name == "Wait" || name == "Result" {
+	if name == "Elapsed" {
 		return len("cancelling")
+	}
+	if name == "Wait" || name == "Result" {
+		return len("○ cancelling")
 	}
 	return 5
 }
@@ -1645,6 +1706,10 @@ func colUnits(name string) int {
 const keybarHeight = 1
 
 const statusPanelHeight = 5
+
+const panelBorders = 2
+
+const popupPadding = 4
 
 const maxPickRows = 10
 
@@ -1679,10 +1744,10 @@ func (m model) bodyView() string {
 	runH, qH, fH := m.listHeights()
 	col := lipgloss.JoinVertical(lipgloss.Left,
 		panel("Status", "", false, left, statusPanelHeight, m.statusPanelLines(left-2)),
-		panel("[0] Repos", m.reposFooter(), m.focus == focusRepos, left, m.reposHeight(), m.repoLines()),
-		panel(fmt.Sprintf("[1] Running (%d)", len(m.running)), countFooter(m.runTable), m.focus == 0, left, runH, m.tableLines(0)),
-		panel(fmt.Sprintf("[2] Queued (%d)", len(m.queued)), countFooter(m.qTable), m.focus == 1, left, qH, m.tableLines(1)),
-		panel(fmt.Sprintf("[3] Finished · 24h (%d)", len(m.finished)), countFooter(m.fTable), m.focus == 2, left, fH, m.tableLines(2)),
+		panel("≡ [0] Repos", m.reposFooter(), m.focus == focusRepos, left, m.reposHeight(), m.repoLines()),
+		panel(fmt.Sprintf("▶ [1] Running (%d)", len(m.running)), countFooter(m.runTable), m.focus == 0, left, runH, m.tableLines(0)),
+		panel(fmt.Sprintf("⏸ [2] Queued (%d)", len(m.queued)), countFooter(m.qTable), m.focus == 1, left, qH, m.tableLines(1)),
+		panel(fmt.Sprintf("✓ [3] Finished · 24h (%d)", len(m.finished)), countFooter(m.fTable), m.focus == 2, left, fH, m.tableLines(2)),
 	)
 	body := col
 	if right > 0 {
@@ -1696,6 +1761,9 @@ func (m model) bodyView() string {
 	}
 	if m.rerunning {
 		body = overlay(body, m.rerunPopup(), m.width)
+	}
+	if m.helpActive {
+		body = overlay(body, m.helpPopup(), m.width)
 	}
 	if m.filterActive {
 		body = overlayAt(body, m.filterPrompt(), 0, 0)
@@ -2074,17 +2142,45 @@ func (m model) rerunPopup() string {
 		"  " + choices + hlStyle.Render("any other key") + dimStyle.Render(" keep it"),
 		"",
 	}
-	w := 0
-	for _, l := range body {
-		if lw := ansi.StringWidth(l); lw > w {
-			w = lw
+	return m.popup("Re-run", "", body)
+}
+
+func (m model) helpPopup() string {
+	keyW := 0
+	for _, g := range helpGroups {
+		for _, k := range g.keys {
+			keyW = max(keyW, ansi.StringWidth(k[0]))
 		}
 	}
-	w += 4
-	if w > m.width {
-		w = m.width
+	tip := "hints = full in the config keeps every key in the bar"
+	if m.opts.hints == "full" {
+		tip = "hints = short in the config shows only ?: help in the bar"
 	}
-	return panel("Re-run", "", true, w, len(body)+2, body)
+	var full, compact []string
+	for _, g := range helpGroups {
+		title := "  " + boldStyle.Render(g.title)
+		full = append(full, "", title)
+		compact = append(compact, title)
+		for _, k := range g.keys {
+			line := "    " + hlStyle.Render(k[0]+strings.Repeat(" ", keyW-ansi.StringWidth(k[0]))) + "  " + dimStyle.Render(k[1])
+			full = append(full, line)
+			compact = append(compact, line)
+		}
+	}
+	full = append(full, "", "  "+dimStyle.Render(tip), "")
+	body := full
+	if len(full)+panelBorders > m.bodyHeight() {
+		body = compact
+	}
+	return m.popup("? Keys", "esc close", body)
+}
+
+func (m model) popup(title, footer string, body []string) string {
+	w := 0
+	for _, l := range body {
+		w = max(w, ansi.StringWidth(l))
+	}
+	return panel(title, footer, true, min(w+popupPadding, m.width), len(body)+panelBorders, body)
 }
 
 func (m model) cancelPopup() string {
@@ -2097,17 +2193,7 @@ func (m model) cancelPopup() string {
 		"  " + hlStyle.Render("y") + dimStyle.Render(" cancel run      ") + hlStyle.Render("any other key") + dimStyle.Render(" keep it"),
 		"",
 	}
-	w := 0
-	for _, l := range body {
-		if lw := ansi.StringWidth(l); lw > w {
-			w = lw
-		}
-	}
-	w += 4
-	if w > m.width {
-		w = m.width
-	}
-	return panel("Cancel run", "", true, w, len(body)+2, body)
+	return m.popup("Cancel run", "", body)
 }
 
 func overlay(bg, fg string, width int) string {
@@ -2291,13 +2377,18 @@ func (m model) statusView() string {
 
 	budget := m.width - ansi.StringWidth(right) - 1
 	left := " "
-	hints := keyHints
+	var hints [][2]string
+	if m.opts.hints == "full" {
+		hints = keyHints
+	}
 	if m.filterActive {
 		hints = filterHints
+	} else {
+		left += hlStyle.Render("?") + dimStyle.Render(": help")
 	}
 	for i, k := range hints {
 		part := hlStyle.Render(k[0]) + dimStyle.Render(": "+k[1])
-		if i > 0 {
+		if i > 0 || !m.filterActive {
 			part = dimStyle.Render(" | ") + part
 		}
 		if ansi.StringWidth(left+part) > budget {

@@ -170,9 +170,96 @@ func typeRunes(m model, s string) model {
 func TestViewContents(t *testing.T) {
 	m := newTestModel(t)
 	view := m.View()
-	for _, want := range []string{"[1] Running (2)", "[2] Queued (1)", "q: quit"} {
+	for _, want := range []string{"≡ [0] Repos", "▶ [1] Running (2)", "⏸ [2] Queued (1)", "✓ [3] Finished · 24h (0)", "?: help"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("view missing %q", want)
+		}
+	}
+}
+
+func TestKeyBarHintsFollowConfig(t *testing.T) {
+	m := newTestModel(t)
+	bar := m.statusView()
+	if !strings.Contains(bar, "?: help") || strings.Contains(bar, "c: cancel run") {
+		t.Fatalf("default key bar = %q, want only ?: help", bar)
+	}
+	m.opts.hints = "full"
+	bar = m.statusView()
+	for _, want := range []string{"enter: open", "c: cancel run", "?: help"} {
+		if !strings.Contains(bar, want) {
+			t.Fatalf("hints = full key bar = %q, missing %q", bar, want)
+		}
+	}
+	m.opts.hints = ""
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 40})
+	m = next.(model)
+	if bar = m.statusView(); !strings.Contains(bar, "?: help") {
+		t.Fatalf("narrow key bar = %q, want ?: help kept", bar)
+	}
+	m = send(m, key("/"))
+	if bar = m.statusView(); !strings.Contains(bar, "enter: keep filter") || strings.Contains(bar, "?: help") {
+		t.Fatalf("filter key bar = %q, want the filter hints", bar)
+	}
+}
+
+func TestHelpPopupGroupsKeysAndSwallowsOthers(t *testing.T) {
+	m := newTestModel(t)
+	m = send(m, key("?"))
+	if !m.helpActive {
+		t.Fatal("? did not open help")
+	}
+	view := m.View()
+	for _, want := range []string{"? Keys", "Navigate", "Actions", "View", "cancel run", "re-run finished run", "hints = full", "esc close"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("help view missing %q:\n%s", want, view)
+		}
+	}
+	before, scanID := m.focus, m.scanID
+	for _, k := range []string{"l", "c", "r", "/"} {
+		m = send(m, key(k))
+	}
+	if !m.helpActive || m.focus != before || m.confirming || m.filterActive || m.scanID != scanID {
+		t.Fatalf("keys leaked through help: help=%v focus=%d confirming=%v filter=%v scanID=%d", m.helpActive, m.focus, m.confirming, m.filterActive, m.scanID)
+	}
+	for _, k := range []string{"esc", "?", "q"} {
+		m.helpActive = true
+		next, cmd := m.Update(key(k))
+		m = next.(model)
+		if m.helpActive || cmd != nil {
+			t.Fatalf("%s: help open=%v cmd=%v, want closed without quitting", k, m.helpActive, cmd)
+		}
+	}
+	m.opts.hints = "full"
+	m = send(m, key("?"))
+	if !strings.Contains(m.View(), "hints = short") {
+		t.Fatal("help with hints = full does not point at hints = short")
+	}
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 24})
+	m = next.(model)
+	if view := m.View(); !strings.Contains(view, "q  ") || !strings.Contains(view, "esc close") || strings.Contains(view, "hints = short") {
+		t.Fatalf("help on a 24-row screen lost keys or kept the tip:\n%s", view)
+	}
+}
+
+func TestRowsCarryStatusGlyphs(t *testing.T) {
+	m := finishedModel(t)
+	m.reruns = map[int64]bool{2002: true}
+	m.refresh()
+	if got := m.runTable.Rows()[0][0]; !strings.HasPrefix(got, "● ") {
+		t.Fatalf("running cell = %q, want ● prefix", got)
+	}
+	m.jobs = append(m.jobs, scan.Job{Status: "queued", Repo: "repo", Name: "q", CreatedAt: time.Now().UTC()})
+	m.refresh()
+	if got := m.qTable.Rows()[0][0]; !strings.HasPrefix(got, "○ ") {
+		t.Fatalf("queued cell = %q, want ○ prefix", got)
+	}
+	got := []string{m.fTable.Rows()[0][3], m.fTable.Rows()[1][3]}
+	if got[0] != "✗ failure" || got[1] != "↻ re-running" {
+		t.Fatalf("finished results = %q, want ✗ failure and ↻ re-running", got)
+	}
+	for c, want := range map[string]string{"success": "✓", "failure": "✗", "timed_out": "✗", "startup_failure": "✗", "action_required": "✗", "cancelled": "⊘", "skipped": "–", "neutral": "–", "": "·"} {
+		if g := resultGlyph(c); g != want {
+			t.Errorf("resultGlyph(%q) = %q, want %q", c, g, want)
 		}
 	}
 }

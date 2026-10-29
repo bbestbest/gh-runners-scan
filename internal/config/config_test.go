@@ -31,6 +31,7 @@ func TestParse(t *testing.T) {
 		{"org moves to the front of orgs", "org = c\norgs = a, b, c\n", Config{Org: "c", Orgs: []string{"c", "a", "b"}}},
 		{"org absent from orgs is prepended", "org = z\norgs = a, b\n", Config{Org: "z", Orgs: []string{"z", "a", "b"}}},
 		{"org with no orgs line migrates to one entry", "org = x\ndays = 4\n", Config{Org: "x", Orgs: []string{"x"}, Days: 4, DaysSet: true}},
+		{"hints", "hints = full\n", Config{Hints: "full"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
