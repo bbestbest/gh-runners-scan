@@ -46,7 +46,15 @@ const RATE_ATTEMPTS = 3
 
 const RATE_BACKOFF = 3000
 
-const HINTS = [['enter', 'open'], ['c', 'cancel run'], ['R', 're-run'], ['/', 'filter'], ['h/l', 'panel'], ['r', 'rescan'], ['j/k', 'move'], ['O', 'choose']]
+const HINTS = [['enter', 'open'], ['c', 'cancel run'], ['R', 're-run'], ['/', 'filter'], ['h/l', 'panel'], ['r', 'rescan'], ['j/k', 'move'], ['O', 'choose'], ['?', 'help']]
+
+const SHORT_HINTS = [['?', 'help']]
+
+const HELP_GROUPS = [
+  ['Navigate', [['j/k ↓/↑', 'move'], ['g/G < >', 'top / bottom'], ['h/l', 'previous / next panel'], ['0 1 2 3', 'Repos / Running / Queued / Finished']]],
+  ['Actions', [['enter/o', 'open in browser'], ['c', 'cancel run'], ['R', 're-run finished run'], ['r', 'rescan now']]],
+  ['View', [['/', 'filter · enter keep · esc clear'], ['esc', 'clear filter'], ['O', 'choose accounts and repos'], ['?', 'this help']]],
+]
 
 const CONNECT_HINTS = [['enter', 'start'], ['space', 'tick'], ['tab', 'next field']]
 
@@ -68,6 +76,8 @@ const state = {
   cancels: new Set(),
   reruns: new Set(),
   confirm: null,
+  help: false,
+  hints: 'short',
   notice: null,
   filter: '',
   scanning: false,
@@ -264,6 +274,14 @@ function conclusionClass(conclusion) {
   if (['cancelled', 'skipped', 'neutral'].includes(conclusion)) return 'yellow'
   if (['failure', 'timed_out', 'startup_failure', 'action_required'].includes(conclusion)) return 'red'
   return 'dim'
+}
+
+function resultGlyph(conclusion) {
+  if (conclusion === 'success') return '✓'
+  if (['failure', 'timed_out', 'startup_failure', 'action_required'].includes(conclusion)) return '✗'
+  if (conclusion === 'cancelled') return '⊘'
+  if (['skipped', 'neutral'].includes(conclusion)) return '–'
+  return '·'
 }
 
 function jobLabel(j) {
@@ -1626,9 +1644,9 @@ function renderTable(id, focus, cols, cells) {
 
 function renderLists() {
   const now = Date.now()
-  $('runTitle').textContent = `[1] Running (${state.running.length})`
-  $('qTitle').textContent = `[2] Queued (${state.queued.length})`
-  $('fTitle').textContent = `[3] Finished · 24h (${state.finished.length})`
+  $('runTitle').textContent = `▶ [1] Running (${state.running.length})`
+  $('qTitle').textContent = `⏸ [2] Queued (${state.queued.length})`
+  $('fTitle').textContent = `✓ [3] Finished · 24h (${state.finished.length})`
   $('runPanel').classList.toggle('focused', state.focus === 0)
   $('qPanel').classList.toggle('focused', state.focus === 1)
   $('fPanel').classList.toggle('focused', state.focus === 2)
@@ -1636,17 +1654,17 @@ function renderLists() {
   $('qFoot').textContent = state.queued.length ? `${state.cursor[1] + 1} of ${state.queued.length}` : ''
   $('fFoot').textContent = state.finished.length ? `${state.cursor[2] + 1} of ${state.finished.length}` : ''
   renderTable('runTable', 0, [['Runner', '24%'], ['Repo', '24%'], ['Job', '30%'], ['Step', '9%'], ['Elapsed', '13%']], j => [
-    [j.runner, 'green'], [repoName(j), ''], [j.name, ''], [stepFraction(j.step), ''],
+    ['● ' + j.runner, 'green'], [repoName(j), ''], [j.name, ''], [stepFraction(j.step), ''],
     state.cancels.has(j.runId) ? ['cancelling', 'yellow'] : [j.startedAt ? fmtElapsed(now - j.startedAt) : '-', ''],
   ])
   renderTable('qTable', 1, [['Wait', '12%'], ['Repo', '26%'], ['Job', '32%'], ['Labels', '30%']], j => {
     const mins = j.createdAt ? Math.floor((now - j.createdAt) / 60000) : -1
-    const wait = state.cancels.has(j.runId) ? ['cancelling', 'yellow'] : [mins >= 0 ? mins + 'm' : '-', waitClass(mins)]
+    const wait = state.cancels.has(j.runId) ? ['○ cancelling', 'yellow'] : ['○ ' + (mins >= 0 ? mins + 'm' : '-'), waitClass(mins)]
     return [wait, [repoName(j), ''], [j.name, ''], [j.labels, '']]
   })
   renderTable('fTable', 2, [['Done', '12%'], ['Repo', '28%'], ['Workflow', '38%'], ['Result', '22%']], j => [
     [age(j.finishedAt), 'dim'], [repoName(j), ''], [j.workflow, ''],
-    state.reruns.has(j.runId) ? ['re-running', 'yellow'] : [j.conclusion || '-', conclusionClass(j.conclusion)],
+    state.reruns.has(j.runId) ? ['↻ re-running', 'yellow'] : [`${resultGlyph(j.conclusion)} ${j.conclusion || '-'}`, conclusionClass(j.conclusion)],
   ])
 }
 
@@ -1722,6 +1740,27 @@ function renderRun(box, j) {
   box.append(actions)
 }
 
+function toggleHelp(open) {
+  state.help = open
+  renderHelp()
+}
+
+function renderHelp() {
+  const box = $('help')
+  box.hidden = !state.help
+  if (!state.help) return
+  const body = $('helpBody')
+  body.replaceChildren()
+  for (const [title, keys] of HELP_GROUPS) {
+    body.append(el('div', 'bold', title))
+    const grid = el('div', 'kv')
+    for (const [k, v] of keys) grid.append(el('span', 'k cyan bold', k), el('span', 'v dim', v))
+    body.append(grid)
+  }
+  body.append(el('div', 'dim', state.hints === 'full' ? 'Key hints: all keys is set in ⚙ config; pick "? only" to show just ?: help' : 'Key hints: "all keys" in ⚙ config keeps every key in the bar'))
+  $('helpClose').focus()
+}
+
 function renderHints() {
   const hints = $('hints')
   hints.replaceChildren()
@@ -1729,7 +1768,7 @@ function renderHints() {
   $('configBtn').classList.toggle('on', open)
   $('configBtn').textContent = open ? '✕ close config' : '⚙ config'
   $('configBtn').disabled = open && !token
-  const list = !$('login').hidden ? (token ? [...CONNECT_HINTS, ['esc', 'close']] : CONNECT_HINTS) : $('filterBox').hidden ? HINTS : [['enter', 'keep filter'], ['esc', 'clear']]
+  const list = !$('login').hidden ? (token ? [...CONNECT_HINTS, ['esc', 'close']] : CONNECT_HINTS) : $('filterBox').hidden ? (state.hints === 'full' ? HINTS : SHORT_HINTS) : [['enter', 'keep filter'], ['esc', 'clear']]
   list.forEach(([k, v], i) => {
     if (i) hints.append(' | ')
     hints.append(el('b', '', k), `: ${v}`)
@@ -1768,6 +1807,12 @@ function onKey(e) {
     return
   }
   if (e.metaKey || e.ctrlKey || e.altKey) return
+  if (state.help) {
+    if (e.key === 'Tab') return
+    e.preventDefault()
+    if (['Escape', '?', 'q'].includes(e.key)) toggleHelp(false)
+    return
+  }
   if (state.confirm) {
     const c = state.confirm
     const choice = c.kind === 'cancel'
@@ -1796,6 +1841,7 @@ function onKey(e) {
     '/': openFilter,
     Escape: () => setFilter(''),
     O: () => openConnect(),
+    '?': () => toggleHelp(true),
   }
   const fn = keys[e.key]
   if (!fn) return
@@ -1884,12 +1930,13 @@ function loadSettings() {
     const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')
     if (Number.isInteger(saved.days) && saved.days >= 0) $('days').value = saved.days
     if (Number.isInteger(saved.interval) && saved.interval >= MIN_INTERVAL) $('interval').value = saved.interval
+    if (saved.hints === 'full') state.hints = 'full'
   } catch {}
 }
 
 function saveSettings() {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ days: (state.pending || state).days, interval: state.interval }))
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ days: (state.pending || state).days, interval: state.interval, hints: state.hints }))
   } catch {}
 }
 
@@ -1926,6 +1973,13 @@ function init() {
     }, 500)
   })
   $('filter').addEventListener('input', () => setFilter($('filter').value))
+  $('hintsMode').value = state.hints
+  $('hintsMode').addEventListener('change', () => {
+    state.hints = $('hintsMode').value === 'full' ? 'full' : 'short'
+    saveSettings()
+    renderHints()
+  })
+  $('helpClose').addEventListener('click', () => toggleHelp(false))
   $('filter').addEventListener('blur', closeFilter)
   document.addEventListener('keydown', onKey)
   setInterval(tick, 1000)

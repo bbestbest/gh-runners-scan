@@ -15,10 +15,10 @@
   <div class="cols">
     <div class="left">
       <section class="panel" id="statusPanel"><h2>Status</h2><div class="body" id="status"></div></section>
-      <section class="panel list fixed" id="reposPanel"><h2>[0] Repos</h2><div class="body scroll"><table id="rTable"></table></div><span class="foot" id="rFoot"></span></section>
-      <section class="panel list" id="runPanel"><h2 id="runTitle">[1] Running (0)</h2><div class="body scroll"><table id="runTable"></table></div><span class="foot" id="runFoot"></span></section>
-      <section class="panel list" id="qPanel"><h2 id="qTitle">[2] Queued (0)</h2><div class="body scroll"><table id="qTable"></table></div><span class="foot" id="qFoot"></span></section>
- <section class="panel list" id="fPanel"><h2 id="fTitle">[3] Finished · 24h (0)</h2><div class="body scroll"><table id="fTable"></table></div><span class="foot" id="fFoot"></span></section>
+      <section class="panel list fixed" id="reposPanel"><h2>≡ [0] Repos</h2><div class="body scroll"><table id="rTable"></table></div><span class="foot" id="rFoot"></span></section>
+      <section class="panel list" id="runPanel"><h2 id="runTitle">▶ [1] Running (0)</h2><div class="body scroll"><table id="runTable"></table></div><span class="foot" id="runFoot"></span></section>
+      <section class="panel list" id="qPanel"><h2 id="qTitle">⏸ [2] Queued (0)</h2><div class="body scroll"><table id="qTable"></table></div><span class="foot" id="qFoot"></span></section>
+ <section class="panel list" id="fPanel"><h2 id="fTitle">✓ [3] Finished · 24h (0)</h2><div class="body scroll"><table id="fTable"></table></div><span class="foot" id="fFoot"></span></section>
     </div>
     <section class="panel right" id="detailPanel"><h2>Job</h2><div class="body" id="detail"></div></section>
   </div>
@@ -28,6 +28,11 @@
  <h2 id="confirmTitle">Confirm</h2>
  <div id="confirmText"></div>
  <div id="confirmButtons" class="actions"></div>
+  </div>
+  <div id="help" class="connect popup help" role="dialog" aria-modal="true" aria-labelledby="helpTitle" hidden>
+    <h2 id="helpTitle">? Keys</h2>
+    <div id="helpBody"></div>
+    <div class="actions"><button type="button" id="helpClose" class="ghost">esc close</button></div>
   </div>
   <form id="login" class="connect" autocomplete="off" hidden>
     <h2 id="connectTitle">Connect · 1/2 token</h2>
@@ -74,6 +79,8 @@
       <p class="hint">Only list and scan repositories pushed in the last N days (the repos lists follow it); 0 means every repository.</p>
       <label>Rescan every <span class="unit"><input id="interval" name="interval" type="number" min="5" value="15"> seconds</span></label>
       <p class="hint">Wait between scans, at least 5. Shorter uses API quota faster.</p>
+      <label>Key hints <select id="hintsMode" name="hints"><option value="short">? only</option><option value="full">all keys</option></select></label>
+      <p class="hint">What the bottom bar shows; ? opens every key either way.</p>
     </div>
     <p id="loginError" class="red"></p>
     <button type="submit" id="submit">enter: continue</button>

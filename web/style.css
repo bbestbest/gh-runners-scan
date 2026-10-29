@@ -187,6 +187,9 @@ tr.sel td { background: var(--seldim); color: #f0f6fc; font-weight: 700; }
 .actions button:disabled { opacity: 0.5; cursor: default; }
 .actions button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 1px; }
 .popup { width: min(440px, calc(100vw - 32px)); z-index: 20; }
+.help { max-height: calc(100vh - 32px); overflow-y: auto; }
+.help .kv { grid-template-columns: 7em 1fr; margin: 4px 0 10px; }
+.help .kv .k { color: var(--cyan); font-weight: 700; }
 .busy .row { display: flex; gap: 12px; white-space: nowrap; }
 .busy .row span:nth-child(2) { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 
